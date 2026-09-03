@@ -32,11 +32,18 @@ const FailOnLeakEnv = "BEADS_TEST_FAIL_ON_LEAK"
 // A root with no marker is never swept, so failing to write one only costs
 // the next run its chance to clean up — it is never unsafe.
 func WriteSuiteOwnerMarker(root string) error {
+	return writeSuiteOwnerMarkerPID(root, os.Getpid())
+}
+
+// writeSuiteOwnerMarkerPID writes an owner marker naming an arbitrary PID.
+// SweepDeadSuiteRoots uses it to put a marker BACK, naming the same dead
+// owner, when it could not finish removing a root.
+func writeSuiteOwnerMarkerPID(root string, pid int) error {
 	if root == "" {
 		return fmt.Errorf("doltserver: WriteSuiteOwnerMarker: empty root")
 	}
 	path := filepath.Join(root, SuiteOwnerMarkerName)
-	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
+	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o600)
 }
 
 // readSuiteOwnerMarker returns the PID recorded in root's owner marker.
@@ -97,13 +104,40 @@ func decideSuiteRoot(hasMarker, ownerAlive bool) suiteRootAction {
 // best-effort and returns the roots it removed.
 //
 // Safety rests entirely on decideSuiteRoot: a root is only ever touched when
-// it carries this suite's own owner marker and that owner is gone. Live
-// sibling runs (marker + live PID) and unclaimed leftovers (no marker) are
-// both left exactly as they are. The per-root SweepOrphanedTestServers call
-// therefore honors that function's contract — a caller-vouched suite root,
-// never a shared temp dir.
+// it is owned by the current user, carries this suite's own owner marker, and
+// that owner is gone. Live sibling runs (marker + live PID) and unclaimed
+// leftovers (no marker) are both left exactly as they are.
+//
+// The per-root reap is sweepServersUnderRoots, NOT SweepOrphanedTestServers:
+// this runs at suite START, while sibling packages (go test -p N) are mid-run,
+// so it must only ever reach processes provably inside the dead root it is
+// cleaning up. SweepOrphanedTestServers' extra deleted-cwd arm spans every
+// temp dir on the box and belongs only at end-of-run, where the suite is the
+// last thing standing.
 func SweepDeadSuiteRoots(parentDir, prefix string) []string {
-	return sweepDeadSuiteRoots(parentDir, prefix, processAlive, SweepOrphanedTestServers, os.RemoveAll)
+	return sweepDeadSuiteRoots(parentDir, prefix, processAlive, sweepServersUnderRoots, removeSuiteRoot)
+}
+
+// removeSuiteRoot removes a suite temp root, making unwritable directories
+// writable first. cmd/bd's root doubles as an isolated $HOME, so it can hold
+// read-only Go module cache entries that plain os.RemoveAll refuses; this
+// mirrors forceRemoveAll in cmd/bd's TestMain.
+func removeSuiteRoot(root string) error {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() && info.Mode()&0o200 == 0 {
+			// #nosec G122 -- filepath.Walk lstats, so this only ever fires on
+			// a real directory (never a symlink), inside a root the caller
+			// already proved is owned by this user and abandoned by a dead
+			// process. Widening its owner-write bit is also the least
+			// consequential thing that could be done to a swapped path.
+			_ = os.Chmod(path, info.Mode()|0o200)
+		}
+		return nil
+	})
+	return os.RemoveAll(root)
 }
 
 // sweepDeadSuiteRoots is SweepDeadSuiteRoots with its three effects injected:
@@ -130,12 +164,30 @@ func sweepDeadSuiteRoots(
 		if err != nil || !info.IsDir() {
 			continue
 		}
+		// On a shared /tmp anyone can plant a directory with this prefix and
+		// a marker naming a dead PID. Only trust a root this user owns.
+		if !rootOwnedBySelf(info) {
+			continue
+		}
 		pid, hasMarker := readSuiteOwnerMarker(root)
 		if decideSuiteRoot(hasMarker, hasMarker && alive(pid)) != sweepSuiteRoot {
 			continue
 		}
 		sweepServers(root)
 		if err := removeAll(root); err != nil {
+			// Removal is not atomic: the marker is usually among the first
+			// entries deleted, so a partial failure would leave an unclaimed
+			// root that no later run may ever touch again. Put the marker
+			// back, naming the same dead owner, so the next run retries.
+			if writeErr := writeSuiteOwnerMarkerPID(root, pid); writeErr != nil {
+				fmt.Fprintf(os.Stderr,
+					"Warning: could not remove dead test-suite root %s (%v) and could not restore its owner marker (%v); it will not be retried\n",
+					root, err, writeErr)
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"Warning: could not remove dead test-suite root %s: %v (marker restored; the next run retries)\n",
+					root, err)
+			}
 			continue
 		}
 		swept = append(swept, root)

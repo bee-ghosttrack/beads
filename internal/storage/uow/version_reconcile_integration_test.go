@@ -2,16 +2,14 @@ package uow
 
 import (
 	"context"
-	"errors"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/steveyegge/beads/internal/procid"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/proxy"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/server"
@@ -38,14 +36,19 @@ func newTestUOWProvider(t *testing.T) UnitOfWorkProvider {
 	storeRootDir := t.TempDir()
 	shutdownOnInterrupt(t, storeRootDir)
 	t.Cleanup(func() {
-		// Read the backend PID BEFORE shutting down: a successful
+		// Read the backend's record BEFORE shutting down: a successful
 		// proxy.Shutdown removes the pid file, so afterwards there is
 		// nothing left to verify against.
-		pid := backendServerPID(t, storeRootDir)
-		if err := proxy.Shutdown(storeRootDir); err != nil {
-			t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
+		record := backendServerRecord(t, storeRootDir)
+		err := proxy.Shutdown(storeRootDir)
+		if err == nil {
+			// Shutdown killed the backend AND confirmed its exit
+			// (waitForRecordedProcessExit) before removing the record.
+			// There is nothing left to check.
+			return
 		}
-		requireBackendExited(t, pid)
+		t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
+		requireBackendExited(t, record)
 	})
 	cfgPath := writeServerConfig(t, port)
 	logPath := filepath.Join(t.TempDir(), "server.log")
@@ -73,47 +76,68 @@ func newTestUOWProvider(t *testing.T) UnitOfWorkProvider {
 
 const (
 	// backendExitTimeout is how long a test waits for the dolt sql-server to
-	// leave the process table after proxy.Shutdown returned. Shutdown itself
-	// already polls for confirmation, so anything approaching this budget is
-	// a real failure to stop, not slow teardown.
-	backendExitTimeout = 5 * time.Second
+	// leave the process table after proxy.Shutdown failed. It is generous on
+	// purpose: Shutdown's own budget is already 5s of confirmation plus a 2s
+	// post-kill minimum, and this only runs on the error path, where the
+	// interesting outcome is "still there", not "took a while".
+	backendExitTimeout = 30 * time.Second
 	backendExitPoll    = 50 * time.Millisecond
 )
 
-// backendServerPID returns the PID of the dolt sql-server the proxy started
-// under rootDir, read from the backend pid file the proxy's child manager
-// writes (server.PIDFileName). It returns 0 when there is no usable record —
-// no server was ever started, or it already shut down and removed the file.
-func backendServerPID(t *testing.T, rootDir string) int {
+// backendServerRecord returns the pid file the proxy's child manager wrote
+// for the dolt sql-server under rootDir (server.PIDFileName). nil means there
+// is nothing to verify: no server was started, or it shut down cleanly and
+// removed its record.
+//
+// The whole record is returned, not just the PID: Birth is the process-birth
+// token that makes the PID safe to act on at all.
+func backendServerRecord(t *testing.T, rootDir string) *pidfile.PidFile {
 	t.Helper()
 	pf, err := pidfile.Read(rootDir, server.PIDFileName)
 	if err != nil {
 		t.Logf("read %s in %s: %v", server.PIDFileName, rootDir, err)
-		return 0
+		return nil
 	}
 	if pf == nil || pf.Pid <= 0 {
-		return 0
+		return nil
 	}
-	return pf.Pid
+	return pf
 }
 
-// requireBackendExited fails the test if the dolt sql-server is still running
-// a short while after proxy.Shutdown claimed to have stopped it, then
-// force-kills it so the leak does not outlive the run.
+// requireBackendExited fails the test if the recorded dolt sql-server is
+// still running after proxy.Shutdown returned an ERROR, then force-kills it
+// so the leak does not outlive the run.
 //
-// This is deliberately a t.Errorf and not a t.Logf: a surviving server holds
+// It is deliberately a t.Errorf and not a t.Logf: a surviving server holds
 // the temp tree the test is about to delete, which is precisely how this
 // package produced sql-servers still serving directories that had been gone
 // for hours (wy-j2zc8q). A leak must be visible where it is caused, not
 // discovered later by a sweep.
-func requireBackendExited(t *testing.T, pid int) {
+//
+// Every step is gated on procid birth identity rather than the bare PID. The
+// server is not this process's child, so its PID is reusable the instant it
+// exits, and proxy.Shutdown deliberately REFUSES to signal a record it cannot
+// verify (ErrUnverifiableProcess) — killing that same PID here would defeat
+// the exact protection the package went out of its way to provide. A record
+// with no Birth token, or one whose token no longer matches, is therefore
+// left alone: not the server we recorded, nothing to report.
+func requireBackendExited(t *testing.T, pf *pidfile.PidFile) {
 	t.Helper()
-	if pid <= 0 {
+	if pf == nil || pf.Pid <= 0 || pf.Birth == "" {
 		return
 	}
+	token := procid.Token(pf.Birth)
+
 	deadline := time.Now().Add(backendExitTimeout)
 	for {
-		if !processRunning(pid) {
+		same, err := procid.Verify(pf.Pid, token)
+		if err != nil {
+			t.Logf("procid.Verify(%d): %v", pf.Pid, err)
+			return
+		}
+		if !same {
+			// Either the process is gone, or the PID now belongs to
+			// something else. Either way our server is not running.
 			return
 		}
 		if time.Now().After(deadline) {
@@ -121,26 +145,21 @@ func requireBackendExited(t *testing.T, pid int) {
 		}
 		time.Sleep(backendExitPoll)
 	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		_ = proc.Kill()
-	}
-	t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s (force-killed)", pid, backendExitTimeout)
-}
 
-// processRunning reports whether pid is still in the process table, using the
-// signal-0 probe (the kernel runs its existence and permission checks but
-// delivers nothing). EPERM means the process exists but belongs to someone
-// else, which still counts as running.
-func processRunning(pid int) bool {
-	proc, err := os.FindProcess(pid)
+	handle, err := procid.Open(pf.Pid, token)
 	if err != nil {
-		return false
+		t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be opened to kill: %v",
+			pf.Pid, backendExitTimeout, err)
+		return
 	}
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
+	killErr := handle.Kill()
+	_ = handle.Close()
+	if killErr != nil {
+		t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be killed: %v",
+			pf.Pid, backendExitTimeout, killErr)
+		return
 	}
-	return errors.Is(err, syscall.EPERM)
+	t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s (force-killed)", pf.Pid, backendExitTimeout)
 }
 
 // TestReconcileVersionPersistsAcrossUOW is the one version assertion that
