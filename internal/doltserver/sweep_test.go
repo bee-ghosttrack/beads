@@ -344,10 +344,12 @@ func TestTempDirRootsBoundTheOrphanArm(t *testing.T) {
 // inside the deleted-cwd arm, which is precisely what tempDirRoots exists to
 // prevent. /tmp and the real per-user temp dir must survive that filter.
 func TestTempDirRootsRejectsOverbroadTMPDIR(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skipf("no home directory to test against: %v", err)
-	}
+	// A real, non-temp home. The ambient one cannot be trusted for these
+	// expectations: CI (scripts/ci/lib/test-env.sh) runs the suite with HOME
+	// under /tmp, where "a workspace under the home directory" and "a path
+	// under /tmp" are the same path.
+	const home = "/home/beads-fixture"
+	t.Setenv("HOME", home)
 
 	t.Run("normal TMPDIR keeps a usable root", func(t *testing.T) {
 		roots := tempDirRoots()
@@ -392,6 +394,36 @@ func TestTempDirRootsRejectsOverbroadTMPDIR(t *testing.T) {
 			t.Errorf("tempDirRoots() = %v, want /tmp still covered", roots)
 		}
 	})
+
+	// The CI shape: HOME is a throwaway directory under /tmp. /tmp contains
+	// it, and must survive anyway — this is the case that emptied
+	// tempDirRoots on every Linux runner and disabled the arm there.
+	t.Run("sandbox HOME under /tmp keeps /tmp", func(t *testing.T) {
+		sandbox := "/tmp/beads-test-env-abc123/home"
+		t.Setenv("HOME", sandbox)
+		roots := tempDirRoots()
+		if !underAnyRoot("/tmp/beads-bd-tests-xyz/.beads/dolt", roots) {
+			t.Errorf("tempDirRoots() = %v with HOME=%s, want /tmp still covered", roots, sandbox)
+		}
+		for _, root := range roots {
+			if filepath.Clean(root) == string(filepath.Separator) {
+				t.Errorf("tempDirRoots() = %v, which includes the filesystem root", roots)
+			}
+		}
+	})
+
+	// TMPDIR=$HOME with a sandbox home: the root IS the home, so it is
+	// dropped even though a sandbox home is otherwise ignored.
+	t.Run("TMPDIR=sandbox HOME is dropped", func(t *testing.T) {
+		sandbox := "/tmp/beads-test-env-abc123/home"
+		t.Setenv("HOME", sandbox)
+		t.Setenv("TMPDIR", sandbox)
+		for _, root := range tempDirRoots() {
+			if filepath.Clean(root) == sandbox {
+				t.Errorf("tempDirRoots() kept %q, the sandbox home itself", root)
+			}
+		}
+	})
 }
 
 // TestIsCredibleTempRoot tables the predicate directly, including the shapes
@@ -420,6 +452,28 @@ func TestIsCredibleTempRoot(t *testing.T) {
 	for _, tc := range cases {
 		if got := isCredibleTempRoot(tc.root, home); got != tc.want {
 			t.Errorf("isCredibleTempRoot(%q, %q) = %v, want %v", tc.root, home, got, tc.want)
+		}
+	}
+
+	// A sandbox home (CI's HOME under /tmp) does not disqualify the roots
+	// that contain it; the root that IS the home is still out, and a real
+	// home under an overbroad TMPDIR still rejects that TMPDIR.
+	const sandbox = "/tmp/beads-test-env-abc123/home"
+	sandboxCases := []struct {
+		root, home string
+		want       bool
+	}{
+		{"/tmp", sandbox, true},
+		{"/tmp/beads-test-env-abc123", sandbox, true},
+		{sandbox, sandbox, false},
+		{sandbox + "/", sandbox, false},
+		{"/", sandbox, false},
+		{"/home", "/home/runner", false},
+		{"/tmp", "/tmp", false},
+	}
+	for _, tc := range sandboxCases {
+		if got := isCredibleTempRoot(tc.root, tc.home); got != tc.want {
+			t.Errorf("isCredibleTempRoot(%q, %q) = %v, want %v", tc.root, tc.home, got, tc.want)
 		}
 	}
 

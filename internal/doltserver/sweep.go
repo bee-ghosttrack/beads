@@ -126,6 +126,15 @@ func tempDirRoots() []string {
 // The home test doubles as the breadth test: a directory holding the user's
 // home holds their workspaces too, so a deleted .beads/dolt under it would
 // again look like test debris.
+//
+// The one home that anchors no workspaces is a SANDBOX home: CI harnesses
+// (scripts/ci/lib/test-env.sh) export HOME under a mktemp -d root so a test
+// can never read or write the runner's real dotfiles. That home lives under
+// /tmp, and without this carve-out it would disqualify /tmp itself, leaving
+// tempDirRoots empty and the deleted-cwd arm silently disabled on exactly the
+// boxes whose killed runs it exists to clean up after. A root that merely
+// contains a sandbox home stays credible; a root that IS the home does not,
+// whatever the home looks like.
 func isCredibleTempRoot(root, home string) bool {
 	cleaned := filepath.Clean(root)
 	if cleaned == "" || cleaned == "." || cleaned == string(filepath.Separator) {
@@ -138,11 +147,24 @@ func isCredibleTempRoot(root, home string) bool {
 		return true
 	}
 	for _, h := range canonicalRoots([]string{home}) {
-		if isUnderDir(filepath.Clean(h), cleaned) {
+		h = filepath.Clean(h)
+		if h == cleaned {
+			return false
+		}
+		if isUnderDir(h, cleaned) && !isSandboxHome(h) {
 			return false
 		}
 	}
 	return true
+}
+
+// isSandboxHome reports whether home lives inside the fixed /tmp fallback —
+// the shape a test harness's throwaway HOME takes. It is judged against the
+// hardcoded fallback, never os.TempDir(), so TMPDIR cannot vote on its own
+// credibility: TMPDIR=/home with HOME=/home/runner must still read as a real
+// home under an overbroad root.
+func isSandboxHome(home string) bool {
+	return underAnyRoot(home, canonicalRoots([]string{"/tmp"}))
 }
 
 // canonicalRoots expands each non-empty root into every form a process's
