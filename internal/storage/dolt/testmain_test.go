@@ -75,9 +75,33 @@ func testMainInner(m *testing.M) int {
 		// It returns BEFORE the suite temp root below for the same reason:
 		// eight concurrent helpers would each run the dead-root sweep and each
 		// claim a root of its own, and os.Exit would abandon every one of
-		// them. A helper needs neither — it inherits the parent's live
-		// BEADS_TEST_CIRCUIT_DIR through the BEADS_ allowlist in
-		// integration.FilterEnv, and the parent's root outlives it.
+		// them. A helper needs neither: it starts no server, so it has no
+		// orphans to sweep and nothing for a later run to reap.
+		//
+		// It DOES still need its own circuit-breaker directory. That state is
+		// one file keyed host:port:db, read-modify-written, and the parent's
+		// BEADS_TEST_CIRCUIT_DIR reaches every helper through the BEADS_
+		// allowlist in integration.FilterEnv — so inheriting it would put all
+		// eight of TestMultiProcessSchemaInit's helpers on ONE file at once,
+		// against the same host:port:db. Each helper used to get a fresh
+		// directory under a suite root of its own; this keeps that isolation
+		// without the root, the sweep, or the marker.
+		circuitDir, circuitErr := os.MkdirTemp("", "beads-dolt-helper-circuit-*")
+		if circuitErr != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: failed to isolate helper circuit state: %v\n", circuitErr)
+			return 1
+		}
+		// A helper commonly exits through os.Exit (see above), which skips
+		// this defer. The directory holds a few bytes of circuit state and
+		// never a server, and it carries no owner marker, so no sweep will
+		// ever look at it: the occasional leftover is accepted rather than
+		// given machinery of its own.
+		defer os.RemoveAll(circuitDir)
+		if err := os.Setenv(testCircuitBreakerDirEnv, circuitDir); err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: failed to isolate helper circuit state: %v\n", err)
+			return 1
+		}
+		defer os.Unsetenv(testCircuitBreakerDirEnv)
 		return m.Run()
 	}
 

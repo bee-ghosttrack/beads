@@ -3,13 +3,10 @@
 package doltserver
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 // SweepOrphanedTestServers reaps `dolt sql-server` processes that are
@@ -50,7 +47,7 @@ import (
 func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
 	pids := selectOrphanTestServerPIDs(candidates, canonicalRoots(suiteTempRoots), tempDirRoots())
-	return reapServerPIDs(pids)
+	return reapServerPIDs(pids, isDoltServerProcess)
 }
 
 // sweepServersUnderRoots reaps only the dolt sql-servers whose working
@@ -62,58 +59,7 @@ func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 func sweepServersUnderRoots(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
 	pids := selectServersUnderRoots(candidates, canonicalRoots(suiteTempRoots))
-	return reapServerPIDs(pids)
-}
-
-// reapServerPIDs SIGTERMs each selected PID, then SIGKILLs whatever is still
-// alive a moment later, revalidating the process identity immediately before
-// each signal so a PID recycled since selection cannot be targeted.
-//
-// Returns the PIDs it sent a kill signal to.
-func reapServerPIDs(pids []int) []int {
-	self := os.Getpid()
-	var killed []int
-	for _, pid := range pids {
-		if pid == self {
-			continue
-		}
-		// Revalidate identity right before signaling: candidate selection
-		// above already did its own /proc read, and in a PID-reuse window
-		// the kernel could have recycled this PID to an unrelated process
-		// in between. isDoltServerProcess re-reads /proc/<pid>/cmdline so
-		// we only ever signal something that still looks like the
-		// dolt sql-server we selected.
-		if !isDoltServerProcess(pid) {
-			continue
-		}
-		if err := syscall.Kill(pid, syscall.SIGTERM); err == nil {
-			killed = append(killed, pid)
-		}
-	}
-
-	if len(killed) == 0 {
-		return killed
-	}
-
-	fmt.Fprintf(os.Stderr, "Info: swept %d orphaned test dolt sql-server process(es): %v\n", len(killed), killed)
-
-	// Give SIGTERM a moment, then force anything still alive. This runs at
-	// suite exit, so a short bounded wait here is acceptable.
-	time.Sleep(300 * time.Millisecond)
-	for _, pid := range killed {
-		// Revalidate again before escalating to SIGKILL: the original
-		// server may have exited cleanly during the grace period, and in
-		// a PID-reuse window (the kernel cycling the whole PID space
-		// within 300ms) this PID could now belong to an unrelated
-		// process. Recheck it still looks like a dolt sql-server before
-		// force-killing it.
-		if !isDoltServerProcess(pid) {
-			continue
-		}
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
-
-	return killed
+	return reapServerPIDs(pids, isDoltServerProcess)
 }
 
 // isDoltServerProcess re-reads /proc/<pid>/cmdline and reports whether pid
