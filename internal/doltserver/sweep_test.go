@@ -337,3 +337,97 @@ func TestTempDirRootsBoundTheOrphanArm(t *testing.T) {
 		t.Errorf("a production workspace path matched tempDirRoots() %v", roots)
 	}
 }
+
+// TestTempDirRootsRejectsOverbroadTMPDIR covers the bound on the bound.
+// TMPDIR is an ordinary environment variable, so os.TempDir() can be handed
+// "/" or a home directory; either would put every workspace on the box back
+// inside the deleted-cwd arm, which is precisely what tempDirRoots exists to
+// prevent. /tmp and the real per-user temp dir must survive that filter.
+func TestTempDirRootsRejectsOverbroadTMPDIR(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory to test against: %v", err)
+	}
+
+	t.Run("normal TMPDIR keeps a usable root", func(t *testing.T) {
+		roots := tempDirRoots()
+		if len(roots) == 0 {
+			t.Fatal("tempDirRoots() is empty for the ambient TMPDIR")
+		}
+		for _, root := range roots {
+			if root == string(filepath.Separator) {
+				t.Errorf("tempDirRoots() = %v, which includes the filesystem root", roots)
+			}
+			if isUnderDir(filepath.Clean(home), root) {
+				t.Errorf("tempDirRoots() root %q contains the home directory %q", root, home)
+			}
+		}
+	})
+
+	t.Run("TMPDIR=/ is dropped", func(t *testing.T) {
+		t.Setenv("TMPDIR", "/")
+		roots := tempDirRoots()
+		for _, root := range roots {
+			if filepath.Clean(root) == string(filepath.Separator) {
+				t.Fatalf("tempDirRoots() = %v, want the filesystem root dropped", roots)
+			}
+		}
+		// The hardcoded /tmp fallback still has to come through, or the
+		// deleted-cwd arm would quietly stop working.
+		if !underAnyRoot("/tmp/beads-bd-tests-xyz/.beads/dolt", roots) {
+			t.Errorf("tempDirRoots() = %v, want /tmp still covered", roots)
+		}
+		if underAnyRoot(filepath.Join(home, "project", ".beads", "dolt"), roots) {
+			t.Errorf("tempDirRoots() = %v still covers a path under the home directory", roots)
+		}
+	})
+
+	t.Run("TMPDIR=$HOME is dropped", func(t *testing.T) {
+		t.Setenv("TMPDIR", home)
+		roots := tempDirRoots()
+		if underAnyRoot(filepath.Join(home, "project", ".beads", "dolt"), roots) {
+			t.Errorf("tempDirRoots() = %v covers a workspace under the home directory", roots)
+		}
+		if !underAnyRoot("/tmp/beads-bd-tests-xyz/.beads/dolt", roots) {
+			t.Errorf("tempDirRoots() = %v, want /tmp still covered", roots)
+		}
+	})
+}
+
+// TestIsCredibleTempRoot tables the predicate directly, including the shapes
+// no environment on this box can produce.
+func TestIsCredibleTempRoot(t *testing.T) {
+	const home = "/Users/dev"
+	cases := []struct {
+		root string
+		want bool
+	}{
+		{"/tmp", true},
+		{"/private/tmp", true},
+		{"/var/folders/c1/xx/T", true},
+		{"/var/folders/c1/xx/T/beads-bd-tests-1", true},
+		{"/", false},
+		{"//", false},
+		{"", false},
+		{".", false},
+		{"relative/tmp", false},
+		{home, false},
+		{home + "/", false},
+		{"/Users", false},
+		{"/Users/dev/tmp", true},
+		{"/Users/other", true},
+	}
+	for _, tc := range cases {
+		if got := isCredibleTempRoot(tc.root, home); got != tc.want {
+			t.Errorf("isCredibleTempRoot(%q, %q) = %v, want %v", tc.root, home, got, tc.want)
+		}
+	}
+
+	// With no home known, only the structural rejections apply.
+	if !isCredibleTempRoot("/Users/dev", "") {
+		t.Error("isCredibleTempRoot with no home should accept an ordinary absolute path")
+	}
+	if isCredibleTempRoot("/", "") {
+		t.Error("isCredibleTempRoot must reject the filesystem root even with no home")
+	}
+}

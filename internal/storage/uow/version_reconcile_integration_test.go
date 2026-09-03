@@ -123,7 +123,14 @@ func backendServerRecord(t *testing.T, rootDir string) *pidfile.PidFile {
 // left alone: not the server we recorded, nothing to report.
 func requireBackendExited(t *testing.T, pf *pidfile.PidFile) {
 	t.Helper()
-	if pf == nil || pf.Pid <= 0 || pf.Birth == "" {
+	if pf == nil || pf.Pid <= 0 {
+		return
+	}
+	if pf.Birth == "" {
+		// A record from before birth tokens were written. There is no safe
+		// way to ask about that PID, so the check is skipped — say so, rather
+		// than looking like a silent pass.
+		t.Logf("backend record for pid %d carries no birth token; skipping the survived-Shutdown check", pf.Pid)
 		return
 	}
 	token := procid.Token(pf.Birth)
@@ -148,18 +155,44 @@ func requireBackendExited(t *testing.T, pf *pidfile.PidFile) {
 
 	handle, err := procid.Open(pf.Pid, token)
 	if err != nil {
-		t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be opened to kill: %v",
-			pf.Pid, backendExitTimeout, err)
+		if backendStillRunning(t, pf.Pid, token) {
+			t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be opened to kill: %v",
+				pf.Pid, backendExitTimeout, err)
+		}
 		return
 	}
 	killErr := handle.Kill()
 	_ = handle.Close()
 	if killErr != nil {
-		t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be killed: %v",
-			pf.Pid, backendExitTimeout, killErr)
+		if backendStillRunning(t, pf.Pid, token) {
+			t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s and could not be killed: %v",
+				pf.Pid, backendExitTimeout, killErr)
+		}
 		return
 	}
 	t.Errorf("dolt sql-server pid %d survived Shutdown by more than %s (force-killed)", pf.Pid, backendExitTimeout)
+}
+
+// backendStillRunning re-checks birth identity after procid.Open or
+// Handle.Kill failed, and reports whether the recorded server is verifiably
+// still there.
+//
+// Both calls verify the token themselves and return a plain "does not match
+// token" error when it no longer does — which is exactly what a process that
+// exited between the wait loop's last poll and the kill attempt produces, and
+// that error is NOT procid.IsProcessGone. Without this second look, a server
+// that shut down a few milliseconds late would be reported as one that
+// survived Shutdown entirely. A verify that itself errors reports "not
+// running": the run is over, and an inconclusive probe is not evidence of a
+// leak.
+func backendStillRunning(t *testing.T, pid int, token procid.Token) bool {
+	t.Helper()
+	same, err := procid.Verify(pid, token)
+	if err != nil {
+		t.Logf("procid.Verify(%d) after a failed kill attempt: %v", pid, err)
+		return false
+	}
+	return same
 }
 
 // TestReconcileVersionPersistsAcrossUOW is the one version assertion that

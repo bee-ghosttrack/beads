@@ -3,13 +3,10 @@
 package doltserver
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 // SweepOrphanedTestServers reaps `dolt sql-server` processes that are
@@ -25,7 +22,7 @@ import (
 func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
 	pids := selectOrphanTestServerPIDs(candidates, canonicalRoots(suiteTempRoots), tempDirRoots())
-	return reapServerPIDs(pids)
+	return reapServerPIDs(pids, isDoltServerProcess)
 }
 
 // sweepServersUnderRoots reaps only the dolt sql-servers whose working
@@ -37,48 +34,7 @@ func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 func sweepServersUnderRoots(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
 	pids := selectServersUnderRoots(candidates, canonicalRoots(suiteTempRoots))
-	return reapServerPIDs(pids)
-}
-
-// reapServerPIDs SIGTERMs each selected PID, then SIGKILLs whatever is still
-// alive a moment later, revalidating the process identity immediately before
-// each signal so a PID recycled since selection cannot be targeted.
-//
-// Returns the PIDs it sent a kill signal to.
-func reapServerPIDs(pids []int) []int {
-	self := os.Getpid()
-	var killed []int
-	for _, pid := range pids {
-		if pid == self {
-			continue
-		}
-		// Re-read the process command immediately before signaling so a PID
-		// recycled since candidate collection cannot target an unrelated
-		// process.
-		if !isDoltServerProcess(pid) {
-			continue
-		}
-		if err := syscall.Kill(pid, syscall.SIGTERM); err == nil {
-			killed = append(killed, pid)
-		}
-	}
-
-	if len(killed) == 0 {
-		return killed
-	}
-
-	fmt.Fprintf(os.Stderr, "Info: swept %d orphaned test dolt sql-server process(es): %v\n", len(killed), killed)
-
-	time.Sleep(300 * time.Millisecond)
-	for _, pid := range killed {
-		// Revalidate again before escalation for the same PID-reuse reason.
-		if !isDoltServerProcess(pid) {
-			continue
-		}
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
-
-	return killed
+	return reapServerPIDs(pids, isDoltServerProcess)
 }
 
 func gatherDoltServerCandidates() []serverCandidate {

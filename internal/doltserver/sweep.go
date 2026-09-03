@@ -97,8 +97,52 @@ func selectCandidatePIDs(candidates []serverCandidate, want func(serverCandidate
 // production workspace: the process temp dir (honoring TMPDIR, which the
 // suites pin to their own root) and /tmp, which os.MkdirTemp uses when TMPDIR
 // is unset and which several suites hardcode.
+//
+// Roots too broad to be evidence of anything are dropped — see
+// isCredibleTempRoot. TMPDIR is an environment variable, so "/" or a home
+// directory can land here, and a root that broad would restore exactly the
+// unbounded deleted-cwd arm this bound exists to remove.
 func tempDirRoots() []string {
-	return canonicalRoots([]string{os.TempDir(), "/tmp"})
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	var roots []string
+	for _, root := range canonicalRoots([]string{os.TempDir(), "/tmp"}) {
+		if !isCredibleTempRoot(root, home) {
+			continue
+		}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+// isCredibleTempRoot reports whether root is narrow enough to bound the
+// deleted-cwd arm. It rejects the filesystem root, a relative or empty path,
+// and any directory that IS the user's home or contains it — "/", "/Users",
+// "/home", $HOME itself. Everything a real temp dir looks like (/tmp,
+// /private/tmp, /var/folders/xx/yy/T, a pinned suite root) passes.
+//
+// The home test doubles as the breadth test: a directory holding the user's
+// home holds their workspaces too, so a deleted .beads/dolt under it would
+// again look like test debris.
+func isCredibleTempRoot(root, home string) bool {
+	cleaned := filepath.Clean(root)
+	if cleaned == "" || cleaned == "." || cleaned == string(filepath.Separator) {
+		return false
+	}
+	if !filepath.IsAbs(cleaned) {
+		return false
+	}
+	if home == "" {
+		return true
+	}
+	for _, h := range canonicalRoots([]string{home}) {
+		if isUnderDir(filepath.Clean(h), cleaned) {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalRoots expands each non-empty root into every form a process's
