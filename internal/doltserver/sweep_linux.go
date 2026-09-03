@@ -30,10 +30,13 @@ import (
 // caller vouches for as its own.
 //
 // A server whose working directory has been deleted (cwdDeleted, see
-// readProcCwd) is reaped unconditionally regardless of suiteTempRoots —
-// that is the unambiguous leak signature (a t.TempDir() cleanup ran out
-// from under a still-live detached server) and cannot occur for any
-// server, from any suite, that is still legitimately in use.
+// readProcCwd) is reaped regardless of suiteTempRoots, but only when the
+// path it used to name was under a temp dir (tempDirRoots). A deleted cwd
+// is the leak signature — a t.TempDir() cleanup ran out from under a
+// still-live detached server — yet on its own it does not distinguish a
+// test server from a production one whose workspace was moved, deleted, or
+// unmounted (a production server is spawned with cmd.Dir = the workspace's
+// .beads/dolt). The temp-dir bound keeps that arm on test debris.
 //
 // Safety is the whole point: this must never touch a developer's real
 // shared server. It only reads /proc (no killing) to build the candidate
@@ -46,8 +49,28 @@ import (
 // Returns the PIDs it sent a kill signal to.
 func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
-	pids := selectOrphanTestServerPIDs(candidates, suiteTempRoots)
+	pids := selectOrphanTestServerPIDs(candidates, canonicalRoots(suiteTempRoots), tempDirRoots())
+	return reapServerPIDs(pids)
+}
 
+// sweepServersUnderRoots reaps only the dolt sql-servers whose working
+// directory sits under one of suiteTempRoots. It is SweepOrphanedTestServers
+// without the deleted-cwd arm, for callers that must not reach outside the
+// trees they name — see selectServersUnderRoots.
+//
+// Returns the PIDs it sent a kill signal to.
+func sweepServersUnderRoots(suiteTempRoots ...string) []int {
+	candidates := gatherDoltServerCandidates()
+	pids := selectServersUnderRoots(candidates, canonicalRoots(suiteTempRoots))
+	return reapServerPIDs(pids)
+}
+
+// reapServerPIDs SIGTERMs each selected PID, then SIGKILLs whatever is still
+// alive a moment later, revalidating the process identity immediately before
+// each signal so a PID recycled since selection cannot be targeted.
+//
+// Returns the PIDs it sent a kill signal to.
+func reapServerPIDs(pids []int) []int {
 	self := os.Getpid()
 	var killed []int
 	for _, pid := range pids {

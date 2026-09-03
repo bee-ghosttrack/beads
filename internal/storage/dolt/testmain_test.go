@@ -57,6 +57,30 @@ func testMainInner(m *testing.M) int {
 	// separate flag from BEADS_TEST_MODE.
 	os.Setenv("BEADS_TEST_PDEATHSIG", "1")
 
+	// AD-01 (be-c5p): the test/bench harness opens a process-local dolt
+	// sql-server (testcontainer or external port). The new database-name
+	// firewall in dolt.New refuses test-named DBs unless this opt-in is set.
+	os.Setenv("BEADS_TEST_SERVER", "1")
+	if isHelperSubprocess() {
+		// A helper subprocess is handed its server's port by the parent test
+		// and never looks at this suite's own server. Starting one anyway
+		// costs a Dolt container plus a full migration chain per subprocess:
+		// TestMultiProcessSchemaInit spawns 8 at once, so the machine ran 9
+		// Dolt servers to measure a lock race between 8 clients of the
+		// parent's single server. Worse, every helper exits through os.Exit,
+		// which skips the deferred TerminateDoltContainer below and leaks the
+		// container. That load is what pushed the contended GET_LOCK past its
+		// 5s wait in CI shard 3.
+		//
+		// It returns BEFORE the suite temp root below for the same reason:
+		// eight concurrent helpers would each run the dead-root sweep and each
+		// claim a root of its own, and os.Exit would abandon every one of
+		// them. A helper needs neither — it inherits the parent's live
+		// BEADS_TEST_CIRCUIT_DIR through the BEADS_ allowlist in
+		// integration.FilterEnv, and the parent's root outlives it.
+		return m.Run()
+	}
+
 	// Suite-owned root for the orphan-server sweep below. Must never be a
 	// shared/global temp dir (see SweepOrphanedTestServers) — this one is
 	// unique to this test run and removed when it exits.
@@ -82,23 +106,6 @@ func testMainInner(m *testing.M) int {
 			return 1
 		}
 		defer os.Unsetenv(testCircuitBreakerDirEnv)
-	}
-
-	// AD-01 (be-c5p): the test/bench harness opens a process-local dolt
-	// sql-server (testcontainer or external port). The new database-name
-	// firewall in dolt.New refuses test-named DBs unless this opt-in is set.
-	os.Setenv("BEADS_TEST_SERVER", "1")
-	if isHelperSubprocess() {
-		// A helper subprocess is handed its server's port by the parent test
-		// and never looks at this suite's own server. Starting one anyway
-		// costs a Dolt container plus a full migration chain per subprocess:
-		// TestMultiProcessSchemaInit spawns 8 at once, so the machine ran 9
-		// Dolt servers to measure a lock race between 8 clients of the
-		// parent's single server. Worse, every helper exits through os.Exit,
-		// which skips the deferred TerminateDoltContainer below and leaks the
-		// container. That load is what pushed the contended GET_LOCK past its
-		// 5s wait in CI shard 3.
-		return m.Run()
 	}
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)

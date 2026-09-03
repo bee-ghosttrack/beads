@@ -4,8 +4,26 @@ package doltserver
 
 import (
 	"errors"
+	"os"
 	"syscall"
 )
+
+// rootOwnedBySelf reports whether the directory info describes is owned by
+// the user running this process.
+//
+// SweepDeadSuiteRoots globs a world-writable temp directory, so on a shared
+// box (/tmp, a CI runner with several users) anyone could plant a directory
+// carrying this suite's prefix and an owner marker naming a PID that is not
+// running, and have the sweep delete a tree of their choosing under the
+// caller's identity. Ownership is the cheap check that closes it. An
+// unreadable or unexpected stat shape reports false — not ours, leave it.
+func rootOwnedBySelf(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(stat.Uid) == os.Getuid()
+}
 
 // processAlive reports whether pid still names a running process, using the
 // signal-0 probe (kill(2) performs its permission and existence checks but

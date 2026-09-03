@@ -76,7 +76,7 @@ func TestParseDarwinCwdOrphanDetection(t *testing.T) {
 			wantOK:     false,
 		},
 		{
-			name:       "an empty n field is skipped in favour of the next one",
+			name:       "an empty n field is skipped in favor of the next one",
 			lsofOutput: "p123\nn\nn" + livePath + "\n",
 			stat:       statLive,
 			wantCwd:    livePath,

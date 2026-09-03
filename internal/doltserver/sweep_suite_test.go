@@ -70,9 +70,8 @@ func TestSuiteOwnerMarkerRoundTrip(t *testing.T) {
 
 // TestSweepDeadSuiteRootsSelection walks a synthetic temp directory holding
 // one of every case and asserts both halves of the outcome: which roots were
-// removed, and which roots SweepOrphanedTestServers was vouched for. Nothing
-// here signals a real process — the liveness probe and the reaper are
-// injected.
+// removed, and which roots the server reaper was vouched for. Nothing here
+// signals a real process — the liveness probe and the reaper are injected.
 func TestSweepDeadSuiteRootsSelection(t *testing.T) {
 	parent := t.TempDir()
 	const prefix = "beads-bd-tests-"
@@ -106,7 +105,10 @@ func TestSweepDeadSuiteRootsSelection(t *testing.T) {
 	elsewhere := t.TempDir()
 	link := filepath.Join(parent, prefix+"symlink")
 	if err := os.Symlink(elsewhere, link); err != nil {
-		t.Fatalf("symlink: %v", err)
+		// Windows without the create-symlink privilege; the rest of the
+		// case still carries its weight.
+		t.Logf("skipping the symlink leg: %v", err)
+		link = ""
 	}
 
 	var vouched []string
@@ -124,15 +126,95 @@ func TestSweepDeadSuiteRootsSelection(t *testing.T) {
 		t.Errorf("sweepDeadSuiteRoots() = %v, want %v", swept, want)
 	}
 	if want := []string{dead}; !reflect.DeepEqual(vouched, want) {
-		t.Errorf("SweepOrphanedTestServers vouched for %v, want %v", vouched, want)
+		t.Errorf("the server reaper was vouched for %v, want %v", vouched, want)
 	}
 	if _, err := os.Stat(dead); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("dead-owner root %s still present: %v", dead, err)
 	}
 	for _, keep := range []string{live, unclaimed, otherSuite, stray, link, elsewhere} {
+		if keep == "" {
+			continue
+		}
 		if _, err := os.Lstat(keep); err != nil {
 			t.Errorf("%s must have been left alone: %v", keep, err)
 		}
+	}
+}
+
+// TestSweepDeadSuiteRootsRestoresMarkerOnPartialRemoval covers the recovery
+// path for a removal that fails halfway. os.RemoveAll is not atomic and the
+// marker is an early casualty, so without the rewrite a root that could not
+// be fully deleted (a read-only Go module cache entry under cmd/bd's isolated
+// $HOME, say) would come back UNCLAIMED — and an unclaimed root is never
+// swept again, by design. The marker must go back naming the same dead owner.
+func TestSweepDeadSuiteRootsRestoresMarkerOnPartialRemoval(t *testing.T) {
+	parent := t.TempDir()
+	const prefix = "beads-partial-tests-"
+	const deadPID = 4242
+
+	root := filepath.Join(parent, prefix+"stuck")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := writeSuiteOwnerMarkerPID(root, deadPID); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Stand in for a partial os.RemoveAll: the marker is gone, the root is
+	// not, and an error comes back.
+	stubbornRemove := func(path string) error {
+		if err := os.Remove(filepath.Join(path, SuiteOwnerMarkerName)); err != nil {
+			t.Fatalf("simulate partial removal: %v", err)
+		}
+		return errors.New("permission denied")
+	}
+
+	swept := sweepDeadSuiteRoots(parent, prefix, func(int) bool { return false }, func(...string) []int { return nil }, stubbornRemove)
+	if len(swept) != 0 {
+		t.Errorf("sweepDeadSuiteRoots() = %v, want nothing reported as removed", swept)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("root should still be there: %v", err)
+	}
+	pid, ok := readSuiteOwnerMarker(root)
+	if !ok || pid != deadPID {
+		t.Fatalf("marker after a failed removal = (%d, %v), want (%d, true) so the next run retries", pid, ok, deadPID)
+	}
+
+	// And the next run, with removal working, finishes the job.
+	swept = sweepDeadSuiteRoots(parent, prefix, func(int) bool { return false }, func(...string) []int { return nil }, removeSuiteRoot)
+	if want := []string{root}; !reflect.DeepEqual(swept, want) {
+		t.Errorf("retry swept %v, want %v", swept, want)
+	}
+}
+
+// TestSweepDeadSuiteRootsRemovesReadOnlyDirs pins removeSuiteRoot's chmod
+// walk: cmd/bd's suite root doubles as an isolated $HOME and can hold
+// read-only Go module cache directories, which plain os.RemoveAll refuses.
+func TestSweepDeadSuiteRootsRemovesReadOnlyDirs(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	nested := filepath.Join(root, "pkg", "mod", "readonly")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "file"), []byte("x"), 0o400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(nested, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// Restore write permission whatever happens, so the test's own temp
+	// cleanup cannot fail.
+	t.Cleanup(func() { _ = os.Chmod(nested, 0o700) })
+
+	if err := os.RemoveAll(root); err == nil {
+		t.Skip("this platform's os.RemoveAll already handles read-only directories")
+	}
+	if err := removeSuiteRoot(root); err != nil {
+		t.Fatalf("removeSuiteRoot: %v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("root still present after removeSuiteRoot: %v", err)
 	}
 }
 
@@ -181,7 +263,7 @@ func TestSweepDeadSuiteRootsSkipsSelf(t *testing.T) {
 	}
 
 	// Real liveness probe this time: our own PID must read as alive.
-	swept := sweepDeadSuiteRoots(parent, prefix, processAlive, SweepOrphanedTestServers, os.RemoveAll)
+	swept := sweepDeadSuiteRoots(parent, prefix, processAlive, sweepServersUnderRoots, removeSuiteRoot)
 	if len(swept) != 0 {
 		t.Fatalf("sweepDeadSuiteRoots removed %v, including this process's own root", swept)
 	}

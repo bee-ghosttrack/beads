@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,8 +24,28 @@ import (
 // Returns the PIDs it sent a kill signal to.
 func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 	candidates := gatherDoltServerCandidates()
-	pids := selectOrphanTestServerPIDs(candidates, canonicalDarwinRoots(suiteTempRoots))
+	pids := selectOrphanTestServerPIDs(candidates, canonicalRoots(suiteTempRoots), tempDirRoots())
+	return reapServerPIDs(pids)
+}
 
+// sweepServersUnderRoots reaps only the dolt sql-servers whose working
+// directory sits under one of suiteTempRoots. It is SweepOrphanedTestServers
+// without the deleted-cwd arm, for callers that must not reach outside the
+// trees they name — see selectServersUnderRoots.
+//
+// Returns the PIDs it sent a kill signal to.
+func sweepServersUnderRoots(suiteTempRoots ...string) []int {
+	candidates := gatherDoltServerCandidates()
+	pids := selectServersUnderRoots(candidates, canonicalRoots(suiteTempRoots))
+	return reapServerPIDs(pids)
+}
+
+// reapServerPIDs SIGTERMs each selected PID, then SIGKILLs whatever is still
+// alive a moment later, revalidating the process identity immediately before
+// each signal so a PID recycled since selection cannot be targeted.
+//
+// Returns the PIDs it sent a kill signal to.
+func reapServerPIDs(pids []int) []int {
 	self := os.Getpid()
 	var killed []int
 	for _, pid := range pids {
@@ -60,25 +79,6 @@ func SweepOrphanedTestServers(suiteTempRoots ...string) []int {
 	}
 
 	return killed
-}
-
-// canonicalDarwinRoots makes caller roots comparable with lsof output. macOS
-// commonly reports a cwd below /private/var while os.MkdirTemp returned the
-// equivalent /var path.
-func canonicalDarwinRoots(roots []string) []string {
-	canonical := make([]string, 0, len(roots))
-	for _, root := range roots {
-		if root == "" {
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(root)
-		if err != nil {
-			canonical = append(canonical, root)
-			continue
-		}
-		canonical = append(canonical, resolved)
-	}
-	return canonical
 }
 
 func gatherDoltServerCandidates() []serverCandidate {

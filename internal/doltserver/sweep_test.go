@@ -1,6 +1,8 @@
 package doltserver
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -15,11 +17,18 @@ import (
 // servers all living under os.TempDir(), and only a suite's own scoped
 // root may reap its own debris, not everyone else's (gastownhall/beads
 // mybd-q6cz).
+//
+// The second bound is on the deleted-cwd arm: a deleted working directory
+// only counts as debris when the path it named was under a TEMP root. A
+// production server is spawned with cmd.Dir = <workspace>/.beads/dolt, so
+// without that bound a moved workspace or an unmounted volume would make a
+// developer's live server look exactly like test debris (wy-j2zc8q).
 func TestSelectOrphanTestServerPIDs(t *testing.T) {
 	cases := []struct {
 		name       string
 		candidates []serverCandidate
 		suiteRoots []string
+		tempRoots  []string
 		want       []int
 	}{
 		{
@@ -28,6 +37,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 100, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/beads-bd-tests-xyz/.beads/dolt", cwdDeleted: true},
 			},
 			suiteRoots: nil,
+			tempRoots:  []string{"/tmp"},
 			want:       []int{100},
 		},
 		{
@@ -36,6 +46,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 101, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/my-suite-root/.beads/dolt"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       []int{101},
 		},
 		{
@@ -44,6 +55,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 102, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/other-suite-xyz/.beads/dolt"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -52,6 +64,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 103, cmdline: "dolt --prof cpu --prof-path /tmp/my-suite-root/dolt-pprof sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/my-suite-root/.beads/dolt"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       []int{103},
 		},
 		{
@@ -60,6 +73,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 200, cmdline: "dolt sql-server -H 127.0.0.1 -P 3307", cwd: "/home/dev/project/.beads/dolt"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -68,6 +82,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 201, cmdline: "some-other-binary --flag", cwd: "/tmp/my-suite-root/whatever"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -76,6 +91,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 202, cmdline: "dolt status", cwd: "/tmp/my-suite-root/whatever"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -84,6 +100,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 203, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: ""},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -92,6 +109,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 204, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/my-suite-root2/evil"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -100,6 +118,7 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 205, cmdline: "dolt sql-server -H 127.0.0.1 -P 12345", cwd: "/tmp/some-suite/.beads/dolt"},
 			},
 			suiteRoots: nil,
+			tempRoots:  []string{"/tmp"},
 			want:       nil,
 		},
 		{
@@ -111,13 +130,68 @@ func TestSelectOrphanTestServerPIDs(t *testing.T) {
 				{pid: 303, cmdline: "dolt sql-server -P 4", cwdDeleted: true, cwd: "/tmp/whatever-else/.beads/dolt"},
 			},
 			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp"},
 			want:       []int{302, 303},
+		},
+		{
+			name: "a PRODUCTION server whose workspace was moved or deleted is left alone",
+			candidates: []serverCandidate{
+				{pid: 400, cmdline: "dolt sql-server --config /Users/dev/project/.beads/dolt-server-config.yaml", cwd: "/Users/dev/project/.beads/dolt", cwdDeleted: true},
+			},
+			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  []string{"/tmp", "/private/var/folders/c1/xx/T"},
+			want:       nil,
+		},
+		{
+			name: "a production server on an unmounted volume is left alone",
+			candidates: []serverCandidate{
+				{pid: 401, cmdline: "dolt sql-server -P 3307", cwd: "/Volumes/external/work/.beads/dolt", cwdDeleted: true},
+			},
+			suiteRoots: nil,
+			tempRoots:  []string{"/tmp"},
+			want:       nil,
+		},
+		{
+			name: "the observed orphan: deleted cwd under the macOS private temp form is reaped with no suite roots",
+			candidates: []serverCandidate{
+				{pid: 402, cmdline: "dolt sql-server --config /private/var/folders/c1/xx/T/TestUOWDependencyEditorContract1/003/config.yaml", cwd: "/private/var/folders/c1/xx/T/TestUOWDependencyEditorContract1/002", cwdDeleted: true},
+			},
+			suiteRoots: nil,
+			tempRoots:  []string{"/var/folders/c1/xx/T", "/private/var/folders/c1/xx/T"},
+			want:       []int{402},
+		},
+		{
+			name: "the same orphan reported in the unresolved /var form is reaped too",
+			candidates: []serverCandidate{
+				{pid: 403, cmdline: "dolt sql-server -P 1", cwd: "/var/folders/c1/xx/T/TestUOWDependencyEditorContract1/002", cwdDeleted: true},
+			},
+			suiteRoots: nil,
+			tempRoots:  []string{"/var/folders/c1/xx/T", "/private/var/folders/c1/xx/T"},
+			want:       []int{403},
+		},
+		{
+			name: "a deleted cwd inside the caller's own suite root needs no temp root at all",
+			candidates: []serverCandidate{
+				{pid: 404, cmdline: "dolt sql-server -P 1", cwd: "/opt/scratch/my-suite-root/.beads/dolt", cwdDeleted: true},
+			},
+			suiteRoots: []string{"/opt/scratch/my-suite-root"},
+			tempRoots:  nil,
+			want:       []int{404},
+		},
+		{
+			name: "no temp roots at all disables the deleted-cwd arm entirely",
+			candidates: []serverCandidate{
+				{pid: 405, cmdline: "dolt sql-server -P 1", cwd: "/tmp/some-suite/.beads/dolt", cwdDeleted: true},
+			},
+			suiteRoots: []string{"/tmp/my-suite-root"},
+			tempRoots:  nil,
+			want:       nil,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := selectOrphanTestServerPIDs(tc.candidates, tc.suiteRoots)
+			got := selectOrphanTestServerPIDs(tc.candidates, tc.suiteRoots, tc.tempRoots)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("selectOrphanTestServerPIDs() = %v, want %v", got, tc.want)
 			}
@@ -175,9 +249,91 @@ not-a-pid dolt sql-server
 		t.Fatalf("gatherPSCandidates() = %#v, want %#v", candidates, wantCandidates)
 	}
 
-	gotPIDs := selectOrphanTestServerPIDs(candidates, []string{"/tmp/my-suite"})
+	gotPIDs := selectOrphanTestServerPIDs(candidates, []string{"/tmp/my-suite"}, []string{"/tmp"})
 	wantPIDs := []int{101, 103}
 	if !reflect.DeepEqual(gotPIDs, wantPIDs) {
 		t.Errorf("darwin ps selection path = %v, want %v", gotPIDs, wantPIDs)
+	}
+}
+
+// TestSelectServersUnderSuiteRoots pins the strictly root-scoped selection
+// SweepDeadSuiteRoots relies on. It runs at suite START, with sibling
+// packages mid-run, so it must reap only what is provably inside the roots
+// it was handed: no deleted-cwd arm, no temp-dir reasoning of any kind.
+func TestSelectServersUnderSuiteRoots(t *testing.T) {
+	candidates := []serverCandidate{
+		{pid: 500, cmdline: "dolt sql-server -P 1", cwd: "/tmp/dead-root/.beads/dolt"},
+		{pid: 501, cmdline: "dolt sql-server -P 2", cwd: "/tmp/dead-root/nested/deeper/dolt", cwdDeleted: true},
+		{pid: 502, cmdline: "dolt sql-server -P 3", cwd: "/tmp/live-sibling-root/.beads/dolt"},
+		{pid: 503, cmdline: "dolt sql-server -P 4", cwd: "/tmp/some-other-suite/.beads/dolt", cwdDeleted: true},
+		{pid: 504, cmdline: "dolt sql-server -P 5", cwd: "/Users/dev/project/.beads/dolt", cwdDeleted: true},
+		{pid: 505, cmdline: "not-dolt --flag", cwd: "/tmp/dead-root/whatever"},
+		{pid: 506, cmdline: "dolt sql-server -P 6", cwd: ""},
+	}
+
+	got := selectServersUnderRoots(candidates, []string{"/tmp/dead-root"})
+	want := []int{500, 501}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("selectServersUnderRoots() = %v, want %v", got, want)
+	}
+
+	if got := selectServersUnderRoots(candidates, nil); got != nil {
+		t.Errorf("selectServersUnderRoots() with no roots = %v, want nothing", got)
+	}
+}
+
+// TestCanonicalRootsForSweep covers the path-form expansion that lets a root
+// match however the OS reports a process's cwd.
+func TestCanonicalRootsForSweep(t *testing.T) {
+	if got := canonicalRoots(nil); got != nil {
+		t.Errorf("canonicalRoots(nil) = %v, want nothing", got)
+	}
+	if got := canonicalRoots([]string{"", ""}); got != nil {
+		t.Errorf("canonicalRoots(empties) = %v, want nothing", got)
+	}
+
+	// A path that cannot be resolved is still kept as given.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if got := canonicalRoots([]string{missing}); !reflect.DeepEqual(got, []string{missing}) {
+		t.Errorf("canonicalRoots(%q) = %v, want just the literal path", missing, got)
+	}
+
+	// A real directory reached through a symlink yields both forms, in that
+	// order, with no duplicates — this is what makes macOS's
+	// /var/folders/… vs /private/var/folders/… pair match.
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", link, err)
+	}
+	got := canonicalRoots([]string{link, link, resolved})
+	want := []string{link, resolved}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("canonicalRoots() = %v, want %v", got, want)
+	}
+}
+
+// TestTempDirRootsBoundTheOrphanArm checks that the deleted-cwd bound
+// actually covers the directory this process's own t.TempDir() lands in —
+// if it did not, the arm would silently never fire.
+func TestTempDirRootsBoundTheOrphanArm(t *testing.T) {
+	roots := tempDirRoots()
+	if len(roots) == 0 {
+		t.Fatal("tempDirRoots() is empty; the deleted-cwd arm could never fire")
+	}
+	dir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		resolved = dir
+	}
+	if !underAnyRoot(dir, roots) && !underAnyRoot(resolved, roots) {
+		t.Errorf("t.TempDir() %q (resolved %q) is under none of tempDirRoots() %v", dir, resolved, roots)
+	}
+	if underAnyRoot("/Users/dev/project/.beads/dolt", roots) {
+		t.Errorf("a production workspace path matched tempDirRoots() %v", roots)
 	}
 }
