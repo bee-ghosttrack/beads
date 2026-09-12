@@ -70,7 +70,7 @@ func testMainInner(m *testing.M) int {
 	// and roots whose owner is still running, are left untouched.
 	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
 
-	// Pin t.TempDir() under a suite-owned root so SweepOrphanedTestServers
+	// Pin t.TempDir() under a suite-owned root so SweepSuiteTestServers
 	// can reap AutoStart leftovers whose t.TempDir() cleanup failed because
 	// the live child still holds the tree (gastownhall/beads#5631).
 	root, pinErr := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
@@ -115,7 +115,7 @@ func testMainInner(m *testing.M) int {
 	// Best-effort reap of any dolt sql-server left running under a temp dir
 	// this suite created (e.g. a SIGKILLed run) — see
 	// gastownhall/beads mybd-q6cz / #5631.
-	swept := doltserver.SweepOrphanedTestServers(root, testBDDir)
+	swept := doltserver.SweepSuiteTestServers(root, testBDDir)
 	code = doltserver.ApplyLeakPolicy("cmd/bd/doctor", code, swept)
 
 	os.Unsetenv("BEADS_DOLT_PORT")

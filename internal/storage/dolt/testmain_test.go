@@ -106,7 +106,7 @@ func testMainInner(m *testing.M) int {
 	}
 
 	// Suite-owned root for the orphan-server sweep below. Must never be a
-	// shared/global temp dir (see SweepOrphanedTestServers) — this one is
+	// shared/global temp dir (see SweepSuiteTestServers) — this one is
 	// unique to this test run and removed when it exits.
 	//
 	// Before claiming one, clear out the roots of earlier runs of this suite
@@ -116,7 +116,7 @@ func testMainInner(m *testing.M) int {
 	// owner is still running, are left untouched.
 	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
 
-	suiteTempRoot, tempRootErr := os.MkdirTemp("", suiteRootPrefix+"*")
+	suiteTempRoot, tempRootErr := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
 	if tempRootErr != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to create suite temp root: %v\n", tempRootErr)
 		return 1
@@ -171,7 +171,7 @@ func testMainInner(m *testing.M) int {
 	// suite's own temp root (e.g. a SIGKILLed run of the multiprocess
 	// schema init tests, which call doltserver.Start directly) — see
 	// gastownhall/beads mybd-q6cz.
-	swept := doltserver.SweepOrphanedTestServers(suiteTempRoot)
+	swept := doltserver.SweepSuiteTestServers(suiteTempRoot)
 	code = doltserver.ApplyLeakPolicy("internal/storage/dolt", code, swept)
 
 	testServerPort = 0
@@ -181,7 +181,7 @@ func testMainInner(m *testing.M) int {
 	return code
 }
 
-// suiteRootPrefix is testMainInner's os.MkdirTemp pattern without its random
+// suiteRootPrefix is testMainInner's PinSuiteTempRoot pattern without its random
 // tail. It is what SweepDeadSuiteRoots globs for, so the two must not drift.
 const suiteRootPrefix = "beads-storage-dolt-tests-"
 

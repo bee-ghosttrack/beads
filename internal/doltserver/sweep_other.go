@@ -5,6 +5,9 @@ package doltserver
 // SweepOrphanedTestServers is a no-op on platforms where process command
 // lines and working directories cannot be inspected by an implementation in
 // this package. The stub keeps callers (test TestMains) portable.
+//
+// Deprecated: use SweepSuiteTestServers for suite shutdown and
+// SweepDeadSuiteRoots for abandoned runs.
 func SweepOrphanedTestServers(_ ...string) []SweptServer {
 	return nil
 }

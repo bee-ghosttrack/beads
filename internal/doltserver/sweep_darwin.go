@@ -18,6 +18,11 @@ import (
 // a shared/global temp directory. This is best-effort: process-listing errors
 // and candidates whose cwd cannot be resolved are ignored.
 //
+// Deprecated: use SweepSuiteTestServers for suite shutdown and
+// SweepDeadSuiteRoots for abandoned runs. This global sweep can consume leak
+// evidence belonging to a still-running foreign suite; do not call it from
+// TestMain or pass its result to ApplyLeakPolicy.
+//
 // Returns the servers (pid + cwd) it sent a kill signal to.
 func SweepOrphanedTestServers(suiteTempRoots ...string) []SweptServer {
 	candidates := gatherDoltServerCandidates()

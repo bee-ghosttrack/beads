@@ -9,41 +9,17 @@ import (
 	"strings"
 )
 
-// SweepOrphanedTestServers reaps `dolt sql-server` processes that are
-// provably leaked test debris: their working directory has been deleted, or
-// sits under one of suiteTempRoots. It is meant to be called once, from a
-// test suite's TestMain, after m.Run() returns — a backstop for servers
-// that survived an interrupted (e.g. SIGKILLed) test run despite the
-// test-mode Pdeathsig in procattr_linux.go.
+// SweepOrphanedTestServers reaps dolt sql-servers under suiteTempRoots and
+// deleted-cwd servers under credible global temp roots. A root must belong
+// exclusively to the caller, never be a shared/global temp directory.
 //
-// suiteTempRoots MUST be directories owned by (anchored under) the calling
-// suite alone — e.g. a package's own testTempRoot — never a shared/global
-// temp dir such as os.TempDir(). scripts/test.sh runs packages in parallel
-// (-p N), so a global root would make every *other* suite's still-running
-// server (whose data dir also happens to live under os.TempDir(), which is
-// true of essentially all of them) look like debris and get SIGTERM'd
-// mid-run. That is why this function never defaults to os.TempDir() itself:
-// a live server is only ever reaped when its cwd is nested under a root the
-// caller vouches for as its own.
+// Deprecated: use SweepSuiteTestServers for suite shutdown and
+// SweepDeadSuiteRoots for abandoned runs. This global sweep can consume leak
+// evidence belonging to a still-running foreign suite; do not call it from
+// TestMain or pass its result to ApplyLeakPolicy.
 //
-// A server whose working directory has been deleted (cwdDeleted, see
-// readProcCwd) is reaped regardless of suiteTempRoots, but only when the
-// path it used to name was under a temp dir (tempDirRoots). A deleted cwd
-// is the leak signature — a t.TempDir() cleanup ran out from under a
-// still-live detached server — yet on its own it does not distinguish a
-// test server from a production one whose workspace was moved, deleted, or
-// unmounted (a production server is spawned with cmd.Dir = the workspace's
-// .beads/dolt). The temp-dir bound keeps that arm on test debris.
-//
-// Safety is the whole point: this must never touch a developer's real
-// shared server. It only reads /proc (no killing) to build the candidate
-// list, and selectOrphanTestServers only matches processes whose data
-// directory is gone or explicitly caller-scoped — a production server's
-// data directory is neither. Errors reading /proc for any single PID just
-// drop that PID from consideration; this function is best-effort and never
-// returns an error itself.
-//
-// Returns the servers (pid + cwd) it sent a kill signal to.
+// Returns the servers (pid + cwd) it sent a kill signal to. Process-listing
+// errors and candidates whose cwd cannot be resolved are ignored.
 func SweepOrphanedTestServers(suiteTempRoots ...string) []SweptServer {
 	candidates := gatherDoltServerCandidates()
 	selected := selectOrphanTestServers(candidates, canonicalRoots(suiteTempRoots), tempDirRoots())

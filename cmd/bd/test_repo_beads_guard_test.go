@@ -51,11 +51,11 @@ type testRunner interface {
 
 func runTestsAndSweep(m testRunner) int {
 	code := m.Run()
-	swept := doltserver.SweepOrphanedTestServers(testTempRoot)
+	swept := doltserver.SweepSuiteTestServers(testTempRoot)
 	return doltserver.ApplyLeakPolicy("cmd/bd", code, swept)
 }
 
-// suiteRootPrefix is testMainInner's os.MkdirTemp pattern without its random
+// suiteRootPrefix is testMainInner's PinSuiteTempRoot pattern without its random
 // tail. It is what SweepDeadSuiteRoots globs for, so the two must not drift.
 const suiteRootPrefix = "beads-bd-tests-"
 
@@ -81,7 +81,7 @@ func testMainInner(m *testing.M) int {
 	// marker, and roots whose owner is still running, are left untouched.
 	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
 
-	tmp, err := os.MkdirTemp("", suiteRootPrefix+"*")
+	tmp, err := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 		return 1
@@ -126,10 +126,18 @@ func testMainInner(m *testing.M) int {
 	// daemons like OrbStack (bd-84kos).
 	testutil.PinDockerHostFromContext()
 
-	_ = os.Setenv("HOME", tmp)
-	_ = os.Setenv("USERPROFILE", tmp) // Windows compatibility
-	_ = os.Setenv("APPDATA", filepath.Join(tmp, "AppData", "Roaming"))
-	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg-config"))
+	// Keep HOME beside the fixture directories, not above them. Tests may
+	// create ~/.beads; putting it on their ancestry would make repository
+	// discovery pick up unrelated suite state before trying worktree fallback.
+	home := filepath.Join(tmp, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create test home: %v\n", err)
+		return 1
+	}
+	_ = os.Setenv("HOME", home)
+	_ = os.Setenv("USERPROFILE", home) // Windows compatibility
+	_ = os.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg-config"))
 	_ = os.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
 
 	// Keep telemetry out of the test suite entirely (wy-12x1p).

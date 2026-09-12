@@ -322,7 +322,19 @@ func TestApplyLeakPolicyForSuite(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(AllowLeakEnv, tc.env)
-			if got := ApplyLeakPolicy("internal/doltserver", tc.code, tc.swept); got != tc.want {
+			// Capture stderr even though this test asserts only the exit
+			// code. ApplyLeakPolicy's sole side effect is printing, and the
+			// line it prints for the leak cases is byte-identical to a real
+			// leak failure — so an uncaptured table run emits
+			// "FAIL: internal/doltserver leaked 1 dolt sql-server ..." from a
+			// PASSING test on every green run of this package. That trains
+			// readers and CI log scrapers to ignore the exact signal this
+			// package exists to raise. The sibling
+			// TestApplyLeakPolicyNamesTheLeakingDirectory proves captureStderr
+			// composes with assertions on the same call.
+			var got int
+			captureStderr(t, func() { got = ApplyLeakPolicy("internal/doltserver", tc.code, tc.swept) })
+			if got != tc.want {
 				t.Errorf("ApplyLeakPolicy(%d, %v) with %s=%q = %d, want %d",
 					tc.code, tc.swept, AllowLeakEnv, tc.env, got, tc.want)
 			}

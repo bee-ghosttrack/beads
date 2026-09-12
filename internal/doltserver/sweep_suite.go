@@ -120,12 +120,9 @@ func decideSuiteRoot(hasMarker, ownerAlive bool) suiteRootAction {
 // that owner is gone. Live sibling runs (marker + live PID) and unclaimed
 // leftovers (no marker) are both left exactly as they are.
 //
-// The per-root reap is sweepServersUnderRoots, NOT SweepOrphanedTestServers:
-// this runs at suite START, while sibling packages (go test -p N) are mid-run,
-// so it must only ever reach processes provably inside the dead root it is
-// cleaning up. SweepOrphanedTestServers' extra deleted-cwd arm spans every
-// temp dir on the box and belongs only at end-of-run, where the suite is the
-// last thing standing.
+// The per-root reap is strictly root-scoped. Sibling packages may still be
+// running at either startup or shutdown, so neither sweep may consume their
+// leak evidence. Abandoned-run cleanup is separate from this run's leak policy.
 func SweepDeadSuiteRoots(parentDir, prefix string) []string {
 	return sweepDeadSuiteRoots(parentDir, prefix, processAlive, sweepServersUnderRoots, removeSuiteRoot)
 }
@@ -211,7 +208,21 @@ func sweepDeadSuiteRoots(
 	return swept
 }
 
-// ApplyLeakPolicy folds the result of a post-run SweepOrphanedTestServers
+// SweepSuiteTestServers reaps only dolt sql-servers under suiteTempRoots,
+// including servers whose working directory has been deleted. Call it after
+// m.Run, before removing the roots, and pass its result to ApplyLeakPolicy.
+// Every root must belong exclusively to this suite; never pass a shared temp
+// directory. No roots means no servers are selected.
+//
+// Unlike SweepOrphanedTestServers, it never reaps deleted-cwd debris outside
+// those roots: a foreign suite may still be running and must retain its own
+// leak evidence. Use SweepDeadSuiteRoots separately at startup to clean up
+// abandoned runs without charging their leaks to the current run.
+func SweepSuiteTestServers(suiteTempRoots ...string) []SweptServer {
+	return sweepServersUnderRoots(suiteTempRoots...)
+}
+
+// ApplyLeakPolicy folds the result of a post-run SweepSuiteTestServers
 // call into the suite's exit code. suite names the package for the log line.
 //
 // A non-empty sweep means the suite leaked a dolt sql-server: the tests

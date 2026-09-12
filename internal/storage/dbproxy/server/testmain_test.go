@@ -1,4 +1,4 @@
-package uow
+package server_test
 
 import (
 	"fmt"
@@ -9,25 +9,33 @@ import (
 	"github.com/steveyegge/beads/internal/testutil"
 )
 
-// suiteRootPrefix is this suite's os.MkdirTemp pattern without its random
-// tail. SweepDeadSuiteRoots globs for it, so the two must not drift.
-const suiteRootPrefix = "beads-storage-uow-tests-"
+// suiteRootPrefix is this suite's PinSuiteTempRoot pattern without its random
+// tail. SweepDeadSuiteRoots globs for it, so the two must not drift. It is
+// deliberately short: this package's unix-socket test builds a socket path
+// under t.TempDir(), and sun_path is 108 bytes on linux / 104 on macOS.
+const suiteRootPrefix = "beads-dbproxy-server-tests-"
 
 // suiteTempRoot is the TestMain-owned temp directory that every t.TempDir()
-// in this package lands under, so SweepSuiteTestServers has a root it can
-// vouch for when it reaps leaked dolt sql-servers.
+// in this package lands under, so the sweeps have a root they can vouch for.
 var suiteTempRoot string
 
-// TestMain gives this package the suite-lifecycle it was missing.
+// TestMain puts this package under the same suite-lifecycle contract as every
+// other package that daemonizes a `dolt sql-server`.
 //
-// The integration tests here (newTestUOWProvider) start a real proxied
-// `dolt sql-server` whose data directory is a t.TempDir(). Cleanup was purely
-// per-test — proxy.Shutdown in a t.Cleanup — and there was no TestMain at
-// all, so a run killed by `go test -timeout` (which panics the binary and
-// skips every Cleanup) left the server running with its data directory
-// deleted out from under it, forever. Observed live on a dev box as a
-// TestUOWDependencyEditorContract server still serving a temp dir that had
-// been gone for hours (wy-j2zc8q).
+// This suite starts real servers: newDoltServer (and the fixtures that build
+// a DoltServer by hand) spawn `dolt sql-server` with cmd.Dir set to the
+// rootDir, which is a t.TempDir(). Until now the package had no TestMain at
+// all, which left two holes:
+//
+//   - A run killed by `go test -timeout`, CI cancel, or Ctrl-C skips every
+//     t.Cleanup, so the server outlives the test binary. Its cwd survives too
+//     (nothing deleted it), and this package claimed no suite root — so that
+//     debris was reachable by neither arm of the sweep and simply accumulated.
+//     Claiming a root here is what makes the NEXT run able to reap it.
+//
+//   - A server this suite leaks on a normal run has its cwd deleted by
+//     t.TempDir's RemoveAll. A root-scoped post-run sweep detects that leak
+//     and fails this package without consuming another live suite's evidence.
 func TestMain(m *testing.M) {
 	os.Exit(testMainInner(m))
 }
@@ -40,8 +48,8 @@ func testMainInner(m *testing.M) int {
 	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
 
 	// Pin TMPDIR under a suite-owned root so every t.TempDir() — including
-	// the storeRootDir a provider serves — is nested under something the
-	// post-run sweep may vouch for. Same pattern as cmd/bd/doctor's TestMain.
+	// each server's rootDir, which is its working directory — is nested under
+	// something the sweeps may vouch for.
 	root, pinErr := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
 	if pinErr != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: suite temp root: %v\n", pinErr)
@@ -61,7 +69,7 @@ func testMainInner(m *testing.M) int {
 	// Best-effort reap of any dolt sql-server still running under this run's
 	// own root — the backstop for a test whose Cleanup did not get to run.
 	swept := doltserver.SweepSuiteTestServers(root)
-	return doltserver.ApplyLeakPolicy("internal/storage/uow", code, swept)
+	return doltserver.ApplyLeakPolicy("internal/storage/dbproxy/server", code, swept)
 }
 
 // TestTempDirLandsUnderSuiteSweepRoot guards the pinning above: if t.TempDir()
