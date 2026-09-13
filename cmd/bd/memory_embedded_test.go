@@ -3,7 +3,10 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -607,6 +610,49 @@ func TestEmbeddedMemoryCorpusBudget(t *testing.T) {
 		}
 		if out := bdRecall(t, bd, dir, "pad"); !strings.Contains(out, strings.Repeat("b", 90)) {
 			t.Errorf("a refused write must leave the old content intact, got %q", out)
+		}
+	})
+
+	// The same refusal under --json is said ONCE, and only on stdout: the
+	// machine-readable envelope, nothing else. Printing the prose to stderr as
+	// well would deliver one refusal twice to a caller reading both streams.
+	t.Run("json_refusal_is_said_once", func(t *testing.T) {
+		stdout, stderr, err := bdRememberBuffers(t, bd, dir, strings.Repeat("d", 91), "--key", "pad", "--json")
+		if err == nil {
+			t.Fatalf("a --json write one byte over the budget must exit nonzero; stdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+
+		// Exactly ONE JSON document on stdout — no second envelope, no prose
+		// before or after it.
+		dec := json.NewDecoder(strings.NewReader(stdout))
+		var doc map[string]interface{}
+		if decErr := dec.Decode(&doc); decErr != nil {
+			t.Fatalf("stdout is not a JSON document (%v):\n%s", decErr, stdout)
+		}
+		if decErr := dec.Decode(new(json.RawMessage)); !errors.Is(decErr, io.EOF) {
+			t.Errorf("stdout carries more than one JSON document (second Decode = %v):\n%s", decErr, stdout)
+		}
+
+		// The envelope carries the refusal sentence, under either the enveloped
+		// or the flat error shape.
+		inner := doc
+		if data, ok := doc["data"].(map[string]interface{}); ok {
+			inner = data
+		}
+		msg, _ := inner["error"].(string)
+		want := "bd remember: memory corpus would be 101 chars, budget is 100 (101%) — refused; use --force to override"
+		if msg != want {
+			t.Errorf("JSON error = %q, want %q (full stdout:\n%s)", msg, want, stdout)
+		}
+
+		// ...and stderr says nothing, so the refusal arrived exactly once.
+		if strings.Contains(stderr, "memory corpus") {
+			t.Errorf("--json refusal must not also print the prose line to stderr, got stderr %q", stderr)
+		}
+
+		// A refused --json write still leaves the old content intact.
+		if out := bdRecall(t, bd, dir, "pad"); !strings.Contains(out, strings.Repeat("b", 90)) {
+			t.Errorf("a refused --json write must leave the old content intact, got %q", out)
 		}
 	})
 

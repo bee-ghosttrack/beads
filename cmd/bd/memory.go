@@ -168,13 +168,22 @@ func projectedMemoryCorpusChars(existing map[string]string, key, content string)
 // Below 80%, and whenever the budget is off, it returns "" and the command is
 // silent — byte-identical to the pre-budget behavior.
 //
-// The percentage is floor(projected*100/budget) over int64, so a large budget
+// The percentage FLOORS within the budget and CEILINGS over it, and the
+// rounding is not cosmetic: floor(201*100/200) is 100, and "100%" is exactly
+// the at-budget reading this code deliberately ALLOWS — so a floored refusal
+// would report the number of the case it is not. Ceiling above the line makes
+// every over-budget line read 101% or more, and the split is on the VALUE, not
+// on --force, so the same projection never reports two different percentages
+// depending on a flag. Both forms are int64 arithmetic, so a large budget
 // cannot overflow the comparison.
 func memoryBudgetLine(projected, budget int, force bool) (line string, refuse bool) {
 	if budget <= 0 {
 		return "", false
 	}
 	pct := int(int64(projected) * 100 / int64(budget))
+	if projected > budget {
+		pct = int((int64(projected)*100 + int64(budget) - 1) / int64(budget))
+	}
 	switch {
 	case projected > budget && !force:
 		return fmt.Sprintf("bd remember: memory corpus would be %d chars, budget is %d (%d%%) — refused; use --force to override", projected, budget, pct), true
@@ -445,6 +454,11 @@ Examples:
 		}
 		var budgetLine string
 		if budget := memoryCorpusBudget(); budget > 0 && budgetKey != "" && strings.TrimSpace(insight) != "" {
+			// ADVISORY, not atomic: this List and the Remember below are
+			// separate transactions, so two concurrent writers can both measure
+			// a corpus inside the budget and both land, leaving it over. The
+			// budget is a guardrail against a corpus drifting past its ceiling
+			// one deliberate write at a time, not a hard limit — no locking.
 			corpus, err := memories.List(rootCtx, memoryops.ListRequest{})
 			if err != nil {
 				return HandleErrorRespectJSON("reading the memory corpus for the budget check: %v", err)
@@ -453,13 +467,18 @@ Examples:
 			if refuse {
 				// The budget line IS the refusal sentence, so it prints as
 				// itself: routing it through HandleError would prefix it with
-				// "Error: " and reword text agents will match on. It goes to
-				// STDERR on every route, including --json, so structured
-				// output can never be corrupted by it; --json additionally
-				// gets the normal machine-readable error object on stdout.
-				fmt.Fprintln(os.Stderr, line)
+				// "Error: " and reword text agents will match on.
+				//
+				// It is said ONCE, on exactly one stream, the way
+				// HandleErrorWithHintRespectJSON does it: --json gets only the
+				// machine-readable envelope on stdout (printing the prose to
+				// stderr as well would make the same refusal arrive twice),
+				// and every other route gets the bare sentence on stderr,
+				// where it can never corrupt structured output.
 				if jsonOutput {
 					jsonStdoutError(line, "raise memories.budget-chars, forget a memory, or pass --force")
+				} else {
+					fmt.Fprintln(os.Stderr, line)
 				}
 				return SilentExit()
 			}

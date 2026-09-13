@@ -138,7 +138,11 @@ func TestRememberBudgetVerdictBoundary(t *testing.T) {
 	if !refuse {
 		t.Fatalf("a projection one byte over the budget must refuse, got line %q", over)
 	}
-	want := "bd remember: memory corpus would be 201 chars, budget is 200 (100%) — refused; use --force to override"
+	// 201 of 200 is 100.5%, and it must NOT round down into "100%": that is the
+	// at-budget reading the case just above deliberately ALLOWS, so a floored
+	// refusal would wear the number of the case it is not. Over the line the
+	// percentage ceilings.
+	want := "bd remember: memory corpus would be 201 chars, budget is 200 (101%) — refused; use --force to override"
 	if over != want {
 		t.Errorf("refusal line =\n  %q\nwant\n  %q", over, want)
 	}
@@ -157,7 +161,10 @@ func TestRememberBudgetVerdictForceWrites(t *testing.T) {
 	if line == "" {
 		t.Fatal("--force over budget must still print a line")
 	}
-	for _, want := range []string{"201", "200", "(100%)", "--force"} {
+	// (101%), not (100%): the ceiling over the budget is a property of the
+	// VALUE, so the same projection cannot report two different percentages
+	// depending on whether --force was passed.
+	for _, want := range []string{"201", "200", "(101%)", "--force"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("forced line %q is missing %q", line, want)
 		}
@@ -182,6 +189,10 @@ func TestRememberBudgetVerdictWarnBand(t *testing.T) {
 		{"one byte under the warn band", 799, false, 0},
 		{"exactly 80 percent", 800, true, 80},
 		{"inside the band", 950, true, 95},
+		// One byte under: 99.9%, which must FLOOR to 99. Within the budget the
+		// rounding goes down, so "100%" belongs to the exactly-at-budget case
+		// alone and never to a projection that merely rounds up to it.
+		{"one byte under the budget", 999, true, 99},
 		{"exactly at budget", 1000, true, 100},
 	}
 	for _, tc := range cases {
@@ -207,18 +218,21 @@ func TestRememberBudgetVerdictWarnBand(t *testing.T) {
 	}
 }
 
-// TestMemoryBudgetLinePercentIsUnclamped pins the arithmetic: the percentage is
-// floor(projected*100/budget) and is NOT clamped at 100, so a corpus forced
-// well past its ceiling reports how far past it actually is. A clamp here would
-// make 101% and 400% read identically — exactly the reading an operator needs.
+// TestMemoryBudgetLinePercentIsUnclamped pins the arithmetic: over the budget
+// the percentage is ceil(projected*100/budget) and is NOT clamped at 100, so a
+// corpus forced well past its ceiling reports how far past it actually is. A
+// clamp here would make 101% and 400% read identically — exactly the reading an
+// operator needs. The ceiling is what keeps an over-budget line off the "100%"
+// that means at-budget-and-allowed.
 func TestMemoryBudgetLinePercentIsUnclamped(t *testing.T) {
 	cases := []struct {
 		projected, budget int
 		want              string
 	}{
 		{101, 100, "(101%)"},
-		{201, 200, "(100%)"}, // floor(100.5)
-		{400, 100, "(400%)"},
+		{201, 200, "(101%)"}, // ceil(100.5) — never floors back onto at-budget
+		{400, 100, "(400%)"}, // exact: ceil and floor agree
+		{1001, 1000, "(101%)"},
 	}
 	for _, tc := range cases {
 		line, _ := memoryBudgetLine(tc.projected, tc.budget, false)
