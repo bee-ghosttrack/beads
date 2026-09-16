@@ -717,3 +717,91 @@ func TestCheckGitConflicts_DoltBackend_Clean(t *testing.T) {
 		t.Fatal("Expected no conflicts in clean database")
 	}
 }
+
+// TestCheckParentBlocksOwnChildDB_NoGates verifies the informational check is
+// quiet on a store with no close gates — including one that has an ordinary
+// parent-child hierarchy, which must not be mistaken for a gate.
+func TestCheckParentBlocksOwnChildDB_NoGates(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	ctx := context.Background()
+
+	parent := &types.Issue{Title: "Parent epic", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeEpic}
+	if err := store.CreateIssue(ctx, parent, "test"); err != nil {
+		t.Fatalf("Failed to create parent: %v", err)
+	}
+	child := &types.Issue{Title: "Child task", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, child, "test"); err != nil {
+		t.Fatalf("Failed to create child: %v", err)
+	}
+	db := store.DB()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO dependencies (id, issue_id, depends_on_issue_id, type, created_at, created_by) VALUES (UUID(), ?, ?, 'parent-child', NOW(), 'test')`,
+		child.ID, parent.ID); err != nil {
+		t.Fatalf("Failed to insert parent-child edge: %v", err)
+	}
+
+	check := checkParentBlocksOwnChildDB(db)
+
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+	}
+	if check.Message != "No parent→own-child blocking edges" {
+		t.Errorf("Message = %q, want the empty-inventory message", check.Message)
+	}
+}
+
+// TestCheckParentBlocksOwnChildDB_GateReported verifies the inventory: a parent
+// that blocks on its own parent-child child is listed, by both ids, and the
+// check stays OK — these edges are legal since gastownhall/beads#6506 and the
+// check has no fix.
+func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	ctx := context.Background()
+
+	parent := &types.Issue{Title: "Parent epic", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeEpic}
+	if err := store.CreateIssue(ctx, parent, "test"); err != nil {
+		t.Fatalf("Failed to create parent: %v", err)
+	}
+	child := &types.Issue{Title: "Child task", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, child, "test"); err != nil {
+		t.Fatalf("Failed to create child: %v", err)
+	}
+	other := &types.Issue{Title: "Unrelated blocker", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, other, "test"); err != nil {
+		t.Fatalf("Failed to create unrelated blocker: %v", err)
+	}
+
+	db := store.DB()
+	edges := []struct{ from, to, depType string }{
+		{child.ID, parent.ID, "parent-child"},
+		{parent.ID, child.ID, "blocks"}, // the close gate
+		{parent.ID, other.ID, "blocks"}, // exogenous: must NOT be listed
+		{child.ID, other.ID, "blocks"},  // an ordinary blocker on the child
+	}
+	for _, e := range edges {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO dependencies (id, issue_id, depends_on_issue_id, type, created_at, created_by) VALUES (UUID(), ?, ?, ?, NOW(), 'test')`,
+			e.from, e.to, e.depType); err != nil {
+			t.Fatalf("Failed to insert %s edge %s->%s: %v", e.depType, e.from, e.to, err)
+		}
+	}
+
+	check := checkParentBlocksOwnChildDB(db)
+
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q: the idiom is legal, the check only reports it", check.Status, StatusOK)
+	}
+	if check.Fix != "" {
+		t.Errorf("Fix = %q, want empty: this check has no --fix", check.Fix)
+	}
+	if !strings.Contains(check.Message, "1 parent→own-child") {
+		t.Errorf("Message = %q, want a count of exactly the one close gate", check.Message)
+	}
+	wantDetail := parent.ID + "→" + child.ID
+	if !strings.Contains(check.Detail, wantDetail) {
+		t.Errorf("Detail = %q, want it to name %q", check.Detail, wantDetail)
+	}
+	if strings.Contains(check.Detail, other.ID) {
+		t.Errorf("Detail = %q, must not list the exogenous blocker %s", check.Detail, other.ID)
+	}
+}
