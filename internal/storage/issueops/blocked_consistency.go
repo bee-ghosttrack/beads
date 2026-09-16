@@ -367,8 +367,9 @@ func unmarkAllBlockedSQL(table, alias, depTable string) string {
 
 // shouldBeBlockedIDsUnionSQL selects, UNCORRELATED with any outer row, every
 // depTable issue_id that currently has a reason to be blocked: one UNION leg
-// per reason — an open blocks/conditional-blocks target (issue or wisp), a
-// blocked parent-child parent (issue or wisp), a blocking waits-for gate.
+// per reason — an open blocks/conditional-blocks target (issue or wisp), an
+// EXOGENOUSLY blocked parent-child parent (issue or wisp; see
+// parentCascadesBlockedSQL), a blocking waits-for gate.
 // Semantically, `<alias>.id IN (this select)` ≡ the disjunction of those
 // reasons correlated on d.issue_id = <alias>.id, which is what the batched
 // mark/unmark templates in blocked_state.go once spelled out as five
@@ -422,12 +423,14 @@ func shouldBeBlockedIDsUnionScopedSQL(depTable, scope string) string {
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND d.type = 'parent-child'
 		  AND p.is_blocked = 1
+		  AND %[4]s
 		UNION
 		SELECT d.issue_id FROM %[1]s d
 		JOIN wisps p ON p.id = d.depends_on_wisp_id
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND d.type = 'parent-child'
 		  AND p.is_blocked = 1
+		  AND %[5]s
 		UNION
 		SELECT d.issue_id FROM (
 		  SELECT DISTINCT d.issue_id, d.depends_on_issue_id, d.depends_on_wisp_id, d.metadata
@@ -436,7 +439,113 @@ func shouldBeBlockedIDsUnionScopedSQL(depTable, scope string) string {
 		    AND d.type = 'waits-for'
 		) d
 		WHERE (%[2]s)
-	`, depTable, waitsForGateBlockedSQL, scope)
+	`, depTable, waitsForGateBlockedSQL, scope,
+		parentCascadesBlockedSQL("p", "dependencies", "depends_on_issue_id"),
+		parentCascadesBlockedSQL("p", "wisp_dependencies", "depends_on_wisp_id"))
+}
+
+// parentCascadesBlockedSQL is the parent-child legs' exogeneity test
+// (gastownhall/beads#6506): the predicate that decides whether a blocked
+// parent's blockedness is allowed to darken its own children.
+//
+// The bug it closes: the legs used to cascade on p.is_blocked = 1 alone,
+// WHATEVER set that bit. A parent that is blocked only by its own children —
+// the "close gate on the epic" idiom, where P carries blocks edges onto C1 and
+// C2 so P cannot close before them — therefore darkened C1 and C2, the very
+// children it was waiting for. Neither child could ever appear in bd ready, so
+// neither could be worked, so neither could close: a permanent lock. P's OWN
+// is_blocked stays 1 (it really does depend on open children); only the
+// propagation to its children changes.
+//
+// The contract: a parent-child edge propagates only EXOGENOUS blockedness. P
+// counts as blocked FOR CHILD C iff P has a blocking reason — an open
+// blocks/conditional-blocks target, or a blocking waits-for gate — whose
+// target is NOT one of P's own parent-child children, or P's own parent-child
+// parent is (recursively) exogenously blocked.
+//
+// The predicate spells that as "p's blockedness is not solely explained by p's
+// own children":
+//
+//	EXISTS (a blocking reason of p whose target is not p's child)
+//	  OR NOT EXISTS (a blocking reason of p whose target IS p's child)
+//
+// The second disjunct is what carries the recursive clause through the
+// existing fixpoint rather than through SQL recursion. A parent that is
+// blocked but has no child-targeted reason of its own is blocked either
+// exogenously or by ITS parent; either way it is dark for exogenous reasons,
+// so its children inherit. Because the legs keep the p.is_blocked = 1
+// conjunct, a chain converges the way it always did — one level per fixpoint
+// pass — and the single-pass doctor COUNT stays the documented lower bound.
+//
+// blockingReasonSQL mirrors union legs 1, 2 and 5 row by row; keep the three
+// in step or the "solely explained by children" reading silently drifts.
+//
+//nolint:gosec // G201: parentAlias, parentDepTable and parentCol are constants from the two call sites.
+func parentCascadesBlockedSQL(parentAlias, parentDepTable, parentCol string) string {
+	reason := blockingReasonSQL("pr")
+	ownChild := dependencyTargetIsOwnChildSQL("pr", parentAlias, parentCol)
+	return fmt.Sprintf(`
+		  ( EXISTS (
+		      SELECT 1 FROM %[1]s pr
+		      WHERE pr.issue_id = %[2]s.id
+		        AND NOT (%[4]s)
+		        AND (%[3]s)
+		    )
+		    OR NOT EXISTS (
+		      SELECT 1 FROM %[1]s pr
+		      WHERE pr.issue_id = %[2]s.id
+		        AND (%[4]s)
+		        AND (%[3]s)
+		    ) )
+	`, parentDepTable, parentAlias, reason, ownChild)
+}
+
+// blockingReasonSQL is the row-level spelling of "this dependency row is,
+// right now, a reason for its own issue to be blocked" — union legs 1 and 2
+// (an open blocks/conditional-blocks target, issue or wisp) and leg 5 (a
+// blocking waits-for gate), for a dependency row aliased rowAlias.
+//
+// It is correlated to one dependency row on purpose: its only caller applies
+// it under `pr.issue_id = p.id` for a parent that is already known blocked, so
+// the engine probes idx_dependencies_issue for a handful of rows rather than
+// materializing a whole-table set. An uncorrelated set would have to be built
+// unscoped — the waits-for gate over every waits-for row in the database — on
+// every batched write statement, which is the cost shape #6288 removed.
+//
+//nolint:gosec // G201: rowAlias is a constant; waitsForGateBlockedSQLFor rewrites a constant template.
+func blockingReasonSQL(rowAlias string) string {
+	return fmt.Sprintf(`
+		        ( ( (%[1]s.type = 'blocks' OR %[1]s.type = 'conditional-blocks')
+		            AND ( EXISTS (SELECT 1 FROM issues bt
+		                          WHERE bt.id = %[1]s.depends_on_issue_id
+		                            AND bt.status <> 'closed' AND bt.status <> 'pinned')
+		               OR EXISTS (SELECT 1 FROM wisps bt
+		                          WHERE bt.id = %[1]s.depends_on_wisp_id
+		                            AND bt.status <> 'closed' AND bt.status <> 'pinned') ) )
+		          OR ( %[1]s.type = 'waits-for' AND (%[2]s) ) )
+	`, rowAlias, waitsForGateBlockedSQLFor(rowAlias))
+}
+
+// dependencyTargetIsOwnChildSQL reports whether the target of dependency row
+// rowAlias is a parent-child CHILD of parentAlias. A child's parent-child edge
+// lives in the dependency table of the CHILD's kind — dependencies for an
+// issue child, wisp_dependencies for a wisp child — so the target's kind
+// selects the table, and parentCol (depends_on_issue_id / depends_on_wisp_id)
+// selects the column naming the parent. A NULL target column matches nothing,
+// which is the right answer for the other kind's rows.
+//
+//nolint:gosec // G201: rowAlias, parentAlias and parentCol are constants from the one call site.
+func dependencyTargetIsOwnChildSQL(rowAlias, parentAlias, parentCol string) string {
+	return fmt.Sprintf(`
+		        ( EXISTS (SELECT 1 FROM dependencies pc
+		                  WHERE pc.type = 'parent-child'
+		                    AND pc.issue_id = %[1]s.depends_on_issue_id
+		                    AND pc.%[3]s = %[2]s.id)
+		          OR EXISTS (SELECT 1 FROM wisp_dependencies pc
+		                  WHERE pc.type = 'parent-child'
+		                    AND pc.issue_id = %[1]s.depends_on_wisp_id
+		                    AND pc.%[3]s = %[2]s.id) )
+	`, rowAlias, parentAlias, parentCol)
 }
 
 // CountIsBlockedInconsistenciesInTx reports how many issue and wisp rows carry a

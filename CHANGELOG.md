@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks in embedded, server, and proxied-server command paths; the legacy
   `<rig>:<bead-id>` await value remains accepted for compatibility.
 
+### Fixed
+
+- **An epic that blocks on its own children no longer hides them from `bd
+  ready`** ([#6506](https://github.com/gastownhall/beads/issues/6506)). A
+  parent-child edge now propagates only a parent's *exogenous* blockedness, so
+  the close-gate idiom — a parent carrying `blocks` edges onto its own children
+  so it cannot close before them — stops darkening the very children it is
+  waiting for. The parent itself stays blocked. Existing stores repair on the
+  next write that touches the hierarchy, or with `bd doctor --fix`.
+
 ## [1.3.0] - 2026-09-15
 
 The first tested release off `main` since the 1.1 line. [1.2.2] was a recovery

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -93,6 +94,25 @@ const waitsForGateBlockedSQL = `
 		  )
 		)
 `
+
+// waitsForGateRowAliasRE matches the dependency-row alias references in
+// waitsForGateBlockedSQL — `d.` at a word boundary, which never matches the
+// gate's own inner `cd.` rows (no boundary between c and d).
+var waitsForGateRowAliasRE = regexp.MustCompile(`\bd\.`)
+
+// waitsForGateBlockedSQLFor returns waitsForGateBlockedSQL with its
+// dependency-row alias rewritten from d to alias, for callers that evaluate
+// the gate somewhere the row cannot be called d — blockingReasonSQL applies it
+// to a parent's own dependency rows inside a union leg whose outer row is
+// already d (gastownhall/beads#6506). Rewriting beats shadowing: an inner d
+// would resolve correctly by scope rules but reads as a bug at every later
+// glance.
+func waitsForGateBlockedSQLFor(alias string) string {
+	if alias == "d" {
+		return waitsForGateBlockedSQL
+	}
+	return waitsForGateRowAliasRE.ReplaceAllString(waitsForGateBlockedSQL, alias+".")
+}
 
 // RecomputeIsBlockedResult reports which issue tables had rows changed while
 // the blocked-state fixpoint converged.
@@ -418,6 +438,9 @@ func AffectedByDepChangeInTx(ctx context.Context, tx DBTX, source, target string
 			if err := loadWaitersOnSpawnerIDsInTx(ctx, tx, []string{target}, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
+			if err := appendSiblingsUnderParentInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
+				return nil, nil, err
+			}
 		}
 		return expandByParentChildDescendantsInTx(ctx, tx, issueSeed, wispSeed, issueSeen, wispSeen)
 	default:
@@ -436,11 +459,51 @@ func AffectedByDepChangeForWispInTx(ctx context.Context, tx DBTX, source, target
 			if err := loadWaitersOnSpawnerIDsInTx(ctx, tx, []string{target}, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
+			if err := appendSiblingsUnderParentInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
+				return nil, nil, err
+			}
 		}
 		return expandByParentChildDescendantsInTx(ctx, tx, issueSeed, wispSeed, issueSeen, wispSeen)
 	default:
 		return nil, nil, nil
 	}
+}
+
+// appendSiblingsUnderParentInTx seeds every existing parent-child child of
+// parent (of either kind) for recompute.
+//
+// A parent-child edge onto a parent that BLOCKS on the new child reclassifies
+// that blocking reason from exogenous to child-derived, and the cascade legs
+// propagate only exogenous blockedness (gastownhall/beads#6506,
+// parentCascadesBlockedSQL). So writing or removing one edge can flip the
+// answer for the parent's OTHER children, which no other seed in this walk
+// reaches: the close-gate epic is built one child at a time, and the second
+// edge is what un-darkens the first child. Seeding the whole sibling set —
+// which expandByParentChildDescendantsInTx then expands to their subtrees —
+// is what keeps the incremental write path agreeing with the full repair.
+func appendSiblingsUnderParentInTx(
+	ctx context.Context, tx DBTX,
+	parent string,
+	issueSeed *[]string, issueSeen map[string]bool,
+	wispSeed *[]string, wispSeen map[string]bool,
+) error {
+	// The parent's own kind is not known here, so probe both target columns;
+	// the one that does not match the parent simply returns no rows.
+	for _, w := range []struct {
+		depTable, parentCol string
+		seed                *[]string
+		seen                map[string]bool
+	}{
+		{"dependencies", "depends_on_issue_id", issueSeed, issueSeen},
+		{"wisp_dependencies", "depends_on_issue_id", wispSeed, wispSeen},
+		{"dependencies", "depends_on_wisp_id", issueSeed, issueSeen},
+		{"wisp_dependencies", "depends_on_wisp_id", wispSeed, wispSeen},
+	} {
+		if err := appendChildrenInTx(ctx, tx, w.depTable, w.parentCol, []string{parent}, w.seen, w.seed); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func loadBlockingDependersInTx(

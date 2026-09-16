@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -176,4 +177,254 @@ func TestRecomputeAllIsBlocked_CascadesThroughParentChild(t *testing.T) {
 	if n := countInconsistencies(ctx, t, store.db); n != 0 {
 		t.Fatalf("after repair: want 0 inconsistencies, got %d", n)
 	}
+}
+
+// --- parent-child cascade: only EXOGENOUS blockedness propagates -------------
+//
+// gastownhall/beads#6506 (wy-3eb07b). The legs used to cascade on the parent's
+// is_blocked bit WHATEVER set it, so the "close gate on the epic" idiom — P
+// carries blocks edges onto its own children so it cannot close before them —
+// darkened the very children P was waiting for. Neither child could reach bd
+// ready, so neither could be worked, so neither could close: a permanent lock.
+//
+// The contract these four cases pin: a parent-child edge propagates only the
+// parent's EXOGENOUS blockedness. P is blocked FOR CHILD C iff P has a
+// blocking reason whose target is NOT one of P's own parent-child children, or
+// P's own parent is (recursively) exogenously blocked. P's OWN is_blocked is
+// unchanged throughout — it really does depend on open children.
+
+// addDepSkippingCycleCheck writes a dependency edge past the per-edge cycle
+// check. The close-gate topology cannot be built any other way through the
+// store: every edge is legal when it is written, but the pair is refused in
+// either order once both exist (CheckBlockingHierarchyInTx rejects a blocker
+// that is a descendant; CheckDependencyCycleInTx rejects the parent-child edge
+// that closes the loop). That is exactly how the shape arrives in the wild —
+// one edge at a time, or through import/merge — and SkipCycleCheck is the
+// supported way to reproduce it (the whole-graph END GATE is the batch
+// caller's obligation, not this fixture's).
+func addDepSkippingCycleCheck(ctx context.Context, t *testing.T, store *DoltStore, source, target string, depType types.DependencyType) {
+	t.Helper()
+	// The store-level AddDependencyWithOptions does not forward SkipCycleCheck
+	// (dolt/dependencies.go builds its own AddDependencyOpts); the transaction
+	// surface does, and it is the one batch callers use.
+	err := store.RunInTransaction(ctx, "test: seed close-gate edge", func(tx storage.Transaction) error {
+		return tx.AddDependencyWithOptions(ctx,
+			&types.Dependency{IssueID: source, DependsOnID: target, Type: depType},
+			"tester", storage.DependencyAddOptions{SkipCycleCheck: true})
+	})
+	if err != nil {
+		t.Fatalf("add dep %s -> %s (%s): %v", source, target, depType, err)
+	}
+}
+
+// assertBlockedFlags checks is_blocked for a set of ids in one place so a
+// failure names every disagreement rather than the first.
+func assertBlockedFlags(ctx context.Context, t *testing.T, store *DoltStore, when string, want map[string]bool) {
+	t.Helper()
+	for id, expected := range want {
+		if got := isBlocked(ctx, t, store.db, id); got != expected {
+			t.Errorf("%s: %s is_blocked = %v, want %v", when, id, got, expected)
+		}
+	}
+}
+
+// assertConvergedAndStable pins the lockstep for the case at hand: detection
+// counts zero, and the full repair agrees by changing nothing.
+func assertConvergedAndStable(ctx context.Context, t *testing.T, store *DoltStore) {
+	t.Helper()
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("write path left %d inconsistencies; detection and the union must agree", n)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed != 0 {
+		t.Errorf("full repair changed %d rows over a write-path-consistent graph, want 0", changed)
+	}
+}
+
+// TestParentChildCascade_ParentBlockedOnlyByItsOwnChildren is the repro. P
+// blocks on C1 and C2, which are P's own parent-child children. P stays
+// blocked; the children must NOT be darkened, and must be reachable as ready
+// work — the property whose absence made the idiom a permanent lock.
+func TestParentChildCascade_ParentBlockedOnlyByItsOwnChildren(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{"pc-gate-p", "pc-gate-c1", "pc-gate-c2"} {
+		createPerm(t, ctx, store, id)
+	}
+	// The blocks edges go in while no hierarchy exists yet...
+	addDependencyWithMeta(t, ctx, store, "pc-gate-p", "pc-gate-c1", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pc-gate-p", "pc-gate-c2", types.DepBlocks, "")
+	// ...and the hierarchy after, which is what closes the gate on the epic.
+	addDepSkippingCycleCheck(ctx, t, store, "pc-gate-c1", "pc-gate-p", types.DepParentChild)
+	addDepSkippingCycleCheck(ctx, t, store, "pc-gate-c2", "pc-gate-p", types.DepParentChild)
+
+	assertBlockedFlags(ctx, t, store, "after the write path", map[string]bool{
+		"pc-gate-p":  true,  // P really does depend on two open children.
+		"pc-gate-c1": false, // ...but the gate must not darken them.
+		"pc-gate-c2": false,
+	})
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", map[string]bool{
+		"pc-gate-p":  true,
+		"pc-gate-c1": false,
+		"pc-gate-c2": false,
+	})
+
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{Status: types.StatusOpen})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	inReady := map[string]bool{}
+	for _, issue := range ready {
+		inReady[issue.ID] = true
+	}
+	for _, id := range []string{"pc-gate-c1", "pc-gate-c2"} {
+		if !inReady[id] {
+			t.Errorf("%s missing from ready work: the children of a close-gate epic are exactly what must stay workable", id)
+		}
+	}
+	if inReady["pc-gate-p"] {
+		t.Error("pc-gate-p is ready, but it is blocked on two open children")
+	}
+}
+
+// TestParentChildCascade_ExogenousParentStillCascades is the control: the fix
+// narrows the cascade, it does not remove it. P is blocked by an open issue
+// that is NOT one of its children, so both children inherit blocked exactly as
+// before.
+func TestParentChildCascade_ExogenousParentStillCascades(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{"pc-exo-p", "pc-exo-c1", "pc-exo-c2", "pc-exo-x"} {
+		createPerm(t, ctx, store, id)
+	}
+	addDependencyWithMeta(t, ctx, store, "pc-exo-p", "pc-exo-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pc-exo-c1", "pc-exo-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pc-exo-c2", "pc-exo-p", types.DepParentChild, "")
+
+	assertBlockedFlags(ctx, t, store, "after the write path", map[string]bool{
+		"pc-exo-x":  false,
+		"pc-exo-p":  true,
+		"pc-exo-c1": true,
+		"pc-exo-c2": true,
+	})
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", map[string]bool{
+		"pc-exo-p":  true,
+		"pc-exo-c1": true,
+		"pc-exo-c2": true,
+	})
+}
+
+// TestParentChildCascade_ThreeLevelChainBothWays pins the recursive clause in
+// both directions on one graph.
+//
+// Exogenous chain: GP is blocked by an outside issue, so GP darkens P and P
+// darkens C — including C, whose own parent P has no blocking edge of its own.
+// That is the clause "P's own parent-child parent is (recursively)
+// exogenously blocked", carried one level per fixpoint pass.
+//
+// Close-gate chain: GP2 is blocked only by its own child P2. Neither P2 nor
+// P2's child C2 may be darkened by it.
+func TestParentChildCascade_ThreeLevelChainBothWays(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{
+		"pc3-x", "pc3-gp", "pc3-p", "pc3-c",
+		"pc3-gp2", "pc3-p2", "pc3-c2",
+	} {
+		createPerm(t, ctx, store, id)
+	}
+
+	// Exogenous: GP -> X (outside), then the two-level hierarchy under GP.
+	addDependencyWithMeta(t, ctx, store, "pc3-gp", "pc3-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pc3-p", "pc3-gp", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pc3-c", "pc3-p", types.DepParentChild, "")
+
+	// Close gate: GP2 blocks on P2, which is then made GP2's own child, and C2
+	// hangs under P2.
+	addDependencyWithMeta(t, ctx, store, "pc3-gp2", "pc3-p2", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pc3-p2", "pc3-gp2", types.DepParentChild)
+	addDependencyWithMeta(t, ctx, store, "pc3-c2", "pc3-p2", types.DepParentChild, "")
+
+	want := map[string]bool{
+		"pc3-x":   false,
+		"pc3-gp":  true,
+		"pc3-p":   true,
+		"pc3-c":   true,
+		"pc3-gp2": true,  // blocked on its own open child...
+		"pc3-p2":  false, // ...which must not be darkened,
+		"pc3-c2":  false, // ...nor anything under it.
+	}
+	assertBlockedFlags(ctx, t, store, "after the write path", want)
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", want)
+
+	// The full repair reaches the same fixpoint from a fully inverted plane,
+	// not just from the write path's answer: the chain is the case where the
+	// cascade needs more than one pass.
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", want)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+}
+
+// TestParentChildCascade_WaitsForGateOverOwnChildren pins the same contract for
+// the waits-for leg, whose "reason" is a gate rather than a target status.
+//
+// A gate whose spawner is the parent's OWN child is child-derived and must not
+// darken the parent's children; a gate on a spawner outside the hierarchy is
+// exogenous and must.
+func TestParentChildCascade_WaitsForGateOverOwnChildren(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{
+		"pcw-p", "pcw-c1", "pcw-c2", "pcw-g",
+		"pcw-p2", "pcw-c3", "pcw-s", "pcw-sc",
+	} {
+		createPerm(t, ctx, store, id)
+	}
+
+	// Own-child gate: P waits for C1, its own child. C1 has an open child of
+	// its own, so the all-children gate is live and P is blocked.
+	addDependencyWithMeta(t, ctx, store, "pcw-c1", "pcw-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcw-c2", "pcw-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcw-g", "pcw-c1", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcw-p", "pcw-c1", types.DepWaitsFor, "")
+
+	// Outside gate: P2 waits for a spawner that is not in its hierarchy.
+	addDependencyWithMeta(t, ctx, store, "pcw-c3", "pcw-p2", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcw-sc", "pcw-s", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcw-p2", "pcw-s", types.DepWaitsFor, "")
+
+	want := map[string]bool{
+		"pcw-p":  true,  // its own child's fanout is still open
+		"pcw-c1": false, // but the gate is over C1 itself: no darkening
+		"pcw-c2": false,
+		"pcw-g":  false,
+		"pcw-p2": true, // gate on an outside spawner: exogenous
+		"pcw-c3": true, // so the child inherits
+		"pcw-s":  false,
+		"pcw-sc": false,
+	}
+	assertBlockedFlags(ctx, t, store, "after the write path", want)
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", want)
 }
