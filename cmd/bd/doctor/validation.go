@@ -337,6 +337,103 @@ func CheckChildParentDependencies(path string) DoctorCheck {
 	return checkChildParentDependenciesDB(db)
 }
 
+// CheckParentBlocksOwnChild reports parents that carry a blocking edge onto one
+// of their own parent-child children — the "close gate on the epic" idiom,
+// where P blocks on C1 and C2 so P cannot close before them.
+//
+// It is INFORMATIONAL and has no fix. Before gastownhall/beads#6506 these
+// edges were a trap: the parent's blocked bit cascaded to its children
+// whatever set it, so the gate hid the very children it was waiting for and
+// nothing in the subtree could ever become ready. The cascade now propagates
+// only exogenous blockedness, so the edges are harmless and frequently
+// intentional; what an operator wants from doctor is the inventory — which
+// beads in this store use the idiom — not a repair.
+func CheckParentBlocksOwnChild(path string) DoctorCheck {
+	beadsDir := ResolveBeadsDirForRepo(path)
+
+	db, store, err := openStoreDB(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Parent Close Gates",
+			Status:  StatusOK,
+			Message: "N/A (no database)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	return checkParentBlocksOwnChildDB(db)
+}
+
+// checkParentBlocksOwnChildDB is the core logic for CheckParentBlocksOwnChild.
+// The pair is symmetric-but-opposite to checkChildParentDependenciesDB above:
+// that one finds a CHILD blocking on its PARENT (still a deadlock, still
+// fixable); this one finds a PARENT blocking on its CHILD, and matches on real
+// parent-child edges rather than on dotted-ID ancestry, because the close-gate
+// idiom is wired with explicit edges between unrelated ids.
+func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
+	//nolint:gosec // G202: doctorDependencyUnionSQL returns a fixed internal SELECT fragment.
+	query := `
+		SELECT b.issue_id, b.depends_on_id
+		FROM (` + doctorDependencyUnionSQL() + `) b
+		WHERE b.type IN ('blocks', 'conditional-blocks')
+		  AND EXISTS (
+		    SELECT 1 FROM (` + doctorDependencyUnionSQL() + `) pc
+		    WHERE pc.type = 'parent-child'
+		      AND pc.issue_id = b.depends_on_id
+		      AND pc.depends_on_id = b.issue_id
+		  )
+		ORDER BY b.issue_id, b.depends_on_id
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Parent Close Gates",
+			Status:  StatusOK,
+			Message: "N/A (query failed)",
+		}
+	}
+	defer rows.Close()
+
+	var gates []string
+	for rows.Next() {
+		var issueID, dependsOnID string
+		if err := rows.Scan(&issueID, &dependsOnID); err == nil {
+			gates = append(gates, fmt.Sprintf("%s→%s", issueID, dependsOnID))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DoctorCheck{
+			Name:     "Parent Close Gates",
+			Status:   StatusOK,
+			Message:  "N/A (row iteration error)",
+			Detail:   err.Error(),
+			Category: CategoryMetadata,
+		}
+	}
+
+	if len(gates) == 0 {
+		return DoctorCheck{
+			Name:     "Parent Close Gates",
+			Status:   StatusOK,
+			Message:  "No parent→own-child blocking edges",
+			Category: CategoryMetadata,
+		}
+	}
+
+	detail := strings.Join(gates, ", ")
+	if len(detail) > 200 {
+		detail = detail[:200] + "..."
+	}
+
+	return DoctorCheck{
+		Name:     "Parent Close Gates",
+		Status:   StatusOK,
+		Message:  fmt.Sprintf("%d parent→own-child blocking edge(s) (informational: the children stay in bd ready)", len(gates)),
+		Detail:   detail,
+		Category: CategoryMetadata,
+	}
+}
+
 // checkDoltConflicts queries the Dolt server for unresolved merge conflicts (GH-2249).
 func checkDoltConflicts(beadsDir string) DoctorCheck {
 	doltPath := getDatabasePath(beadsDir)
