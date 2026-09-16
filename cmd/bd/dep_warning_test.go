@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -79,5 +80,106 @@ func TestWarnImplicitBlocksDefaultStaysSilentUnderCapturedStderr(t *testing.T) {
 	})
 	if got != "" {
 		t.Errorf("expected no warning when stderr is not a terminal, got %q", got)
+	}
+}
+
+// TestParentBlocksOwnChild is the #6506 guard test: `bd dep add P C` where C is
+// already P's parent-child child is the "close gate on the epic" idiom, and it
+// must be reported rather than refused — since the cascade fix the edge is
+// harmless, and it is what an operator wiring a close gate actually meant.
+//
+// The predicate reads the parent's DEPENDENTS, so the two controls that matter
+// are a dependent with the right id and the wrong edge type (a plain blocks
+// edge onto the parent is an ordinary cycle, not a close gate) and a
+// parent-child dependent that is not the blocker at all (P's other children
+// must not make every blocker look like a close gate).
+func TestParentBlocksOwnChild(t *testing.T) {
+	dependent := func(id string, dt types.DependencyType) *types.IssueWithDependencyMetadata {
+		return &types.IssueWithDependencyMetadata{Issue: types.Issue{ID: id}, DependencyType: dt}
+	}
+
+	tests := []struct {
+		name       string
+		dependents []*types.IssueWithDependencyMetadata
+		childID    string
+		want       bool
+	}{
+		{
+			name:       "blocker is the parent's own child",
+			dependents: []*types.IssueWithDependencyMetadata{dependent("bd-c1", types.DepParentChild)},
+			childID:    "bd-c1",
+			want:       true,
+		},
+		{
+			name: "blocker is one of several children",
+			dependents: []*types.IssueWithDependencyMetadata{
+				dependent("bd-c1", types.DepParentChild),
+				dependent("bd-c2", types.DepParentChild),
+			},
+			childID: "bd-c2",
+			want:    true,
+		},
+		{
+			name:       "dependent with the right id but a blocks edge is not a child",
+			dependents: []*types.IssueWithDependencyMetadata{dependent("bd-c1", types.DepBlocks)},
+			childID:    "bd-c1",
+			want:       false,
+		},
+		{
+			name:       "the parent's other children do not match",
+			dependents: []*types.IssueWithDependencyMetadata{dependent("bd-c1", types.DepParentChild)},
+			childID:    "bd-x",
+			want:       false,
+		},
+		{name: "no dependents at all", childID: "bd-c1", want: false},
+		{
+			name:       "a nil row is skipped, not dereferenced",
+			dependents: []*types.IssueWithDependencyMetadata{nil, dependent("bd-c1", types.DepParentChild)},
+			childID:    "bd-c1",
+			want:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parentBlocksOwnChild(tt.dependents, tt.childID); got != tt.want {
+				t.Errorf("parentBlocksOwnChild(%v, %q) = %v, want %v", tt.dependents, tt.childID, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEmitParentBlocksOwnChildWarning locks the message content: it must name
+// both beads, say the parent stays blocked, and say the child is NOT hidden
+// from bd ready — the half an operator cannot verify without running a query,
+// and the half that used to be false.
+func TestEmitParentBlocksOwnChildWarning(t *testing.T) {
+	got := captureStderr(t, func() { emitParentBlocksOwnChildWarning("bd-epic", "bd-child") })
+
+	for _, want := range []string{"bd-epic", "bd-child", "bd ready", "6506"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning must mention %q, got %q", want, got)
+		}
+	}
+	if !strings.Contains(got, "stays blocked") {
+		t.Errorf("warning must say the parent stays blocked, got %q", got)
+	}
+	if !strings.Contains(got, "NOT hidden") {
+		t.Errorf("warning must say the child is not hidden from ready work, got %q", got)
+	}
+}
+
+// TestWarnIfParentBlocksOwnChildIgnoresNonBlockingTypes is the type gate: the
+// advisory is about a BLOCKING edge onto a child. A parent-child edge (or any
+// other type) onto one's own child is not a close gate and must stay silent —
+// and the gate must return before touching the store, which a nil store proves.
+func TestWarnIfParentBlocksOwnChildIgnoresNonBlockingTypes(t *testing.T) {
+	for _, dt := range []types.DependencyType{types.DepParentChild, types.DepWaitsFor, types.DepTracks} {
+		got := captureStderr(t, func() {
+			warnIfParentBlocksOwnChild(context.Background(), nil, "bd-epic", "bd-child", dt)
+		})
+		if got != "" {
+			t.Errorf("type %s: expected silence, got %q", dt, got)
+		}
 	}
 }
