@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage"
@@ -337,6 +338,26 @@ func CheckChildParentDependencies(path string) DoctorCheck {
 	return checkChildParentDependenciesDB(db)
 }
 
+// detailMaxBytes is the budget for a DoctorCheck Detail line: enough to show
+// the shape of a finding, short enough not to bury the report.
+const detailMaxBytes = 200
+
+// truncateDetail cuts a detail line to detailMaxBytes WITHOUT splitting a
+// rune. The gate inventory joins its entries with U+2192 (three bytes), so a
+// plain detail[:200] lands mid-rune about two times in three and puts invalid
+// UTF-8 into `bd doctor --json`, where it is no longer a display nuisance but
+// a value a consumer has to decode.
+func truncateDetail(detail string) string {
+	if len(detail) <= detailMaxBytes {
+		return detail
+	}
+	cut := detailMaxBytes
+	for cut > 0 && !utf8.RuneStart(detail[cut]) {
+		cut--
+	}
+	return detail[:cut] + "..."
+}
+
 // CheckParentBlocksOwnChild reports parents that carry a blocking edge onto one
 // of their own parent-child children — the "close gate on the epic" idiom,
 // where P blocks on C1 and C2 so P cannot close before them.
@@ -354,9 +375,10 @@ func CheckParentBlocksOwnChild(path string) DoctorCheck {
 	db, store, err := openStoreDB(beadsDir)
 	if err != nil {
 		return DoctorCheck{
-			Name:    "Parent Close Gates",
-			Status:  StatusOK,
-			Message: "N/A (no database)",
+			Name:     "Parent Close Gates",
+			Status:   StatusOK,
+			Message:  "N/A (no database)",
+			Category: CategoryMetadata,
 		}
 	}
 	defer func() { _ = store.Close() }()
@@ -387,9 +409,10 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	rows, err := db.Query(query)
 	if err != nil {
 		return DoctorCheck{
-			Name:    "Parent Close Gates",
-			Status:  StatusOK,
-			Message: "N/A (query failed)",
+			Name:     "Parent Close Gates",
+			Status:   StatusOK,
+			Message:  "N/A (query failed)",
+			Category: CategoryMetadata,
 		}
 	}
 	defer rows.Close()
@@ -420,10 +443,7 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 		}
 	}
 
-	detail := strings.Join(gates, ", ")
-	if len(detail) > 200 {
-		detail = detail[:200] + "..."
-	}
+	detail := truncateDetail(strings.Join(gates, ", "))
 
 	return DoctorCheck{
 		Name:     "Parent Close Gates",
