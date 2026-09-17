@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/types"
@@ -803,5 +804,34 @@ func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	}
 	if strings.Contains(check.Detail, other.ID) {
 		t.Errorf("Detail = %q, must not list the exogenous blocker %s", check.Detail, other.ID)
+	}
+}
+
+// TestTruncateDetail_CutsOnARuneBoundary pins the --json contract: a cut
+// detail line is still valid UTF-8. The gate inventory joins its entries with
+// U+2192, three bytes wide, so a byte-indexed cut lands mid-rune for two of
+// every three offsets and emits a replacement-character sequence into JSON.
+func TestTruncateDetail_CutsOnARuneBoundary(t *testing.T) {
+	// One entry is 6 bytes: "a", U+2192 (3), "b", ",", " " — so successive
+	// totals step past 200 at offsets that are not rune starts.
+	entry := "a→b"
+	for n := 1; n < 120; n++ {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = entry
+		}
+		got := truncateDetail(strings.Join(parts, ", "))
+		if !utf8.ValidString(got) {
+			t.Fatalf("n=%d: truncateDetail produced invalid UTF-8: %q", n, got)
+		}
+		if len(got) > detailMaxBytes+len("...") {
+			t.Fatalf("n=%d: truncateDetail returned %d bytes, want <= %d",
+				n, len(got), detailMaxBytes+len("..."))
+		}
+	}
+
+	// Short input is returned whole, with no ellipsis.
+	if got := truncateDetail("wr-p→wr-c"); got != "wr-p→wr-c" {
+		t.Errorf("short detail was rewritten: %q", got)
 	}
 }
