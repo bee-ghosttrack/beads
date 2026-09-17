@@ -27,11 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **An epic that blocks on its own children no longer hides them from `bd
   ready`** ([#6506](https://github.com/gastownhall/beads/issues/6506)). A
-  parent-child edge now propagates only a parent's *exogenous* blockedness, so
-  the close-gate idiom — a parent carrying `blocks` edges onto its own children
-  so it cannot close before them — stops darkening the very children it is
-  waiting for. The parent itself stays blocked. Existing stores repair on the
-  next write that touches the hierarchy, or with `bd doctor --fix`.
+  parent-child edge now propagates only a parent's *exogenous* blockedness —
+  blockedness whose cause lies outside the parent's own subtree — so the
+  close-gate idiom, a parent carrying `blocks` edges onto its own children (or
+  grandchildren) so it cannot close before them, stops darkening the very work
+  it is waiting for. The parent itself stays blocked. One case is knowingly
+  left alone, always in the direction of showing work rather than hiding it: a
+  sub-epic blocked BOTH by its own children AND by an exogenously blocked
+  ancestor keeps its children visible, where the contract would darken them
+  (tracked upstream). Existing stores repair on the next write that touches the
+  hierarchy, or with `bd doctor --fix`.
 - `bd dep add` no longer explains its refusal of a blocking edge onto your own
   descendant by claiming the block would cascade down and never clear — it
   does not, as of the fix above. The refusal stands, and now names the
