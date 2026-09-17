@@ -17,9 +17,11 @@ import (
 // (gastownhall/beads#6291).
 
 // batchTemplateOccurrences is the number of IN-lists a batched template
-// carries: the outer row filter, plus one per leg of the scoped
-// should-be-blocked union.
-const batchTemplateOccurrences = 6
+// carries: the outer row filter, one per leg of the scoped should-be-blocked
+// union, and one per parent-child leg's exogeneity subquery, whose candidate
+// parents are read from the batch's own dependency rows
+// (gastownhall/beads#6506).
+const batchTemplateOccurrences = 8
 
 func batchedTemplates() map[string]string {
 	return map[string]string{

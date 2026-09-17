@@ -290,6 +290,78 @@ func TestParentChildCascade_ParentBlockedOnlyByItsOwnChildren(t *testing.T) {
 	}
 }
 
+// TestParentChildCascade_ParentBlocksItsOwnGrandchild is the same lock one
+// level down, and the case a DIRECT-child reading of "own child" leaves alive
+// (the adversarial review's B1 repro).
+//
+// P blocks on G, which is not P's child but P's GRANDCHILD: pc C -> P,
+// pc C2 -> P, pc G -> C. Under a depth-1 test G reads exogenous, so P darkens
+// C, so C darkens G — and G is the only row whose close can ever free P. The
+// contract is about blockedness originating outside P's own SUBTREE, so the
+// whole hierarchy under P must stay bright while P alone stays blocked.
+//
+// C2 is the sibling control: it is reachable only through P's cascade, so it
+// proves the leg was re-evaluated rather than merely skipped for the branch
+// the new edge touched.
+func TestParentChildCascade_ParentBlocksItsOwnGrandchild(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{"pcg-p", "pcg-c", "pcg-c2", "pcg-g"} {
+		createPerm(t, ctx, store, id)
+	}
+	// The gate goes in first, while P and G are unrelated...
+	addDependencyWithMeta(t, ctx, store, "pcg-p", "pcg-g", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcg-c", "pcg-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcg-c2", "pcg-p", types.DepParentChild, "")
+	// ...and the edge that puts G inside P's subtree comes last, which is what
+	// reclassifies P's reason from exogenous to subtree-derived. Nothing but
+	// this edge's own seeding can un-darken C and C2.
+	addDepSkippingCycleCheck(ctx, t, store, "pcg-g", "pcg-c", types.DepParentChild)
+
+	want := map[string]bool{
+		"pcg-p":  true,  // P still depends on an open G.
+		"pcg-c":  false, // but nothing under P may be darkened by it,
+		"pcg-c2": false,
+		"pcg-g":  false, // least of all the row whose close frees P.
+	}
+	assertBlockedFlags(ctx, t, store, "after the write path", want)
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", want)
+
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{Status: types.StatusOpen})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	inReady := map[string]bool{}
+	for _, issue := range ready {
+		inReady[issue.ID] = true
+	}
+	if !inReady["pcg-g"] {
+		t.Error("pcg-g missing from ready work: the grandchild P waits on is the one row that can end the lock")
+	}
+	for _, id := range []string{"pcg-c", "pcg-c2"} {
+		if !inReady[id] {
+			t.Errorf("%s missing from ready work", id)
+		}
+	}
+
+	// The same answer from a fully inverted plane: the grandchild case needs
+	// the fixpoint, not just the write path's incremental seeding.
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", want)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+}
+
 // TestParentChildCascade_ExogenousParentStillCascades is the control: the fix
 // narrows the cascade, it does not remove it. P is blocked by an open issue
 // that is NOT one of its children, so both children inherit blocked exactly as

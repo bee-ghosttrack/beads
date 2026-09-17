@@ -235,8 +235,10 @@ func markIsBlockedPassForIssuesInTx(ctx context.Context, tx DBTX, ids []string) 
 // probe re-read the uncommitted overlay (gastownhall/beads#6288).
 //
 // The batch IN-list therefore appears more than once per statement — the
-// outer row filter plus one per union leg; expandBatchTemplate repeats the
-// placeholders and the bound ids to match.
+// outer row filter, one per union leg, and one per parent-child leg's
+// exogeneity subquery, which confines itself to the batch's own parents
+// (gastownhall/beads#6506); expandBatchTemplate repeats the placeholders and
+// the bound ids to match.
 
 // batchScopeSQL is the per-leg predicate that confines the should-be-blocked
 // union to the batch (see shouldBeBlockedIDsUnionScopedSQL); its %s is filled
@@ -292,8 +294,9 @@ func unmarkBlockedTemplate(table, alias, depTable string) string {
 
 // expandBatchTemplate fills every %s in a batched template with the same
 // IN-list placeholders and repeats the bound ids once per occurrence, in
-// order. Templates carry the batch list in the outer row filter and in each
-// leg of the scoped union (six occurrences today); a template with a single
+// order. Templates carry the batch list in the outer row filter, in each leg
+// of the scoped union, and in each parent-child leg's exogeneity subquery
+// (eight occurrences today); a template with a single
 // %s degrades to the plain Sprintf it always was. The count is textual, so a
 // template must contain no other percent sign (no LIKE 'x%' pattern, no %%)
 // and at least one %s — a template with none is a programmer error that
@@ -438,7 +441,7 @@ func AffectedByDepChangeInTx(ctx context.Context, tx DBTX, source, target string
 			if err := loadWaitersOnSpawnerIDsInTx(ctx, tx, []string{target}, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
-			if err := appendSiblingsUnderParentInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
+			if err := appendSiblingsUnderAncestorsInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -459,7 +462,7 @@ func AffectedByDepChangeForWispInTx(ctx context.Context, tx DBTX, source, target
 			if err := loadWaitersOnSpawnerIDsInTx(ctx, tx, []string{target}, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
-			if err := appendSiblingsUnderParentInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
+			if err := appendSiblingsUnderAncestorsInTx(ctx, tx, target, &issueSeed, issueSeen, &wispSeed, wispSeen); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -469,26 +472,41 @@ func AffectedByDepChangeForWispInTx(ctx context.Context, tx DBTX, source, target
 	}
 }
 
-// appendSiblingsUnderParentInTx seeds every existing parent-child child of
-// parent (of either kind) for recompute.
+// appendSiblingsUnderAncestorsInTx seeds every existing parent-child child of
+// parent AND of each of parent's own ancestors (of either kind) for recompute.
 //
 // A parent-child edge onto a parent that BLOCKS on the new child reclassifies
-// that blocking reason from exogenous to child-derived, and the cascade legs
+// that blocking reason from exogenous to subtree-derived, and the cascade legs
 // propagate only exogenous blockedness (gastownhall/beads#6506,
-// parentCascadesBlockedSQL). So writing or removing one edge can flip the
+// parentsExplainedBySubtreeSQL). So writing or removing one edge can flip the
 // answer for the parent's OTHER children, which no other seed in this walk
 // reaches: the close-gate epic is built one child at a time, and the second
-// edge is what un-darkens the first child. Seeding the whole sibling set —
-// which expandByParentChildDescendantsInTx then expands to their subtrees —
-// is what keeps the incremental write path agreeing with the full repair.
-func appendSiblingsUnderParentInTx(
+// edge is what un-darkens the first child.
+//
+// The walk goes all the way UP because the exogeneity test is over the whole
+// SUBTREE, not over direct children. Hanging G under C changes nothing about C
+// but everything about any ANCESTOR of C that blocks on G: that reason just
+// moved inside its subtree, so the ancestor stops darkening its own children.
+// The reviewer's depth-2 lock is exactly this shape (P blocks G; pc C -> P,
+// C2 -> P, G -> C), and only P's sibling set — not C's — carries the flip.
+// Seeding each ancestor's whole sibling set, which
+// expandByParentChildDescendantsInTx then expands to their subtrees, is what
+// keeps the incremental write path agreeing with the full repair.
+func appendSiblingsUnderAncestorsInTx(
 	ctx context.Context, tx DBTX,
 	parent string,
 	issueSeed *[]string, issueSeen map[string]bool,
 	wispSeed *[]string, wispSeen map[string]bool,
 ) error {
-	// The parent's own kind is not known here, so probe both target columns;
-	// the one that does not match the parent simply returns no rows.
+	parents, err := ancestorChainInTx(ctx, tx, parent)
+	if err != nil {
+		return err
+	}
+	if len(parents) == 0 {
+		return nil
+	}
+	// The parents' own kinds are not known here, so probe both target columns;
+	// the one that does not match a parent simply returns no rows.
 	for _, w := range []struct {
 		depTable, parentCol string
 		seed                *[]string
@@ -499,11 +517,73 @@ func appendSiblingsUnderParentInTx(
 		{"dependencies", "depends_on_wisp_id", issueSeed, issueSeen},
 		{"wisp_dependencies", "depends_on_wisp_id", wispSeed, wispSeen},
 	} {
-		if err := appendChildrenInTx(ctx, tx, w.depTable, w.parentCol, []string{parent}, w.seen, w.seed); err != nil {
+		if err := appendChildrenInTx(ctx, tx, w.depTable, w.parentCol, parents, w.seen, w.seed); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ancestorChainInTx returns id, plus every parent-child ancestor of id THAT
+// CARRIES A BLOCKING REASON OF ITS OWN — a dependency row that is not
+// parent-child. Order is not meaningful.
+//
+// The filter is what keeps the walk from being quadratic. Only an ancestor
+// that holds a blocking reason can have that reason reclassified by an edge
+// below it, so only such an ancestor's children can flip; an ancestor with
+// nothing but hierarchy edges contributes seeds that can never change. Without
+// the filter a 70-deep chain reseeds every ancestor's subtree on every edge
+// written into it, which is O(depth x size) per write and times out.
+//
+// It is the seeding twin of isAncestorInTx in dependencies.go and borrows its
+// recursion: UNION distinct, so a malformed diamond or cycle in the hierarchy
+// terminates by unique reachable node rather than running away.
+//
+//nolint:gosec // G201: the union is built from constant table names and DepTargetExpr.
+func ancestorChainInTx(ctx context.Context, tx DBTX, id string) ([]string, error) {
+	if id == "" {
+		return nil, nil
+	}
+	var unions []string
+	for _, t := range cycleDetectionTables() {
+		unions = append(unions, fmt.Sprintf(
+			"SELECT issue_id, %s AS parent_id FROM %s WHERE type = 'parent-child'", DepTargetExpr, t))
+	}
+	query := fmt.Sprintf(`
+		WITH RECURSIVE ancestors(node) AS (
+			SELECT ?
+			UNION
+			SELECT d.parent_id
+			FROM ancestors a
+			JOIN (%s) d ON d.issue_id = a.node
+		)
+		SELECT node FROM ancestors
+		WHERE node IS NOT NULL
+		  AND ( node = ?
+		     OR EXISTS (SELECT 1 FROM dependencies r
+		                WHERE r.issue_id = ancestors.node AND r.type <> 'parent-child')
+		     OR EXISTS (SELECT 1 FROM wisp_dependencies r
+		                WHERE r.issue_id = ancestors.node AND r.type <> 'parent-child') )
+	`, strings.Join(unions, " UNION "))
+
+	rows, err := tx.QueryContext(ctx, query, id, id)
+	if err != nil {
+		return nil, fmt.Errorf("load ancestor chain of %s: %w", id, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var node string
+		if err := rows.Scan(&node); err != nil {
+			return nil, fmt.Errorf("scan ancestor chain of %s: %w", id, err)
+		}
+		out = append(out, node)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ancestor chain rows for %s: %w", id, err)
+	}
+	return out, nil
 }
 
 func loadBlockingDependersInTx(
