@@ -231,8 +231,6 @@ Examples:
 				return HandleErrorRespectJSON("failed to commit: %v", err)
 			}
 
-			warnIfParentBlocksOwnChild(ctx, fromStore, fromID, toID, types.DepBlocks)
-
 			if jsonOutput {
 				return outputJSON(map[string]interface{}{
 					"status":     "added",
@@ -428,7 +426,6 @@ Examples:
 
 		explicit := cmd.Flags().Changed("type") || cmd.Flags().Changed("blocked-by") || cmd.Flags().Changed("depends-on")
 		warnImplicitBlocksDefault(dt, explicit)
-		warnIfParentBlocksOwnChild(ctx, fromStore, fromID, toID, dt)
 
 		if jsonOutput {
 			return outputJSON(map[string]interface{}{
@@ -443,68 +440,6 @@ Examples:
 			ui.RenderPass("✓"), formatFeedbackIDParen(fromID, lookupTitle(fromID)), depRelationFor(dt).phrase, formatFeedbackIDParen(toID, lookupTitle(toID)), dt)
 		return nil
 	},
-}
-
-// warnIfParentBlocksOwnChild emits the #6506 advisory when the edge just
-// written makes a parent block on one of its own parent-child children — the
-// "close gate on the epic" idiom, where P carries blocks edges onto C1 and C2
-// so P cannot close before them.
-//
-// It is an advisory, not a refusal. Before gastownhall/beads#6506 the edge was
-// a trap: the cascade darkened the very children P was waiting for, so neither
-// could reach bd ready and neither could ever close. Now a parent-child edge
-// propagates only the parent's EXOGENOUS blockedness, so the edge is harmless
-// and the operator's intent is served — but it is unusual enough, and its old
-// meaning damaging enough, that saying what it now means is worth one line.
-//
-// Unlike the D1 implicit-blocks warning this one is NOT gated on an
-// interactive stderr: it fires on a rare deliberate shape rather than on the
-// documented-default majority path, and an agent wiring a close gate is
-// exactly the caller who should read what it does.
-//
-// It runs after the edge has landed, so a refusal from the hierarchy or cycle
-// guard (which reject this pair whenever both edges already exist, in either
-// order) is never preceded by a warning about an edge that was not written.
-// Any read failure is silent: an advisory must not turn a successful write
-// into an error.
-func warnIfParentBlocksOwnChild(ctx context.Context, store storage.DoltStorage, parentID, childID string, dt types.DependencyType) {
-	if dt != types.DepBlocks && dt != types.DepConditionalBlocks {
-		return
-	}
-	if store == nil {
-		return
-	}
-	dependents, err := store.GetDependentsWithMetadata(ctx, parentID)
-	if err != nil {
-		return
-	}
-	if !parentBlocksOwnChild(dependents, childID) {
-		return
-	}
-	emitParentBlocksOwnChildWarning(parentID, childID)
-}
-
-// parentBlocksOwnChild is the testable predicate behind the warning: among the
-// issues that depend on the parent, is the blocker the parent's own
-// parent-child child? Dependents carry the edge type, and only a parent-child
-// edge makes the target a child — a dependent that merely blocks on the parent
-// is an ordinary (and already refused) cycle, not a close gate.
-func parentBlocksOwnChild(dependents []*types.IssueWithDependencyMetadata, childID string) bool {
-	for _, dependent := range dependents {
-		if dependent == nil {
-			continue
-		}
-		if dependent.ID == childID && dependent.DependencyType == types.DepParentChild {
-			return true
-		}
-	}
-	return false
-}
-
-// emitParentBlocksOwnChildWarning writes the #6506 advisory. Split from the
-// gate so the message text can be asserted without a store.
-func emitParentBlocksOwnChildWarning(parentID, childID string) {
-	fmt.Fprintf(os.Stderr, "warning: %s now blocks on its own child %s (a close gate on the epic) — %s stays blocked while %s is open, but a parent-child edge propagates only EXOGENOUS blockedness, so %s and its siblings are NOT hidden from bd ready (gastownhall/beads#6506)\n", parentID, childID, parentID, childID, childID) //nolint:gosec // G705: stderr, not a browser context
 }
 
 // warnImplicitBlocksDefault is the D1 guard: when a dep add edge is created

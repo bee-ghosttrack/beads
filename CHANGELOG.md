@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it cannot close before them — stops darkening the very children it is
   waiting for. The parent itself stays blocked. Existing stores repair on the
   next write that touches the hierarchy, or with `bd doctor --fix`.
+- `bd dep add` no longer explains its refusal of a blocking edge onto your own
+  descendant by claiming the block would cascade down and never clear — it
+  does not, as of the fix above. The refusal stands, and now names the
+  sanctioned way to say it: a waits-for gate over the children.
 
 ## [1.3.0] - 2026-09-15
 
