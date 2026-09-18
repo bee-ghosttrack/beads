@@ -35,10 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left alone, always in the direction of showing work rather than hiding it: a
   sub-epic blocked BOTH by its own children AND by an exogenously blocked
   ancestor keeps its children visible, where the contract would darken them
-  (tracked upstream). "Inside my own subtree" is also decided to a fixed depth
-  of **four** parent-child levels — epic → sub-epic → leg → task — so a parent
-  that blocks on something deeper than that still darkens its whole subtree,
-  exactly as it did before this fix; that depth is a measured trade (the
+  (tracked as [#6601](https://github.com/gastownhall/beads/issues/6601)).
+  "Inside my own subtree" is also decided to a fixed depth of **four**
+  parent-child levels — epic → sub-epic → leg → task — so a parent that
+  blocks on something deeper than that still darkens its whole subtree, exactly
+  as it did before this fix; that depth is a measured trade (the
   bounded walk is a fixed chain of index probes, where a recursive one cost
   7.5x per evaluation) and raising it is a one-constant change. Existing stores
   repair on the next write that touches the hierarchy, or with
