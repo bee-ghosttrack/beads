@@ -13,9 +13,9 @@ import (
 
 // Blocked-state cost at store scale (gastownhall/beads#6506, #6288).
 //
-// The three timings below are the ones the parent-child cascade can regress,
-// and the three a change to shouldBeBlockedIDsUnionScopedSQL must be measured
-// against BEFORE it ships:
+// The timings below are the ones the parent-child cascade can regress, and the
+// ones a change to shouldBeBlockedIDsUnionScopedSQL must be measured against
+// BEFORE it ships:
 //
 //   - RecomputeAllIsBlockedInTx — the full repair. It runs on every dolt
 //     pull/merge (versioncontrolops/blocked_recompute.go), on federation sync,
@@ -24,8 +24,12 @@ import (
 //   - CountIsBlockedInconsistenciesInTx — the read-only detection behind the
 //     doctor "Blocked State" check, over an ALREADY CONSISTENT store, which is
 //     the case an operator actually hits.
-//   - CloseIssue x100 — the incremental write path, which runs the same union
-//     scoped to a batch.
+//   - RecomputeIsBlockedForIDsInTx at 2, 20 and 200 ids — the batched
+//     mark/unmark the incremental write path runs, isolated from the dolt
+//     commit around it. 200 is queryBatchSize (the bulk/import shape); 2 is the
+//     small-batch floor where per-statement cost cannot be amortized.
+//   - CloseIssue x100 — the incremental write path end to end, which runs the
+//     same union scoped to a batch.
 //
 // The fixture matters as much as the numbers: the parent-child legs
 // short-circuit on `p.is_blocked = 1`, so a plane with no blocked rows
@@ -85,30 +89,41 @@ func TestBlockedStateScaleTiming(t *testing.T) {
 		time.Since(start).Round(time.Millisecond), changed)
 
 	// The write path's SQL on its own: the batched mark/unmark the incremental
-	// recompute runs, over a spread of 200 ids, with no commit. CloseIssue
-	// below is the honest end-to-end number, but most of it is a dolt commit,
-	// which on a loaded box swings further than the thing being measured.
-	batchIDs := make([]string, 0, 200)
-	for i := 0; i < 200; i++ {
-		batchIDs = append(batchIDs, scaleID((i*5)%scaleIssues))
-	}
-	const batchReps = 5
-	txb, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("begin batched-recompute tx: %v", err)
-	}
-	start = time.Now()
-	for k := 0; k < batchReps; k++ {
-		if err := issueops.RecomputeIsBlockedForIDsInTx(ctx, txb, batchIDs); err != nil {
-			_ = txb.Rollback()
-			t.Fatalf("RecomputeIsBlockedForIDsInTx: %v", err)
+	// recompute runs, over a spread of ids, with no commit. CloseIssue below is
+	// the honest end-to-end number, but most of it is a dolt commit, which on a
+	// loaded box swings further than the thing being measured.
+	//
+	// THREE batch sizes, because the batched path's cost per statement and its
+	// cost per id pull in opposite directions and one size hides the other. 200
+	// is queryBatchSize — one statement pair, the bulk/import shape an
+	// AffectedBy* fan-out reaches. 20 is an ordinary epic-sized fan-out. 2 is
+	// the floor: the per-STATEMENT overhead (a scoped exogeneity read, the
+	// union built once) with almost no ids to amortize it over, which is where
+	// a fixed per-statement cost shows up worst.
+	for _, bs := range []struct {
+		size, reps int
+	}{{2, 50}, {20, 20}, {200, 5}} {
+		batchIDs := make([]string, 0, bs.size)
+		for i := 0; i < bs.size; i++ {
+			batchIDs = append(batchIDs, scaleID((i*5)%scaleIssues))
 		}
+		txb, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin batched-recompute tx: %v", err)
+		}
+		start = time.Now()
+		for k := 0; k < bs.reps; k++ {
+			if err := issueops.RecomputeIsBlockedForIDsInTx(ctx, txb, batchIDs); err != nil {
+				_ = txb.Rollback()
+				t.Fatalf("RecomputeIsBlockedForIDsInTx(%d ids): %v", bs.size, err)
+			}
+		}
+		elapsedBatch := time.Since(start)
+		_ = txb.Rollback()
+		t.Logf("TIMING batched-recompute-%03d %s for %d x %d ids (%s each)",
+			bs.size, elapsedBatch.Round(time.Millisecond), bs.reps, len(batchIDs),
+			(elapsedBatch / time.Duration(bs.reps)).Round(time.Microsecond))
 	}
-	elapsedBatch := time.Since(start)
-	_ = txb.Rollback()
-	t.Logf("TIMING batched-recompute %s for %d x %d ids (%s each)",
-		elapsedBatch.Round(time.Millisecond), batchReps, len(batchIDs),
-		(elapsedBatch / batchReps).Round(time.Microsecond))
 
 	// The write path end to end: close scaleClosesTimed open leaves one at a
 	// time, each through the store's own CloseIssue, which recomputes the
