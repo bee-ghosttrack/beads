@@ -1045,7 +1045,7 @@ func TestFormatIssueCompact(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf strings.Builder
-			formatIssueCompact(&buf, tt.issue, tt.labels, nil, nil, "")
+			formatIssueCompact(&buf, tt.issue, tt.labels, nil, nil, "", false)
 			result := buf.String()
 			if !strings.Contains(result, tt.want) {
 				t.Errorf("formatIssueCompact() = %q, want to contain %q", result, tt.want)
@@ -1239,7 +1239,7 @@ func TestFormatIssueCompactWithDependencies(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf strings.Builder
-			formatIssueCompact(&buf, tt.issue, nil, tt.blockedBy, tt.blocks, "")
+			formatIssueCompact(&buf, tt.issue, nil, tt.blockedBy, tt.blocks, "", false)
 			result := buf.String()
 			if !strings.Contains(result, tt.want) {
 				t.Errorf("formatIssueCompact() = %q, want to contain %q", result, tt.want)
@@ -1262,7 +1262,7 @@ func TestFormatIssueCompactBlockedIcon(t *testing.T) {
 			Status:    types.StatusOpen,
 		}
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "")
+		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "", false)
 		result := buf.String()
 		// Should show blocked icon ● not open icon ○
 		if strings.Contains(result, ui.StatusIconOpen) {
@@ -1282,7 +1282,7 @@ func TestFormatIssueCompactBlockedIcon(t *testing.T) {
 			Status:    types.StatusOpen,
 		}
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, nil, nil, "")
+		formatIssueCompact(&buf, issue, nil, nil, nil, "", false)
 		result := buf.String()
 		if !strings.Contains(result, ui.StatusIconOpen) {
 			t.Errorf("open issue without blockers should show open icon ○, got: %q", result)
@@ -1298,7 +1298,7 @@ func TestFormatIssueCompactBlockedIcon(t *testing.T) {
 			Status:    types.StatusInProgress,
 		}
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "")
+		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "", false)
 		result := buf.String()
 		// Should keep in_progress icon, not override to blocked
 		if !strings.Contains(result, ui.StatusIconInProgress) {
@@ -1676,7 +1676,7 @@ func TestFormatIssueCompactWithParent(t *testing.T) {
 
 	t.Run("shows parent annotation", func(t *testing.T) {
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, nil, nil, "test-parent")
+		formatIssueCompact(&buf, issue, nil, nil, nil, "test-parent", false)
 		result := buf.String()
 		if !strings.Contains(result, "(parent: test-parent)") {
 			t.Errorf("Expected '(parent: test-parent)' in output, got %q", result)
@@ -1685,7 +1685,7 @@ func TestFormatIssueCompactWithParent(t *testing.T) {
 
 	t.Run("does not show blocked by for parent", func(t *testing.T) {
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, nil, nil, "test-parent")
+		formatIssueCompact(&buf, issue, nil, nil, nil, "test-parent", false)
 		result := buf.String()
 		if strings.Contains(result, "blocked by") {
 			t.Errorf("Should not contain 'blocked by' for parent-child dep, got %q", result)
@@ -1694,7 +1694,7 @@ func TestFormatIssueCompactWithParent(t *testing.T) {
 
 	t.Run("shows parent and blocked by together", func(t *testing.T) {
 		var buf strings.Builder
-		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "test-parent")
+		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "test-parent", false)
 		result := buf.String()
 		if !strings.Contains(result, "(parent: test-parent, blocked by: blocker-1)") {
 			t.Errorf("Expected '(parent: test-parent, blocked by: blocker-1)' in output, got %q", result)
