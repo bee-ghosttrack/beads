@@ -120,10 +120,12 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	details.Dependencies, _ = src.Dependencies(ctx, id, isWisp)
 
 	// The gates blocking this issue are the gate-typed subset of the
-	// dependencies just read (types.IsActiveGate, the same rule the readiness
-	// query applies), so the field costs no extra query. Computed BEFORE the
-	// BriefDeps trim below, which rewrites the slice.
-	details.GatedBy = types.GateRefs(types.ActiveGates(details.Dependencies))
+	// dependencies just read (types.GatesHolding, the one predicate the
+	// readiness query's is_blocked column encodes — subject clause included,
+	// so a closed or pinned issue publishes no gated_by), which costs no extra
+	// query. Computed BEFORE the BriefDeps trim below, which rewrites the
+	// slice.
+	details.GatedBy = types.GateRefs(types.GatesHolding(issue, details.Dependencies))
 
 	// Aggregate counts - O(1) queries, no row materialization.
 	dependentCount, _ := src.CountDependents(ctx, id, isWisp)

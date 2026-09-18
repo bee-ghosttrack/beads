@@ -195,7 +195,7 @@ var showCmd = &cobra.Command{
 			// without a second query. Best effort, as it always was: a failed
 			// read renders the issue undecorated rather than not at all.
 			depsWithMeta, _ := issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
-			gates := types.ActiveGates(depsWithMeta)
+			gates := types.GatesHolding(issue, depsWithMeta)
 
 			if idx > 0 {
 				fmt.Println("\n" + ui.RenderMuted(strings.Repeat("─", 60)))

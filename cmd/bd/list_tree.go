@@ -116,7 +116,7 @@ func compareIssuesByPriority(a, b *types.Issue) int {
 // Children are ordered by dependency then priority when dr != nil (--deps), else
 // by priority (P0 first) for intuitive reading. When dr is set, each node's
 // dependency edges are annotated just beneath it.
-func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, gated map[string]bool) {
+func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, gated map[string][]string) {
 	children := childrenMap[parentID]
 
 	if dr != nil {
@@ -218,9 +218,10 @@ func readyFooterScope(statusSelector string) string {
 // by --limit; the summary then says "Showing N" instead of "Total: N" (GH#5362).
 // readyFiltered means --ready was in force; statusSelector is the --status value
 // so the summary names the pin that actually applied — see listFooterLine.
-// gated names the ids an open gate blocks (gatedIssueIDs); nil means the
-// caller computed no gate decoration, and every row renders as it always did.
-func displayPrettyListWithDepsMode(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, depsMode string, truncated, readyFiltered bool, statusSelector string, gated map[string]bool) {
+// gated maps each listed id to the OPEN gates holding it (gatesByIssueID);
+// nil means the caller computed no gate decoration, and every row renders as
+// it always did.
+func displayPrettyListWithDepsMode(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, depsMode string, truncated, readyFiltered bool, statusSelector string, gated map[string][]string) {
 	if showHeader {
 		// Clear screen and show header
 		fmt.Print("\033[2J\033[H")

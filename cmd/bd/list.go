@@ -326,8 +326,8 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 			return HandleError("loading dependencies for --deps: %v", depErr)
 		}
 		// allDeps is already the whole rig's edge map, so the gate decoration
-		// costs exactly ONE extra query here: the hydration of the gate
-		// candidates it names.
+		// adds ONE call here — the hydration of the gate candidates it names,
+		// itself an id-set read of a few round trips. Per page, never per row.
 		displayPrettyListWithDepsMode(issues, false, allDeps, in.depsMode, truncated, in.ReadyFlag, in.Status,
 			gatedIssueIDs(ctx, activeStore, issues, allDeps))
 		printTruncationHint(truncated, in.effectiveLimit)
@@ -361,13 +361,19 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 	// between the two CALLERS, recorded for the owner in AMBIGUITIES.md
 	// (A-blk-1) rather than converged here.
 	blocking := annotateListBlocking(ctx, activeStore, issueIDs)
-	// Batched by id set, never per row — see gatedIssueIDs.
-	gated := gatedIssueIDs(ctx, activeStore, issues, nil)
+	// Batched by id set, never per row — see gatesByIssueID. --long and
+	// --format render no gate (GatedBy lives on types.IssueDetails, which a
+	// --format template cannot reach), so neither pays for the reads; agent
+	// and compact mode both spend them and both render them.
+	var gated map[string][]string
+	if ui.IsAgentMode() || !in.longFormat {
+		gated = gatedIssueIDs(ctx, activeStore, issues, nil)
+	}
 
 	var buf strings.Builder
 	if ui.IsAgentMode() {
 		for _, issue := range issues {
-			formatAgentIssue(&buf, issue, blocking.blockedBy[issue.ID], blocking.blocks[issue.ID], blocking.parent[issue.ID])
+			formatAgentIssue(&buf, issue, blocking.blockedBy[issue.ID], blocking.blocks[issue.ID], blocking.parent[issue.ID], gated[issue.ID])
 		}
 		fmt.Print(buf.String())
 		printTruncationHint(truncated, in.effectiveLimit)
