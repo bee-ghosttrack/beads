@@ -173,34 +173,15 @@ func TestPrintComments_TailAtOrAboveCount(t *testing.T) {
 	}
 }
 
-// TestPrintComments_AbsentMatchesZero is scenario 3: the flag absent (which
-// resolves to Go's zero value for an unset int flag, 0) and the flag
-// explicitly passed as 0 must be indistinguishable — both take the tailN ==
-// 0 branch, so there is nothing left to diverge, but this pins that
-// contract at the call-site level too, not just inside printComments.
-func TestPrintComments_AbsentMatchesZero(t *testing.T) {
-	comments := makeTailTestComments(3)
-
-	var absentTailN int // zero value: an unset --comments-tail flag GetInt()s to this
-	absent := captureStdout(t, func() error {
-		printComments(comments, absentTailN, testCommentsTailFormatTime, "ts-1")
-		return nil
-	})
-	explicitZero := captureStdout(t, func() error {
-		printComments(comments, 0, testCommentsTailFormatTime, "ts-1")
-		return nil
-	})
-	if absent != explicitZero {
-		t.Errorf("flag-absent output diverged from --comments-tail 0 output:\nabsent:\n%s\nexplicit:\n%s", absent, explicitZero)
-	}
-}
-
 // TestPrintComments_ByteIdenticalToLegacyRender is the strongest form of "the
 // flag absent or 0 must not change output": it compares printComments'
 // uncapped path against an independent reproduction of the exact code that
 // rendered the COMMENTS section before --comments-tail existed, so the two
 // can't share a bug that a self-comparison (capped vs. uncapped both going
-// through printComments) would hide.
+// through printComments) would hide. Calling printComments(x, 0) and
+// comparing it to another printComments(x, 0) call would be vacuous — it
+// can't fail — so every subtest here compares against legacyRenderComments
+// instead.
 func TestPrintComments_ByteIdenticalToLegacyRender(t *testing.T) {
 	comments := makeTailTestComments(7)
 
@@ -215,6 +196,20 @@ func TestPrintComments_ByteIdenticalToLegacyRender(t *testing.T) {
 	if legacy != current {
 		t.Errorf("printComments(tailN=0) diverged from the pre-flag render:\nlegacy:\n%s\ncurrent:\n%s", legacy, current)
 	}
+
+	// scenario 3: the flag absent — which resolves to Go's zero value for an
+	// unset int flag — must render identically to the pre-flag block, not
+	// merely to another explicit-0 call.
+	t.Run("flag absent (zero value)", func(t *testing.T) {
+		var absentTailN int // an unset --comments-tail flag GetInt()s to this
+		absent := captureStdout(t, func() error {
+			printComments(comments, absentTailN, testCommentsTailFormatTime, "ts-1")
+			return nil
+		})
+		if absent != legacy {
+			t.Errorf("flag-absent output diverged from the pre-flag render:\nabsent:\n%s\nlegacy:\n%s", absent, legacy)
+		}
+	})
 
 	t.Run("empty comments", func(t *testing.T) {
 		legacyEmpty := captureStdout(t, func() error {
@@ -248,24 +243,74 @@ func TestPrintComments_SingularWording(t *testing.T) {
 	}
 }
 
-// TestPrintComments_CommentCountHeaderUnaffected pins that a cap does not
-// touch any count carried alongside comments elsewhere — printComments only
-// ever receives the already-fetched comment slice and never reports a count
-// itself, so the total the caller shows in any header stays the total
-// regardless of tailN. This guards against a future edit accidentally
-// threading len(comments[start:]) somewhere a total was expected.
-func TestPrintComments_CommentCountHeaderUnaffected(t *testing.T) {
-	comments := makeTailTestComments(6)
-	if got := len(comments); got != 6 {
-		t.Fatalf("test setup: want 6 comments, got %d", got)
+// legacyWatchRenderComments reproduces, verbatim, the COMMENTS block that
+// lived inline in show_display.go's displayShowIssueReturn before
+// --comments-tail existed. Unlike legacyRenderComments above (which the
+// direct and --proxied-server routes shared), the watch path hardcoded UTC
+// unconditionally rather than taking a formatTime parameter — it never
+// threaded --local-time — so this is its own, separate baseline.
+func legacyWatchRenderComments(comments []*types.Comment) {
+	if len(comments) > 0 {
+		fmt.Printf("\n%s\n", ui.RenderBold("COMMENTS"))
+		for _, comment := range comments {
+			fmt.Printf("  %s %s\n", ui.RenderMuted(comment.CreatedAt.UTC().Format("2006-01-02 15:04")), comment.Author)
+			rendered := uimd.RenderMarkdown(comment.Text)
+			for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
+				fmt.Printf("    %s\n", line)
+			}
+		}
 	}
-	// printComments must not mutate the slice it was handed — a caller that
-	// reports len(comments) in a header after calling it must still see 6.
-	_ = captureStdout(t, func() error {
-		printComments(comments, 2, testCommentsTailFormatTime, "ts-1")
+}
+
+// TestRenderWatchComments_TailAbsentMatchesLegacy pins that the watch path's
+// own render call (renderWatchComments, the exact function
+// displayShowIssueReturn calls — see show_display.go) reproduces the old
+// watch block byte for byte when --comments-tail is absent (tailN == 0),
+// including its hardcoded UTC formatting. This is the "watch mode ignores
+// the flag" regression guard: it exercises the real wiring, not a
+// hand-picked formatTime, so a future edit that stops threading
+// --comments-tail to the watch render — or that starts threading
+// --local-time in a way that changes the UTC formatting — would surface
+// here.
+func TestRenderWatchComments_TailAbsentMatchesLegacy(t *testing.T) {
+	comments := makeTailTestComments(4)
+
+	legacy := captureStdout(t, func() error {
+		legacyWatchRenderComments(comments)
 		return nil
 	})
-	if got := len(comments); got != 6 {
-		t.Errorf("printComments mutated the comments slice: len = %d, want 6", got)
+	current := captureStdout(t, func() error {
+		renderWatchComments(comments, 0, "ts-1")
+		return nil
+	})
+	if legacy != current {
+		t.Errorf("renderWatchComments(tailN=0) diverged from the pre-flag watch block:\nlegacy:\n%s\ncurrent:\n%s", legacy, current)
+	}
+}
+
+// TestRenderWatchComments_HonoursTail is the watch-path form of scenario 1:
+// --comments-tail must cap the watch render the same way it caps the other
+// two show routes, through the actual renderWatchComments call
+// displayShowIssueReturn makes.
+func TestRenderWatchComments_HonoursTail(t *testing.T) {
+	comments := makeTailTestComments(5)
+	out := captureStdout(t, func() error {
+		renderWatchComments(comments, 2, "ts-1")
+		return nil
+	})
+
+	for i := 0; i < 3; i++ {
+		if strings.Contains(out, fmt.Sprintf("body-%d", i)) {
+			t.Errorf("expected body-%d to be hidden by the cap in watch output, found it in:\n%s", i, out)
+		}
+	}
+	for i := 3; i < 5; i++ {
+		if !strings.Contains(out, fmt.Sprintf("body-%d", i)) {
+			t.Errorf("expected body-%d to render in watch output, missing from:\n%s", i, out)
+		}
+	}
+	wantLine := "… 3 older comments hidden — bd show ts-1 for the full record"
+	if !strings.Contains(out, wantLine) {
+		t.Errorf("expected elision line %q in watch output, got:\n%s", wantLine, out)
 	}
 }
