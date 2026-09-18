@@ -380,14 +380,14 @@ func unmarkAllBlockedSQL(table, alias, depTable string, explained subtreeExplain
 // explained by their own subtree and which therefore may not darken their
 // children (gastownhall/beads#6506), split by the parent's kind.
 //
-// WHY THE IDS AND NOT THE SQL. The batched mark/unmark splice the set in as a
-// subquery, because there it is confined to the batch's own parents and costs
-// a few rows. The unbatched statements cannot confine it — they ARE the whole
-// table — so a spliced subquery is evaluated once per statement per parent
-// kind, and a full repair pass is four statements. Measured at 1000 issues /
-// 2870 deps: 46 ms on origin/main, 420 ms with the set spliced into all four,
-// 80 ms read once per pass and bound as ids. The read itself is the same
-// query either way; what changes is how many times a pass pays for it.
+// WHY THE IDS AND NOT THE SQL. A spliced `p.id NOT IN (deriving query)` is
+// evaluated once per leg per statement, and a full repair pass is four
+// statements over two parent kinds. Measured at 1000 issues / 2870 deps:
+// 46 ms on origin/main, 420 ms with the set spliced into all four, 80 ms read
+// once per pass and bound as ids. The read itself is the same query either
+// way; what changes is how many times a pass pays for it. The BATCHED path
+// makes the same trade against its own scope rather than the whole store
+// (scopedExplainedParentsInTx) — spliced there, it measured 6.9x.
 //
 // The set is small by construction — blocked parents that carry a blocking
 // reason of their own, all of whose reasons point inside their own subtree —
@@ -453,6 +453,105 @@ func subtreeExplainedParentsInTx(ctx context.Context, tx DBTX) (subtreeExplained
 	return out, nil
 }
 
+// scopedExplainedParentsInTx is subtreeExplainedParentsInTx confined to ONE
+// BATCH: the same two reads, but the candidate parents are read only from the
+// batch's own dependency rows, so the set is derived for the handful of
+// parents above the batch instead of for every parent in the store.
+//
+// WHY A READ AND NOT A SPLICE. The batched mark/unmark templates used to
+// splice the deriving query into both of their parent-child legs,
+// batch-scoped, which reads as the cheap option: the scope confines cand to
+// the batch, so the subquery is small. It is not cheap. A spliced
+// `p.id NOT IN (subquery)` is paid once per leg per STATEMENT, and a batched
+// pass is a mark and an unmark, so one 200-id recompute derived the set four
+// times. Measured at 1000 issues / 2870 deps on embedded dolt, one pass over
+// 200 ids: 53 ms on origin/main, 422 ms with the query spliced into both legs
+// of both statements (6.9x, against a 1.5x bar), 61 ms read once per batch and
+// bound as ids. It is the same trade the unbatched statements make one level
+// up (see subtreeExplainedParents): the read is the same query either way,
+// and what changes is how many times a pass pays for it.
+//
+// scope is the batch predicate already rendered to placeholders
+// ("AND d.issue_id IN (?,?,…)") and args its ids. Both parent kinds are read
+// with the same scope, because exogeneity is a property of the PARENT and the
+// batch is only what bounds which parents can be asked about.
+func scopedExplainedParentsInTx(
+	ctx context.Context, tx DBTX, depTable, scope string, args []any,
+) (subtreeExplainedParents, error) {
+	var out subtreeExplainedParents
+	hasIssueParent, hasWispParent, err := batchParentKindsInTx(ctx, tx, depTable, scope, args)
+	if err != nil {
+		if isTableNotExistError(err) {
+			return out, nil
+		}
+		return out, err
+	}
+	cands := []candSource{{depTable: depTable, scope: scope}}
+
+	if hasIssueParent {
+		out.issueParents, err = queryIDs(ctx, tx,
+			parentsExplainedBySubtreeSQL("issues", "dependencies", "depends_on_issue_id", cands), args...)
+		if err != nil {
+			return out, fmt.Errorf("read batch issue parents explained by their own subtree: %w", err)
+		}
+	}
+	if hasWispParent {
+		out.wispParents, err = queryIDs(ctx, tx,
+			parentsExplainedBySubtreeSQL("wisps", "wisp_dependencies", "depends_on_wisp_id", cands), args...)
+		if err != nil {
+			if isTableNotExistError(err) {
+				return out, nil
+			}
+			return out, fmt.Errorf("read batch wisp parents explained by their own subtree: %w", err)
+		}
+	}
+	return out, nil
+}
+
+// batchParentKindsInTx reports which parent KINDS the batch can possibly ask
+// about: whether any parent-child row in the batch names an issue parent, and
+// whether any names a wisp parent.
+//
+// It is the cheap guard in front of the two reads above, and it is what keeps
+// the SMALL-batch case honest. A kind with no parent-child row in the batch
+// has an empty candidate set, hence an empty exogeneity set, so its read is
+// pure overhead — and that overhead is not small: the read is a ten-join walk
+// under two CTEs, which dolt spends ~8 ms planning whether it returns rows or
+// not. Most batches name no wisp parent at all, and a batch of roots (or of
+// rows with no hierarchy) names neither. Measured at 1000 issues / 2870 deps,
+// per pass: a 2-id batch of unparented rows 37 ms with both reads run blind
+// against 20 ms with this guard, which is origin/main's own number.
+//
+// One indexed aggregate, both columns at once, because COUNT ignores NULLs and
+// a parent-child row carries exactly one of the two.
+//
+//nolint:gosec // G201: depTable is a constant from the caller; scope carries only ? placeholders.
+func batchParentKindsInTx(
+	ctx context.Context, tx DBTX, depTable, scope string, args []any,
+) (bool, bool, error) {
+	query := fmt.Sprintf(`
+		SELECT COUNT(d.depends_on_issue_id), COUNT(d.depends_on_wisp_id)
+		FROM %[1]s d
+		WHERE d.issue_id IS NOT NULL %[2]s
+		  AND d.type = 'parent-child'
+	`, depTable, scope)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	var issueParents, wispParents int64
+	if rows.Next() {
+		if err := rows.Scan(&issueParents, &wispParents); err != nil {
+			return false, false, fmt.Errorf("scan batch parent kinds: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, false, err
+	}
+	return issueParents > 0, wispParents > 0, nil
+}
+
 // candSource names one dependency table the candidate-parent set is read from,
 // with the batch scope that confines it there (empty for the unbatched reads).
 type candSource struct {
@@ -466,8 +565,8 @@ func unbatchedCandSources() []candSource {
 	return []candSource{{depTable: "dependencies"}, {depTable: "wisp_dependencies"}}
 }
 
-func queryIDs(ctx context.Context, tx DBTX, query string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, query)
+func queryIDs(ctx context.Context, tx DBTX, query string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -495,11 +594,11 @@ func shouldBeBlockedIDsUnionPrecomputedSQL(depTable string, explained subtreeExp
 		notInPlaceholders(len(explained.wispParents)))
 }
 
-// shouldBeBlockedIDsUnionScopedSQL selects, UNCORRELATED with any outer row,
-// every depTable issue_id that currently has a reason to be blocked: one UNION
-// leg per reason — an open blocks/conditional-blocks target (issue or wisp), an
-// EXOGENOUSLY blocked parent-child parent (issue or wisp; see
-// parentsExplainedBySubtreeSQL), a blocking waits-for gate.
+// shouldBeBlockedIDsUnionScopedPrecomputedSQL selects, UNCORRELATED with any
+// outer row, every depTable issue_id that currently has a reason to be
+// blocked: one UNION leg per reason — an open blocks/conditional-blocks target
+// (issue or wisp), an EXOGENOUSLY blocked parent-child parent (issue or wisp;
+// see parentsExplainedBySubtreeSQL), a blocking waits-for gate.
 // Semantically, `<alias>.id IN (this select)` ≡ the disjunction of those
 // reasons correlated on d.issue_id = <alias>.id, which is what the batched
 // mark/unmark templates in blocked_state.go once spelled out as five
@@ -513,6 +612,13 @@ func shouldBeBlockedIDsUnionPrecomputedSQL(depTable string, explained subtreeExp
 // mark/unmark templates in blocked_state.go, which confine each leg to
 // d.issue_id IN (batch) so the union stays index-sized per statement. scope is
 // spliced verbatim: a %s inside it survives this Sprintf for the batch runner.
+//
+// Like the unbatched form above, and unlike the shape this round replaced, the
+// two parent-child legs SUBTRACT AN ALREADY-READ id list rather than the query
+// that derives it: the batch runner reads the set once per batch
+// (scopedExplainedParentsInTx) and binds it into both statements. The caller
+// binds explained.args() once per splice, interleaved with the batch ids in
+// text order — expandBatchTemplate does that bookkeeping.
 //
 // The waits-for leg wraps its dependency rows in a DISTINCT derived table
 // BEFORE the gate predicate (waitsForGateBlockedSQL, six correlated EXISTS
@@ -529,12 +635,12 @@ func shouldBeBlockedIDsUnionPrecomputedSQL(depTable string, explained subtreeExp
 // fold back into the outer query; a DISTINCT one is materialized.
 //
 //nolint:gosec // G201: depTable and scope are constants; waitsForGateBlockedSQL is a constant template.
-func shouldBeBlockedIDsUnionScopedSQL(depTable, scope string) string {
+func shouldBeBlockedIDsUnionScopedPrecomputedSQL(
+	depTable, scope string, explained subtreeExplainedParents,
+) string {
 	return shouldBeBlockedIDsUnionCoreSQL(depTable, scope,
-		"AND p.id NOT IN ("+parentsExplainedBySubtreeSQL("issues", "dependencies", "depends_on_issue_id",
-			[]candSource{{depTable: depTable, scope: scope}})+")",
-		"AND p.id NOT IN ("+parentsExplainedBySubtreeSQL("wisps", "wisp_dependencies", "depends_on_wisp_id",
-			[]candSource{{depTable: depTable, scope: scope}})+")")
+		notInPlaceholders(len(explained.issueParents)),
+		notInPlaceholders(len(explained.wispParents)))
 }
 
 // shouldBeBlockedIDsUnionCoreSQL is the five legs themselves. The two
@@ -604,6 +710,15 @@ func shouldBeBlockedIDsUnionCoreSQL(depTable, scope, issueParentCond, wispParent
 // epic -> sub-epic -> leg -> task, which is deeper than any dotted-id
 // hierarchy this store has carried, and it is the knob to turn first if a
 // real store is ever found below it.
+//
+// BOTH SIDES OF THE HORIZON ARE PINNED, by a pair of dolt tests that differ by
+// one edge: TestParentChildCascade_ReasonAtTheWalkHorizon (a reason exactly
+// this many levels down; the subtree comes bright) and
+// _ReasonPastTheWalkHorizon (one level further; the subtree stays dark, which
+// is origin/main's own answer, so that test passes unchanged on origin/main).
+// Raising this constant makes the second one fail and name the rows that
+// changed. Measured cost of raising it, at 1000 issues / 2870 deps: see the
+// commit that introduced the pin.
 const subtreeWalkDepth = 4
 
 // parentsExplainedBySubtreeSQL is the parent-child legs' exogeneity test
@@ -676,8 +791,8 @@ const subtreeWalkDepth = 4
 //
 //   - cand is the set of parents the caller can possibly ask about. A batched
 //     mark/unmark passes ONE source — its own dependency table, carrying its
-//     own batch scope (see shouldBeBlockedIDsUnionScopedSQL) — so it computes
-//     the handful of parents above the batch. The unbatched read passes both
+//     own batch scope (see scopedExplainedParentsInTx) — so it computes the
+//     handful of parents above the batch. The unbatched read passes both
 //     tables unscoped, which is every row that is a parent at all and already
 //     prunes most of the table. The alias must be d: batchScopeSQL is written
 //     against d.issue_id and is spliced verbatim. It binds to this subquery's
