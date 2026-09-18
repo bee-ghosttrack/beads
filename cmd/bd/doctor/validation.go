@@ -359,8 +359,9 @@ func truncateDetail(detail string) string {
 }
 
 // CheckParentBlocksOwnChild reports parents that carry a blocking edge onto one
-// of their own parent-child children — the "close gate on the epic" idiom,
-// where P blocks on C1 and C2 so P cannot close before them.
+// of their own parent-child descendants — the "close gate on the epic" idiom,
+// where P blocks on C1 and C2 (or on a grandchild) so P cannot close before
+// them.
 //
 // It is INFORMATIONAL and has no fix. Before gastownhall/beads#6506 these
 // edges were a trap: the parent's blocked bit cascaded to its children
@@ -389,21 +390,48 @@ func CheckParentBlocksOwnChild(path string) DoctorCheck {
 // checkParentBlocksOwnChildDB is the core logic for CheckParentBlocksOwnChild.
 // The pair is symmetric-but-opposite to checkChildParentDependenciesDB above:
 // that one finds a CHILD blocking on its PARENT (still a deadlock, still
-// fixable); this one finds a PARENT blocking on its CHILD, and matches on real
-// parent-child edges rather than on dotted-ID ancestry, because the close-gate
-// idiom is wired with explicit edges between unrelated ids.
+// fixable); this one finds a PARENT blocking on its own DESCENDANT, and
+// matches on real parent-child edges rather than on dotted-ID ancestry,
+// because the close-gate idiom is wired with explicit edges between unrelated
+// ids. "Descendant" is walked to the same four parent-child levels the cascade
+// fix uses to decide "inside my own subtree" (issueops subtreeWalkDepth), so
+// the inventory and the fix agree on which gates are gates: a parent that
+// blocks on its grandchild is listed, one that blocks five levels down is not.
 func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	//nolint:gosec // G202: doctorDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
-		SELECT b.issue_id, b.depends_on_id
+		SELECT DISTINCT b.issue_id, b.depends_on_id
 		FROM (` + doctorDependencyUnionSQL() + `) b
+		JOIN (
+		    SELECT l1.depends_on_id AS anc, l1.issue_id AS des
+		    FROM (` + doctorDependencyUnionSQL() + `) l1
+		    WHERE l1.type = 'parent-child'
+		  UNION
+		    SELECT l1.depends_on_id, l2.issue_id
+		    FROM (` + doctorDependencyUnionSQL() + `) l1
+		    JOIN (` + doctorDependencyUnionSQL() + `) l2
+		      ON l2.type = 'parent-child' AND l2.depends_on_id = l1.issue_id
+		    WHERE l1.type = 'parent-child'
+		  UNION
+		    SELECT l1.depends_on_id, l3.issue_id
+		    FROM (` + doctorDependencyUnionSQL() + `) l1
+		    JOIN (` + doctorDependencyUnionSQL() + `) l2
+		      ON l2.type = 'parent-child' AND l2.depends_on_id = l1.issue_id
+		    JOIN (` + doctorDependencyUnionSQL() + `) l3
+		      ON l3.type = 'parent-child' AND l3.depends_on_id = l2.issue_id
+		    WHERE l1.type = 'parent-child'
+		  UNION
+		    SELECT l1.depends_on_id, l4.issue_id
+		    FROM (` + doctorDependencyUnionSQL() + `) l1
+		    JOIN (` + doctorDependencyUnionSQL() + `) l2
+		      ON l2.type = 'parent-child' AND l2.depends_on_id = l1.issue_id
+		    JOIN (` + doctorDependencyUnionSQL() + `) l3
+		      ON l3.type = 'parent-child' AND l3.depends_on_id = l2.issue_id
+		    JOIN (` + doctorDependencyUnionSQL() + `) l4
+		      ON l4.type = 'parent-child' AND l4.depends_on_id = l3.issue_id
+		    WHERE l1.type = 'parent-child'
+		) d ON d.anc = b.issue_id AND d.des = b.depends_on_id
 		WHERE b.type IN ('blocks', 'conditional-blocks')
-		  AND EXISTS (
-		    SELECT 1 FROM (` + doctorDependencyUnionSQL() + `) pc
-		    WHERE pc.type = 'parent-child'
-		      AND pc.issue_id = b.depends_on_id
-		      AND pc.depends_on_id = b.issue_id
-		  )
 		ORDER BY b.issue_id, b.depends_on_id
 	`
 	rows, err := db.Query(query)
@@ -438,7 +466,7 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 		return DoctorCheck{
 			Name:     "Parent Close Gates",
 			Status:   StatusOK,
-			Message:  "No parent→own-child blocking edges",
+			Message:  "No parent→own-descendant blocking edges",
 			Category: CategoryMetadata,
 		}
 	}
@@ -448,7 +476,7 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	return DoctorCheck{
 		Name:     "Parent Close Gates",
 		Status:   StatusOK,
-		Message:  fmt.Sprintf("%d parent→own-child blocking edge(s) (informational: the children stay in bd ready)", len(gates)),
+		Message:  fmt.Sprintf("%d parent→own-descendant blocking edge(s) (informational: the children stay in bd ready)", len(gates)),
 		Detail:   detail,
 		Category: CategoryMetadata,
 	}

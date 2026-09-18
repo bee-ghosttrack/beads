@@ -746,14 +746,17 @@ func TestCheckParentBlocksOwnChildDB_NoGates(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
 	}
-	if check.Message != "No parent→own-child blocking edges" {
+	if check.Message != "No parent→own-descendant blocking edges" {
 		t.Errorf("Message = %q, want the empty-inventory message", check.Message)
+	}
+	if check.Category != CategoryMetadata {
+		t.Errorf("Category = %q, want %q", check.Category, CategoryMetadata)
 	}
 }
 
 // TestCheckParentBlocksOwnChildDB_GateReported verifies the inventory: a parent
-// that blocks on its own parent-child child is listed, by both ids, and the
-// check stays OK — these edges are legal since gastownhall/beads#6506 and the
+// that blocks on its own parent-child child OR grandchild is listed, by both
+// ids, and the check stays OK — these edges are legal since gastownhall/beads#6506 and the
 // check has no fix.
 func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	store := newTestDoltStore(t, "test")
@@ -767,6 +770,10 @@ func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	if err := store.CreateIssue(ctx, child, "test"); err != nil {
 		t.Fatalf("Failed to create child: %v", err)
 	}
+	grandchild := &types.Issue{Title: "Grandchild task", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, grandchild, "test"); err != nil {
+		t.Fatalf("Failed to create grandchild: %v", err)
+	}
 	other := &types.Issue{Title: "Unrelated blocker", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
 	if err := store.CreateIssue(ctx, other, "test"); err != nil {
 		t.Fatalf("Failed to create unrelated blocker: %v", err)
@@ -775,9 +782,11 @@ func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	db := store.DB()
 	edges := []struct{ from, to, depType string }{
 		{child.ID, parent.ID, "parent-child"},
-		{parent.ID, child.ID, "blocks"}, // the close gate
-		{parent.ID, other.ID, "blocks"}, // exogenous: must NOT be listed
-		{child.ID, other.ID, "blocks"},  // an ordinary blocker on the child
+		{grandchild.ID, child.ID, "parent-child"},
+		{parent.ID, child.ID, "blocks"},      // the close gate
+		{parent.ID, grandchild.ID, "blocks"}, // a gate two levels down: listed too
+		{parent.ID, other.ID, "blocks"},      // exogenous: must NOT be listed
+		{child.ID, other.ID, "blocks"},       // an ordinary blocker on the child
 	}
 	for _, e := range edges {
 		if _, err := db.ExecContext(ctx,
@@ -795,12 +804,16 @@ func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	if check.Fix != "" {
 		t.Errorf("Fix = %q, want empty: this check has no --fix", check.Fix)
 	}
-	if !strings.Contains(check.Message, "1 parent→own-child") {
-		t.Errorf("Message = %q, want a count of exactly the one close gate", check.Message)
+	if check.Category != CategoryMetadata {
+		t.Errorf("Category = %q, want %q", check.Category, CategoryMetadata)
 	}
-	wantDetail := parent.ID + "→" + child.ID
-	if !strings.Contains(check.Detail, wantDetail) {
-		t.Errorf("Detail = %q, want it to name %q", check.Detail, wantDetail)
+	if !strings.Contains(check.Message, "2 parent→own-descendant") {
+		t.Errorf("Message = %q, want a count of exactly the two close gates", check.Message)
+	}
+	for _, wantDetail := range []string{parent.ID + "→" + child.ID, parent.ID + "→" + grandchild.ID} {
+		if !strings.Contains(check.Detail, wantDetail) {
+			t.Errorf("Detail = %q, want it to name %q", check.Detail, wantDetail)
+		}
 	}
 	if strings.Contains(check.Detail, other.ID) {
 		t.Errorf("Detail = %q, must not list the exogenous blocker %s", check.Detail, other.ID)
