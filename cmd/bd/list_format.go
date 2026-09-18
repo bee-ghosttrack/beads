@@ -43,8 +43,24 @@ func renderStatusIcon(status types.Status) string {
 // formatPrettyIssue formats a single issue for pretty output
 // Uses semantic colors: status icon colored, priority P0/P1 colored, rest neutral
 func formatPrettyIssue(issue *types.Issue) string {
+	return formatPrettyIssueGated(issue, false)
+}
+
+// formatPrettyIssueGated is formatPrettyIssue with the derived gate marker
+// (wy-j2upyy): when an open gate blocks the issue, the glyph column carries
+// ⊘ instead of the stored status's icon. The rest of the row is untouched,
+// and the stored status is untouched — this is a decoration over the same
+// predicate `bd ready` filters on, so the listing stops disagreeing with it.
+//
+// The marker OUTRANKS the status icon, including ❄: one column can hold one
+// glyph, and of the two reasons the work cannot start, the gate is the one a
+// reader cannot discover from the row's own fields.
+func formatPrettyIssueGated(issue *types.Issue, gated bool) string {
 	// Use shared helpers from ui package
 	statusIcon := ui.RenderStatusIcon(string(issue.Status))
+	if gated && issue.Status != types.StatusClosed {
+		statusIcon = ui.StatusBlockedStyle.Render(ui.StatusIconGated)
+	}
 	priorityTag := renderPriorityTag(issue.Priority)
 
 	// Type badge - only show for notable types
@@ -235,7 +251,7 @@ func getClosedBlockerIDs(ctx context.Context, s storage.DoltStorage, allDeps map
 // formatIssueCompact formats a single issue in compact format to a buffer
 // Uses status icons for better scanability - consistent with bd graph
 // Format: [icon] [pin] ID [Priority] [Type] @assignee [labels] - Title (parent: X, blocked by: Y, blocks: Z)
-func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []string, blockedBy, blocks []string, parent string) {
+func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []string, blockedBy, blocks []string, parent string, gated bool) {
 	labelsStr := ""
 	if len(labels) > 0 {
 		labelsStr = fmt.Sprintf(" %v", labels)
@@ -255,6 +271,11 @@ func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []strin
 	statusIcon := renderStatusIcon(issue.Status)
 	if len(blockedBy) > 0 && issue.Status == types.StatusOpen {
 		statusIcon = renderStatusIcon(types.StatusBlocked)
+	}
+	// A gate is a blocker a reader cannot see in the row, so it takes the
+	// column back off ● (wy-j2upyy). Same predicate as the tree view's glyph.
+	if gated && issue.Status != types.StatusClosed {
+		statusIcon = ui.StatusBlockedStyle.Render(ui.StatusIconGated)
 	}
 
 	if issue.Status == types.StatusClosed {

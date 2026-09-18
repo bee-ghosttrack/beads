@@ -326,7 +326,8 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 				return HandleError("loading dependencies for --deps: %v", depErr)
 			}
 			// Hierarchical --parent walks use an unlimited per-level query, so the tree is never page-truncated.
-			displayPrettyListWithDepsMode(treeIssues, false, allDeps, in.depsMode, false, in.ReadyFlag, in.Status, in.SortBy, in.Reverse)
+			displayPrettyListWithDepsMode(treeIssues, false, allDeps, in.depsMode, false, in.ReadyFlag, in.Status, in.SortBy, in.Reverse,
+				gatedIssueIDs(ctx, activeStore, treeIssues, allDeps))
 			printSkipLabelsFooter(in.SkipLabels)
 			return nil
 		}
@@ -335,7 +336,11 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 		if depErr != nil && in.depsMode != "" {
 			return HandleError("loading dependencies for --deps: %v", depErr)
 		}
-		displayPrettyListWithDepsMode(issues, false, allDeps, in.depsMode, truncated, in.ReadyFlag, in.Status, in.SortBy, in.Reverse)
+		// allDeps is already the whole rig's edge map, so the gate decoration
+		// costs exactly ONE extra query here: the hydration of the gate
+		// candidates it names.
+		displayPrettyListWithDepsMode(issues, false, allDeps, in.depsMode, truncated, in.ReadyFlag, in.Status, in.SortBy, in.Reverse,
+			gatedIssueIDs(ctx, activeStore, issues, allDeps))
 		printTruncationHint(truncated, in.effectiveLimit)
 		printSkipLabelsFooter(in.SkipLabels)
 		return nil
@@ -367,6 +372,8 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 	// between the two CALLERS, recorded for the owner in AMBIGUITIES.md
 	// (A-blk-1) rather than converged here.
 	blocking := annotateListBlocking(ctx, activeStore, issueIDs)
+	// Batched by id set, never per row — see gatedIssueIDs.
+	gated := gatedIssueIDs(ctx, activeStore, issues, nil)
 
 	var buf strings.Builder
 	if ui.IsAgentMode() {
@@ -385,7 +392,7 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 	} else {
 		for _, issue := range issues {
 			labels := labelsMap[issue.ID]
-			formatIssueCompact(&buf, issue, labels, blocking.blockedBy[issue.ID], blocking.blocks[issue.ID], blocking.parent[issue.ID])
+			formatIssueCompact(&buf, issue, labels, blocking.blockedBy[issue.ID], blocking.blocks[issue.ID], blocking.parent[issue.ID], gated[issue.ID])
 		}
 	}
 
