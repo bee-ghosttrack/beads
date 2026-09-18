@@ -115,6 +115,19 @@ func TestEmbeddedGatedRendering(t *testing.T) {
 		}
 	})
 
+	// --flat leaves the tree view, and with it the whole-rig edge map the tree
+	// already had: this arm is what exercises gatedIssueIDs' own batched
+	// dependency read.
+	t.Run("flat_list_row_carries_the_gated_glyph", func(t *testing.T) {
+		out := bdList(t, bd, dir, "--flat")
+		t.Logf("bd list --flat:\n%s", out)
+		row := listRowFor(t, out, target.ID)
+		if !strings.HasPrefix(strings.TrimSpace(row), ui.StatusIconGated) {
+			t.Errorf("flat list row for %s does not lead with the gated glyph %q:\n%s",
+				target.ID, ui.StatusIconGated, row)
+		}
+	})
+
 	t.Run("deferred_and_gated_show_both_markers", func(t *testing.T) {
 		deferred := bdCreate(t, bd, dir, "Deferred and gated", "-p", "1")
 		bdUpdate(t, bd, dir, deferred.ID, "--defer", "2099-01-15")
@@ -153,6 +166,14 @@ func TestEmbeddedGatedRendering(t *testing.T) {
 		details := bdShowDetails(t, bd, dir, target.ID)
 		if raw, ok := details["gated_by"]; ok {
 			t.Errorf("gated_by present after the gate closed: %#v", raw)
+		}
+
+		for _, listArgs := range [][]string{nil, {"--flat"}} {
+			listOut := bdList(t, bd, dir, listArgs...)
+			row := listRowFor(t, listOut, target.ID)
+			if strings.Contains(row, ui.StatusIconGated) {
+				t.Errorf("list %v row still carries the gated glyph after resolve:\n%s", listArgs, row)
+			}
 		}
 
 		listOut := bdList(t, bd, dir)
