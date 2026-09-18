@@ -3,6 +3,7 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -499,4 +500,235 @@ func TestParentChildCascade_WaitsForGateOverOwnChildren(t *testing.T) {
 	assertBlockedFlags(ctx, t, store, "after the write path", want)
 	assertConvergedAndStable(ctx, t, store)
 	assertBlockedFlags(ctx, t, store, "after the full repair", want)
+}
+
+// horizonChain builds "P blocks on a descendant `levels` parent-child edges
+// below it" and returns the chain ids, nearest child first.
+//
+// The order is the only order the store allows: the blocks edge goes in while
+// the hierarchy does not exist yet, then the chain from the top down, and the
+// LAST edge — the one that finally puts the blocked target inside P's subtree —
+// needs SkipCycleCheck, because that is the edge that closes the loop.
+func horizonChain(ctx context.Context, t *testing.T, store *DoltStore, prefix string, levels int) []string {
+	t.Helper()
+	chain := make([]string, 0, levels)
+	parent := prefix + "-p"
+	createPerm(t, ctx, store, parent)
+	for i := 1; i <= levels; i++ {
+		id := fmt.Sprintf("%s-d%d", prefix, i)
+		createPerm(t, ctx, store, id)
+		chain = append(chain, id)
+	}
+
+	addDependencyWithMeta(t, ctx, store, parent, chain[levels-1], types.DepBlocks, "")
+	for i, id := range chain {
+		up := parent
+		if i > 0 {
+			up = chain[i-1]
+		}
+		if i == levels-1 {
+			addDepSkippingCycleCheck(ctx, t, store, id, up, types.DepParentChild)
+			continue
+		}
+		addDependencyWithMeta(t, ctx, store, id, up, types.DepParentChild, "")
+	}
+	return chain
+}
+
+// TestParentChildCascade_ReasonAtTheWalkHorizon pins the deepest shape the
+// exogeneity test actually decides: P blocks on a descendant exactly
+// subtreeWalkDepth parent-child edges below it. The walk reaches P on its last
+// level, so the reason reads as subtree-derived and nothing under P is
+// darkened.
+//
+// Together with the past-horizon test below, this is the pin on the horizon
+// itself: these two shapes differ by one edge and must land on opposite sides.
+func TestParentChildCascade_ReasonAtTheWalkHorizon(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// 4 = subtreeWalkDepth (internal/storage/issueops/blocked_consistency.go).
+	chain := horizonChain(ctx, t, store, "pch4", 4)
+
+	want := map[string]bool{"pch4-p": true}
+	for _, id := range chain {
+		want[id] = false
+	}
+	assertBlockedFlags(ctx, t, store, "after the write path", want)
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", want)
+
+	// And from an inverted plane, which is the leg the fixpoint has to walk.
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", want)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+}
+
+// TestParentChildCascade_ReasonPastTheWalkHorizon is the PIN ON THE
+// LIMITATION, not on the fix (gastownhall/beads#6506, fix round 2 / D2).
+//
+// The ancestor walk in parentsExplainedBySubtreeSQL is four levels deep
+// (subtreeWalkDepth), spelled as four pairs of indexed LEFT JOINs because
+// WITH RECURSIVE measured 7.5x per evaluation and blew the driver read timeout
+// on the full repair. So a blocking reason whose target is FIVE parent-child
+// edges below its blocker is out of the walk's reach and reads as EXOGENOUS.
+//
+// This test states exactly what that costs, so the limitation is a pinned
+// behavior rather than a comment: the whole chain under P stays dark, which is
+// the pre-#6506 behavior for this one shape. It therefore PASSES UNCHANGED ON
+// origin/main — deliberately, and it is the assertion that makes "no new dark
+// rows, no new visible rows past the horizon" checkable rather than argued. If
+// someone raises the horizon, this test fails and names the row that changed.
+//
+// The direction matters and is the safe one: past the horizon the cascade
+// propagates MORE than the contract asks, never less, so no work is hidden
+// that the old code showed. What survives is the old permanent lock for a
+// hierarchy deeper than epic -> sub-epic -> leg -> task between a blocker and
+// the row it waits on.
+func TestParentChildCascade_ReasonPastTheWalkHorizon(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// 5 = subtreeWalkDepth + 1: one level past what the walk can see.
+	chain := horizonChain(ctx, t, store, "pch5", 5)
+
+	// Every row in the chain stays blocked, P included: origin/main's answer.
+	want := map[string]bool{"pch5-p": true}
+	for _, id := range chain {
+		want[id] = true
+	}
+	assertBlockedFlags(ctx, t, store, "after the write path", want)
+	assertConvergedAndStable(ctx, t, store)
+	assertBlockedFlags(ctx, t, store, "after the full repair", want)
+
+	// No NEW visible row either: nothing in the shape is ready work, which is
+	// what it means for the past-horizon answer to be unchanged.
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{Status: types.StatusOpen})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	for _, issue := range ready {
+		if _, ours := want[issue.ID]; ours {
+			t.Errorf("%s is ready work: past the walk horizon the cascade is unchanged from origin/main, where the whole chain is dark", issue.ID)
+		}
+	}
+
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", want)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+}
+
+// TestParentChildCascade_IncrementalMatchesFullRepairAcrossEdits is the
+// lockstep proof for the incremental seeding this fix changed
+// (AffectedByDepChange{,ForWisp}InTx now walk UP from a parent-child edge's
+// target to every reason-carrying ancestor and reseed each ancestor's whole
+// sibling set, see appendSiblingsUnderAncestorsInTx).
+//
+// The property: after EVERY mutation, the flags the incremental write path
+// left behind are exactly the flags a full repair computes from scratch —
+// detection counts 0 and the repair changes 0 rows (assertConvergedAndStable).
+// An under-seeded incremental path shows up here as a nonzero repair on a
+// graph the write path just finished maintaining.
+//
+// The mutations are the ones that reclassify a blocking reason WITHOUT
+// touching the row that carries it, which is where seeding is hard to get
+// right: moving the reason's target INTO the blocker's subtree, closing and
+// reopening it, moving it back OUT, and removing the reason.
+//
+// Note what is NOT here: adding a blocks edge straight onto an existing own
+// descendant. The store refuses that outright (CheckBlockingHierarchyInTx, the
+// refusal whose reason text this branch corrects), so the shape can only
+// arrive the way it arrives in the wild — one edge at a time, or through
+// import/merge — and the re-parent below is the one-edge-at-a-time arrival.
+func TestParentChildCascade_IncrementalMatchesFullRepairAcrossEdits(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{"ls-p", "ls-c", "ls-c2", "ls-g", "ls-out"} {
+		createPerm(t, ctx, store, id)
+	}
+
+	step := func(name string, want map[string]bool) {
+		t.Helper()
+		assertBlockedFlags(ctx, t, store, name+" (write path)", want)
+		// The lockstep itself: detection sees nothing to fix and the full
+		// repair changes nothing.
+		assertConvergedAndStable(ctx, t, store)
+		assertBlockedFlags(ctx, t, store, name+" (after full repair)", want)
+	}
+
+	// The starting graph: P blocks on G while G is OUTSIDE P's subtree, so the
+	// reason is exogenous and P's two children inherit it. G hangs under a
+	// root of its own.
+	addDependencyWithMeta(t, ctx, store, "ls-p", "ls-g", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "ls-c", "ls-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "ls-c2", "ls-p", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "ls-g", "ls-out", types.DepParentChild, "")
+
+	exogenous := map[string]bool{
+		"ls-p": true, "ls-c": true, "ls-c2": true, "ls-g": false, "ls-out": false,
+	}
+	subtreeDerived := map[string]bool{
+		"ls-p": true, "ls-c": false, "ls-c2": false, "ls-g": false, "ls-out": false,
+	}
+	clear := map[string]bool{
+		"ls-p": false, "ls-c": false, "ls-c2": false, "ls-g": false, "ls-out": false,
+	}
+	step("exogenous blocker outside the subtree", exogenous)
+
+	// 1. Re-parent G INTO P's subtree, under C. The same blocks edge is now a
+	// close gate over P's own grandchild, so P keeps its flag and its whole
+	// subtree must come bright — including C and C2, which this edge does not
+	// name. SkipCycleCheck is the only way in: P blocks G, so pc G -> C closes
+	// a loop.
+	if err := store.RemoveDependency(ctx, "ls-g", "ls-out", "tester"); err != nil {
+		t.Fatalf("remove parent-child ls-g -> ls-out: %v", err)
+	}
+	addDepSkippingCycleCheck(ctx, t, store, "ls-g", "ls-c", types.DepParentChild)
+	step("reason re-parented into the subtree", subtreeDerived)
+
+	// 2. Close the descendant: a closed target is no reason at all, so P comes
+	// bright with the edge still in place. Then reopen it.
+	if err := store.CloseIssue(ctx, "ls-g", "lockstep", "tester", ""); err != nil {
+		t.Fatalf("close ls-g: %v", err)
+	}
+	step("descendant closed", clear)
+	if err := store.ReopenIssue(ctx, "ls-g", "lockstep", "tester"); err != nil {
+		t.Fatalf("reopen ls-g: %v", err)
+	}
+	step("descendant reopened", subtreeDerived)
+
+	// 3. Re-parent G back OUT. The reason turns exogenous again and P's
+	// cascade comes back on for C and C2.
+	if err := store.RemoveDependency(ctx, "ls-g", "ls-c", "tester"); err != nil {
+		t.Fatalf("remove parent-child ls-g -> ls-c: %v", err)
+	}
+	addDependencyWithMeta(t, ctx, store, "ls-g", "ls-out", types.DepParentChild, "")
+	step("reason re-parented out of the subtree", exogenous)
+
+	// 4. Remove the reason itself: nothing anywhere carries one.
+	if err := store.RemoveDependency(ctx, "ls-p", "ls-g", "tester"); err != nil {
+		t.Fatalf("remove blocks ls-p -> ls-g: %v", err)
+	}
+	step("blocks edge removed", clear)
 }
