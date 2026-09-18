@@ -86,27 +86,86 @@ func TestFormatIssueMetadataGatedKeepsDeferredLine(t *testing.T) {
 }
 
 func TestFormatPrettyIssueGatedGlyph(t *testing.T) {
+	gates := []string{"bd-gate"}
 	open := &types.Issue{ID: "bd-1", Title: "Open", Status: types.StatusOpen, Priority: 2}
-	if got := formatPrettyIssueGated(open, false); !strings.HasPrefix(got, ui.StatusIconOpen) {
+	if got := formatPrettyIssueGated(open, nil); !strings.HasPrefix(got, ui.StatusIconOpen) {
 		t.Errorf("ungated row = %q, want the open glyph", got)
 	}
-	if got := formatPrettyIssueGated(open, true); !strings.HasPrefix(got, ui.StatusIconGated) {
+	if got := formatPrettyIssueGated(open, gates); !strings.HasPrefix(got, ui.StatusIconGated) {
 		t.Errorf("gated row = %q, want the gated glyph %q", got, ui.StatusIconGated)
 	}
 
 	// The gated glyph outranks the deferred snowflake: one column, and the
 	// gate is the fact the row cannot otherwise show.
 	deferred := &types.Issue{ID: "bd-2", Title: "Later", Status: types.StatusDeferred, Priority: 2}
-	if got := formatPrettyIssueGated(deferred, true); !strings.HasPrefix(got, ui.StatusIconGated) {
+	if got := formatPrettyIssueGated(deferred, gates); !strings.HasPrefix(got, ui.StatusIconGated) {
 		t.Errorf("deferred+gated row = %q, want the gated glyph", got)
 	}
-	if got := formatPrettyIssueGated(deferred, false); !strings.HasPrefix(got, ui.StatusIconDeferred) {
+	if got := formatPrettyIssueGated(deferred, nil); !strings.HasPrefix(got, ui.StatusIconDeferred) {
 		t.Errorf("deferred row = %q, want the deferred glyph", got)
 	}
 
-	// A closed issue is never decorated: a gate on a closed row is history.
+	// A closed issue is never decorated: `bd ready` withholds it on its own
+	// account, so a gate marker would claim a causation that is not there.
 	closed := &types.Issue{ID: "bd-3", Title: "Done", Status: types.StatusClosed, Priority: 2}
-	if got := formatPrettyIssueGated(closed, true); strings.Contains(got, ui.StatusIconGated) {
+	if got := formatPrettyIssueGated(closed, gates); strings.Contains(got, ui.StatusIconGated) {
 		t.Errorf("closed row carries the gated glyph: %q", got)
+	}
+
+	// Nor is a PINNED one — and the pin survives, because the glyph never gets
+	// the chance to evict it (types.SubjectCanBeGated says no first).
+	pinned := &types.Issue{ID: "bd-4", Title: "Pinned", Status: types.StatusPinned, Priority: 2}
+	got := formatPrettyIssueGated(pinned, gates)
+	if strings.Contains(got, ui.StatusIconGated) {
+		t.Errorf("pinned row carries the gated glyph: %q", got)
+	}
+	if !strings.HasPrefix(got, ui.StatusIconPinned) {
+		t.Errorf("pinned+gated row = %q, want it to keep the pin %q", got, ui.StatusIconPinned)
+	}
+}
+
+// TestFormatIssueCompactGated pins the compact row: the same glyph rule, plus
+// the "gated by" clause that names the gate the glyph only hints at.
+func TestFormatIssueCompactGated(t *testing.T) {
+	issue := &types.Issue{ID: "bd-1", Title: "Open", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+
+	var buf strings.Builder
+	formatIssueCompact(&buf, issue, nil, []string{"bd-gate"}, nil, "", []string{"bd-gate"})
+	got := buf.String()
+	if !strings.Contains(got, ui.StatusIconGated) {
+		t.Errorf("gated compact row missing %q: %q", ui.StatusIconGated, got)
+	}
+	if !strings.Contains(got, "gated by: bd-gate") {
+		t.Errorf("gated compact row does not name the gate: %q", got)
+	}
+
+	buf.Reset()
+	pinned := &types.Issue{ID: "bd-2", Title: "Pinned", Status: types.StatusPinned, Priority: 2, IssueType: types.TypeTask}
+	formatIssueCompact(&buf, pinned, nil, nil, nil, "", []string{"bd-gate"})
+	if got := buf.String(); strings.Contains(got, ui.StatusIconGated) {
+		t.Errorf("pinned compact row carries the gated glyph: %q", got)
+	}
+}
+
+// TestFormatAgentIssueGated is SHOULD-3: agent mode has no glyph column, and
+// ui.IsAgentMode() is true in every CLAUDE_CODE seat — the population that
+// cannot otherwise tell a gated row from a startable one.
+func TestFormatAgentIssueGated(t *testing.T) {
+	issue := &types.Issue{ID: "bd-1", Title: "Gated work", Status: types.StatusOpen, Priority: 2}
+
+	var buf strings.Builder
+	formatAgentIssue(&buf, issue, nil, nil, "", nil)
+	if got := buf.String(); got != "bd-1: Gated work\n" {
+		t.Errorf("ungated agent line = %q, want the untouched one-liner", got)
+	}
+
+	buf.Reset()
+	formatAgentIssue(&buf, issue, []string{"bd-gate"}, nil, "", []string{"bd-gate"})
+	got := buf.String()
+	if !strings.Contains(got, "gated by: bd-gate") {
+		t.Errorf("agent line does not name the gate: %q", got)
+	}
+	if !strings.Contains(got, "blocked by: bd-gate") {
+		t.Errorf("agent line lost its blocked-by clause: %q", got)
 	}
 }

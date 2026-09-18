@@ -162,7 +162,7 @@ const treeCycleMarker = "(cycle: shown above; parent-child cycle in stored edges
 // Children use the requested list order. With --deps, dependency order takes
 // precedence and the requested order breaks ties. When dr is set, each node's
 // dependency edges are annotated just beneath it.
-func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, compare func(a, b *types.Issue) int, gated map[string]bool) {
+func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, compare func(a, b *types.Issue) int, gated map[string][]string) {
 	printPrettyTreePath(childrenMap, parentID, prefix, dr, compare, gated, map[string]bool{parentID: true})
 }
 
@@ -176,7 +176,7 @@ func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, pre
 // renders under both; only a true ancestor counts as a cycle. Like the
 // "(shown above)" arm of bd dep tree, the marked line carries no --deps
 // annotations: they were printed with the node's first appearance.
-func printPrettyTreePath(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, compare func(a, b *types.Issue) int, gated map[string]bool, onPath map[string]bool) {
+func printPrettyTreePath(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender, compare func(a, b *types.Issue) int, gated map[string][]string, onPath map[string]bool) {
 	children := childrenMap[parentID]
 
 	if dr != nil {
@@ -284,9 +284,10 @@ func readyFooterScope(statusSelector string) string {
 // readyFiltered means --ready was in force; statusSelector is the --status value
 // so the summary names the pin that actually applied — see listFooterLine.
 // sortBy and reverse preserve the requested list order within the hierarchy.
-// gated names the ids an open gate blocks (gatedIssueIDs); nil means the
-// caller computed no gate decoration, and every row renders as it always did.
-func displayPrettyListWithDepsMode(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, depsMode string, truncated, readyFiltered bool, statusSelector, sortBy string, reverse bool, gated map[string]bool) {
+// gated maps each listed id to the OPEN gates holding it (gatesByIssueID);
+// nil means the caller computed no gate decoration, and every row renders as
+// it always did.
+func displayPrettyListWithDepsMode(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, depsMode string, truncated, readyFiltered bool, statusSelector, sortBy string, reverse bool, gated map[string][]string) {
 	if showHeader {
 		// Clear screen and show header
 		fmt.Print("\033[2J\033[H")

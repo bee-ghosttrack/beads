@@ -7,13 +7,29 @@ import "strings"
 //
 // GATED IS DERIVED, NEVER STORED. `bd gate create --blocks X` writes a gate
 // issue plus an ordinary blocking dependency X -> gate; nothing on X changes.
-// `bd ready` then drops X through the denormalized is_blocked column, whose
-// recompute (internal/storage/issueops/blocked_state.go,
-// shouldBeBlockedIDsUnionScopedSQL) marks an issue blocked when it has a
-// blocking-edge dependency — blocks / conditional-blocks / waits-for — on a
-// target that is neither closed nor pinned. IsActiveGate is that same rule
-// restricted to gate-typed targets, so a surface that renders GATED cannot
-// disagree with the readiness query about whether the gate is still holding.
+// `bd ready` then drops X through the denormalized is_blocked column, and the
+// rule here is the subset of that column's recompute
+// (internal/storage/issueops/blocked_consistency.go) a gate can account for:
+//
+//   - the EDGE clause, from the recompute's first two union legs: the edge is
+//     'blocks' or 'conditional-blocks' and the target is neither closed nor
+//     pinned (IsGateEdge + the status test in GateIsHolding);
+//   - the SUBJECT clause, from unmarkAllBlockedSQL, which forces is_blocked=0
+//     for a closed or pinned subject whatever its edges say (SubjectCanBeGated).
+//
+// Both halves live here, in one predicate every surface asks, so a glyph, a
+// header and a gated_by field cannot disagree with each other or with `bd
+// ready` about the same bead.
+//
+// WAITS-FOR IS DELIBERATELY OUT. The recompute's waits-for leg does not apply
+// the closed/pinned status test at all: it goes through waitsForGateBlockedSQL
+// (internal/storage/issueops/blocked_state.go), which blocks only when the
+// target has an OPEN parent-child child, or metadata.also_blocks names an open
+// spawner. A plain `bd dep add X G -t waits-for` onto an open childless gate
+// therefore leaves X in `bd ready`, and decorating it would be exactly the
+// drift this file exists to prevent. Mirroring that leg in Go would be a
+// second implementation of a rule the database already owns; a decoration that
+// covers the fanout case is its own bead, not this one.
 
 // GateRef is a gate projected for a caller: the id to resolve, what kind of
 // wait it is, and why. It is what `gated_by` carries on the detail view.
@@ -28,35 +44,62 @@ type GateRef struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// IsActiveGate reports whether target, reached over a dependency of type
-// depType, is a gate that is currently holding its dependent back.
+// IsGateEdge reports whether a dependency of this type is one whose target's
+// status alone decides blockedness — the two legs of the is_blocked recompute
+// that carry "target not closed and not pinned". It is NOT
+// DependencyType.IsBlockingEdge, which also admits waits-for; see the file
+// comment.
+func IsGateEdge(depType DependencyType) bool {
+	return depType == DepBlocks || depType == DepConditionalBlocks
+}
+
+// SubjectCanBeGated reports whether an issue's OWN status admits the gate
+// decoration. A closed or pinned issue never does: unmarkAllBlockedSQL clears
+// is_blocked for those two statuses unconditionally, so `bd ready` withholds
+// them for reasons that have nothing to do with a gate, and a "GATED" marker
+// on such a row would claim a causation that is not there.
 //
-// THE one predicate: every gated decoration — `bd show`'s header and meta
-// lines, `bd list`'s glyph, the detail view's gated_by — asks this and nothing
-// else. The three clauses mirror the is_blocked recompute leg by leg: a
-// blocking edge (IsBlockingEdge, which is 'blocks' OR 'conditional-blocks' OR
-// 'waits-for'), a target that is not closed and not pinned, and — the only
-// restriction this adds — a target that is a gate rather than ordinary work.
-func IsActiveGate(depType DependencyType, target *Issue) bool {
+// The listing route asks this without hydrated dependencies, which is why the
+// clause is exported rather than buried inside GatesHolding.
+func SubjectCanBeGated(subject *Issue) bool {
+	if subject == nil {
+		return false
+	}
+	return subject.Status != StatusClosed && subject.Status != StatusPinned
+}
+
+// GateIsHolding reports whether target, reached over a dependency of type
+// depType, is a gate that is currently holding its dependent back. It is the
+// EDGE half of the rule; the caller still owes the subject half, which is what
+// GatesHolding exists to keep it from forgetting.
+func GateIsHolding(depType DependencyType, target *Issue) bool {
 	if target == nil || target.IssueType != TypeGate {
 		return false
 	}
-	if !depType.IsBlockingEdge() {
+	if !IsGateEdge(depType) {
 		return false
 	}
 	return target.Status != StatusClosed && target.Status != StatusPinned
 }
 
-// ActiveGates selects, from an issue's hydrated dependencies, the gates that
-// are actively blocking it, in the order the dependencies arrived.
-func ActiveGates(deps []*IssueWithDependencyMetadata) []*Issue {
+// GatesHolding selects, from subject's hydrated dependencies, the gates that
+// are actively holding subject back, in the order the dependencies arrived.
+//
+// THE one predicate: every gated decoration — `bd show`'s header and meta
+// lines, `bd list`'s glyph, the agent line, the detail view's gated_by — comes
+// from this function or from the pair it is built out of, so the result is
+// nonempty exactly when `bd ready` withholds subject on a gate's account.
+func GatesHolding(subject *Issue, deps []*IssueWithDependencyMetadata) []*Issue {
+	if !SubjectCanBeGated(subject) {
+		return nil
+	}
 	var gates []*Issue
 	for _, dep := range deps {
 		if dep == nil {
 			continue
 		}
 		issue := dep.Issue
-		if IsActiveGate(dep.DependencyType, &issue) {
+		if GateIsHolding(dep.DependencyType, &issue) {
 			gate := issue
 			gates = append(gates, &gate)
 		}
@@ -101,28 +144,40 @@ func GateRefs(gates []*Issue) []GateRef {
 	return refs
 }
 
-// gateReasonMarker separates an ad-hoc gate's boilerplate description from the
-// reason its creator gave. The reason has no column of its own, so the
-// description is where it lives; GateDescription writes it and GateReason
-// reads it back, and they sit together so the pair cannot drift.
-const gateReasonMarker = "\n\nReason: "
+// ReasonMarker separates a generated description from the free-text reason its
+// author gave. The reason has no column of its own, so the description is
+// where it lives.
+//
+// It is SHARED, not gate-private: `bd gate create` writes it through
+// GateDescription, and `bd state`'s state-change EVENT descriptions write the
+// same marker (cmd/bd/state.go). One exported constant so the spelling cannot
+// drift between them — and so the sharing is visible rather than a coincidence
+// two files have to keep on purpose.
+const ReasonMarker = "\n\nReason: "
 
 // GateDescription builds an ad-hoc gate's description. `bd gate create` is its
 // only writer.
 func GateDescription(targetID, reason string) string {
 	desc := "Ad-hoc gate blocking " + targetID
 	if reason != "" {
-		desc += gateReasonMarker + reason
+		desc += ReasonMarker + reason
 	}
 	return desc
 }
 
-// GateReason recovers the reason GateDescription recorded, or "" when the gate
-// carries none (including every gate not created by `bd gate create`).
+// GateReason recovers the reason GateDescription recorded, or "" when the
+// description carries no marker.
+//
+// It is a TEXT read-back, not proof of provenance: ReasonMarker is shared (see
+// its doc), so any description containing it yields a reason here — a gate
+// written by hand with that spelling included. What the pair does guarantee is
+// the round trip: what GateDescription wrote, this returns. `bd gate create`
+// (cmd/bd/gate.go) is the only GateDescription caller today, so every gate
+// whose reason this reports is one it recorded.
 func GateReason(description string) string {
-	idx := strings.Index(description, gateReasonMarker)
+	idx := strings.Index(description, ReasonMarker)
 	if idx < 0 {
 		return ""
 	}
-	return strings.TrimSpace(description[idx+len(gateReasonMarker):])
+	return strings.TrimSpace(description[idx+len(ReasonMarker):])
 }

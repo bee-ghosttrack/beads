@@ -256,7 +256,8 @@ func runListProxiedHierarchicalParent(ctx context.Context, uw uow.UnitOfWork, in
 	}
 
 	// Hierarchical --parent walks use an unlimited per-level query; never page-truncated.
-	displayPrettyListWithDepsMode(treeIssues, false, depsByIssueID, in.depsMode, false, in.ReadyFlag, in.Status, in.SortBy, in.Reverse, nil)
+	displayPrettyListWithDepsMode(treeIssues, false, depsByIssueID, in.depsMode, false, in.ReadyFlag, in.Status, in.SortBy, in.Reverse,
+		proxiedGatedIssueIDs(ctx, uw, treeIssues, depsByIssueID))
 	printSkipLabelsFooter(in.SkipLabels)
 	return nil
 }
