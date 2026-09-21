@@ -21,14 +21,17 @@
 //   - The intent is written by the caller at the command's first mutating
 //     SQL statement (bd arms it through internal/storage/sqltap), so a
 //     preview or a command that fails before writing logs nothing, and a
-//     read command whose store open migrates the schema is logged as the
-//     write it is. Writes bd makes without a client SQL connection (the
+//     read command that writes incidentally — its store open migrates the
+//     schema, or it records that it showed a tip — is logged as the write it
+//     is. Writes bd makes without a client SQL connection (the
 //     dbproxy server's own, and anything done by another process) are not
 //     logged.
 //   - Records carry no issue IDs: the arguments a command was given are not
 //     a list of what it touched.
 //   - A panic, or a kill -9, leaves an intent with no outcome. That is the
 //     signal the log exists to give, but it is not proof the write was lost.
+//     So does a second interrupt that force-exits bd while the intent is
+//     being written: the write it announced never left.
 //   - The digest is not a secret. For a low-entropy payload (a status or
 //     priority value) it can be reversed by guessing, and payload_bytes
 //     reveals the payload's length.

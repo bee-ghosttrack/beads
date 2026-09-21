@@ -25,27 +25,7 @@ func TestOplogEmbedded(t *testing.T) {
 	logDir := t.TempDir()
 	env := []string{"BD_OPLOG_DIR=" + logDir}
 
-	seen := 0
-	// step runs one command and checks how many ops it logged and, when it
-	// logged one, the verb and that the outcome carries the command's rc.
-	step := func(wantOps int, wantVerb string, args ...string) (string, int) {
-		t.Helper()
-		out, rc := bdRunRaw(t, bd, dir, env, args...)
-		recs := readOplog(t, logDir)
-		got := recs[seen:]
-		seen = len(recs)
-		if len(got) != 2*wantOps {
-			t.Fatalf("%v (rc %d): want %d op(s), got records %+v\n%s", args, rc, wantOps, got, out)
-		}
-		if wantOps == 1 {
-			in, res := got[0], got[1]
-			if in.Phase != oplog.PhaseIntent || in.Verb != wantVerb || len(in.IDs) != 0 ||
-				res.OpID != in.OpID || res.RC == nil || *res.RC != rc {
-				t.Fatalf("%v (rc %d): intent %+v outcome %+v", args, rc, in, res)
-			}
-		}
-		return out, rc
-	}
+	step := oplogStepper(t, bd, dir, env, logDir)
 
 	const title = "fix-payroll-export-for-alice"
 	out, rc := step(1, "create", "create", "--silent", title)
@@ -55,8 +35,10 @@ func TestOplogEmbedded(t *testing.T) {
 	id := strings.TrimSpace(out)
 
 	export := filepath.Join(t.TempDir(), "issues.jsonl")
+	// --quiet: a shown tip is recorded with a real (dolt-ignored) write, at
+	// random, and that write is rightly logged under the read verb.
 	for _, args := range [][]string{{"show", id}, {"status"}, {"list"}, {"ready"}, {"export", "-o", export}} {
-		if out, rc := step(0, "", args...); rc != 0 {
+		if out, rc := step(0, "", append([]string{"--quiet"}, args...)...); rc != 0 {
 			t.Fatalf("%v rc %d: %s", args, rc, out)
 		}
 	}
@@ -100,5 +82,30 @@ func TestOplogEmbedded(t *testing.T) {
 		if strings.Contains(raw, leak) {
 			t.Fatalf("%q reached the log:\n%s", leak, raw)
 		}
+	}
+}
+
+// oplogStepper returns a step function that runs one bd command and checks
+// how many ops it logged and, when it logged one, the verb and that the
+// outcome carries the command's rc.
+func oplogStepper(t *testing.T, bd, dir string, env []string, logDir string) func(int, string, ...string) (string, int) {
+	seen := 0
+	return func(wantOps int, wantVerb string, args ...string) (string, int) {
+		t.Helper()
+		out, rc := bdRunRaw(t, bd, dir, env, args...)
+		recs := readOplog(t, logDir)
+		got := recs[seen:]
+		seen = len(recs)
+		if len(got) != 2*wantOps {
+			t.Fatalf("%v (rc %d): want %d op(s), got records %+v\n%s", args, rc, wantOps, got, out)
+		}
+		if wantOps == 1 {
+			in, res := got[0], got[1]
+			if in.Phase != oplog.PhaseIntent || in.Verb != wantVerb || len(in.IDs) != 0 ||
+				res.OpID != in.OpID || res.RC == nil || *res.RC != rc {
+				t.Fatalf("%v (rc %d): intent %+v outcome %+v", args, rc, in, res)
+			}
+		}
+		return out, rc
 	}
 }

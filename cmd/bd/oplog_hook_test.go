@@ -158,6 +158,9 @@ func TestCommandOplog_NoWriteNoLog(t *testing.T) {
 func TestCommandOplog_ServeExcluded(t *testing.T) {
 	dir := setupOplogTest(t)
 	db := tappedDB(t)
+	// A previous command in this process left the tap armed: serve must
+	// disarm it, not merely decline to arm.
+	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
 	stashCommandOplog(&cobra.Command{Use: "serve"}, nil)
 	oplogExec(t, db, "INSERT INTO t VALUES (1)")
 	endCommandOplog(0)
@@ -213,5 +216,25 @@ func TestCommandOplog_ConcurrentEnd(t *testing.T) {
 	wg.Wait()
 	if recs := readOplog(t, dir); len(recs) != 2 {
 		t.Fatalf("want intent + one outcome, got %+v", recs)
+	}
+}
+
+// beginCommandOplog runs from the tap at most once per arming, but it must
+// also refuse a second begin on its own: a re-armed tap in the same command
+// would otherwise orphan the first intent.
+func TestCommandOplog_BeginIsOncePerCommand(t *testing.T) {
+	dir := setupOplogTest(t)
+	db := tappedDB(t)
+	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
+	oplogExec(t, db, "INSERT INTO t VALUES (1)")
+	first := commandOp.Load()
+	sqltap.Arm(beginCommandOplog)
+	oplogExec(t, db, "INSERT INTO t VALUES (2)")
+	if commandOp.Load() != first {
+		t.Fatal("a second begin replaced the command's op")
+	}
+	endCommandOplog(0)
+	if recs := readOplog(t, dir); len(recs) != 2 {
+		t.Fatalf("want one intent and one outcome, got %+v", recs)
 	}
 }

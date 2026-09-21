@@ -10,12 +10,10 @@
 // once, synchronously, before the first mutating statement leaves the
 // process.
 //
-// Classification is by the statement's leading keyword. Writes are INSERT,
-// UPDATE, DELETE, REPLACE, the DDL verbs except CREATE DATABASE IF NOT EXISTS
-// (which every store open sends), and CALL of any Dolt procedure except
-// DOLT_CHECKOUT (a session branch switch) and DOLT_FETCH (remote-tracking refs
-// only). A prepared statement is classified when it is prepared. Reads, session
-// statements (SET, USE) and transaction control never fire the hook.
+// Classification (IsWriteArgs) is an allowlist of reads: a statement batch is
+// a write unless every statement in it is a known read, session or
+// transaction-control form. A prepared statement is classified each time it
+// executes, with its bound arguments.
 //
 // With no hook armed the wrapper costs one atomic load per statement.
 package sqltap
@@ -25,7 +23,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -62,8 +59,8 @@ func Disarm() { Arm(nil) }
 // observe runs the hook if query is a write and the hook has not fired yet.
 // Holding mu while the hook runs makes a concurrent writer wait until the
 // hook has finished, so no write leaves ahead of it.
-func observe(query string) {
-	if !armed.Load() || !IsWrite(query) {
+func observe(query string, args []driver.NamedValue) {
+	if !armed.Load() || !IsWriteArgs(query, args) {
 		return
 	}
 	mu.Lock()
@@ -76,83 +73,6 @@ func observe(query string) {
 	// take the slow path and wait on mu.
 	defer armed.Store(false)
 	hook()
-}
-
-var writeVerbs = map[string]bool{
-	"INSERT": true, "UPDATE": true, "DELETE": true, "REPLACE": true,
-	"CREATE": true, "ALTER": true, "DROP": true, "TRUNCATE": true, "RENAME": true,
-}
-
-// readOnlyProcs are Dolt procedures that move no stored data.
-var readOnlyProcs = map[string]bool{"DOLT_CHECKOUT": true, "DOLT_FETCH": true}
-
-// IsWrite reports whether query's leading statement mutates stored state.
-func IsWrite(query string) bool {
-	rest := skipSpaceAndComments(query)
-	verb, rest := leadingWord(rest)
-	verb = strings.ToUpper(verb)
-	if verb == "CREATE" && isEnsureDatabase(rest) {
-		return false
-	}
-	if writeVerbs[verb] {
-		return true
-	}
-	if verb != "CALL" {
-		return false
-	}
-	proc, _ := leadingWord(skipSpaceAndComments(rest))
-	return !readOnlyProcs[strings.ToUpper(proc)]
-}
-
-// isEnsureDatabase reports whether rest (what follows CREATE) is
-// "DATABASE|SCHEMA IF NOT EXISTS": every store open sends it, and it creates
-// nothing once the database exists.
-func isEnsureDatabase(rest string) bool {
-	var words []string
-	for len(words) < 4 {
-		w, r := leadingWord(skipSpaceAndComments(rest))
-		if w == "" {
-			return false
-		}
-		words, rest = append(words, strings.ToUpper(w)), r
-	}
-	return (words[0] == "DATABASE" || words[0] == "SCHEMA") &&
-		words[1] == "IF" && words[2] == "NOT" && words[3] == "EXISTS"
-}
-
-func skipSpaceAndComments(s string) string {
-	for {
-		s = strings.TrimLeft(s, " \t\r\n(")
-		switch {
-		case strings.HasPrefix(s, "/*"):
-			end := strings.Index(s[2:], "*/")
-			if end < 0 {
-				return ""
-			}
-			s = s[2+end+2:]
-		case strings.HasPrefix(s, "--"), strings.HasPrefix(s, "#"):
-			end := strings.IndexByte(s, '\n')
-			if end < 0 {
-				return ""
-			}
-			s = s[end+1:]
-		default:
-			return s
-		}
-	}
-}
-
-func leadingWord(s string) (word, rest string) {
-	i := 0
-	for i < len(s) {
-		c := s[i]
-		if c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
-			i++
-			continue
-		}
-		break
-	}
-	return s[:i], s[i:]
 }
 
 // WrapConnector returns a connector whose connections report writes.
@@ -235,16 +155,17 @@ var (
 )
 
 func (c *tapConn) Prepare(query string) (driver.Stmt, error) {
-	observe(query)
-	return c.inner.Prepare(query)
+	st, err := c.inner.Prepare(query)
+	return c.wrapStmt(query, st, err)
 }
 
 func (c *tapConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	observe(query)
 	if pc, ok := c.inner.(driver.ConnPrepareContext); ok {
-		return pc.PrepareContext(ctx, query)
+		st, err := pc.PrepareContext(ctx, query)
+		return c.wrapStmt(query, st, err)
 	}
-	return c.inner.Prepare(query)
+	st, err := c.inner.Prepare(query)
+	return c.wrapStmt(query, st, err)
 }
 
 func (c *tapConn) Close() error { return c.inner.Close() }
@@ -267,7 +188,7 @@ func (c *tapConn) ExecContext(ctx context.Context, query string, args []driver.N
 	if !ok {
 		return nil, driver.ErrSkip // database/sql prepares instead, and PrepareContext observes
 	}
-	observe(query)
+	observe(query, args)
 	return ec.ExecContext(ctx, query, args)
 }
 
@@ -276,7 +197,7 @@ func (c *tapConn) QueryContext(ctx context.Context, query string, args []driver.
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	observe(query)
+	observe(query, args)
 	return qc.QueryContext(ctx, query, args)
 }
 
@@ -306,4 +227,102 @@ func (c *tapConn) CheckNamedValue(nv *driver.NamedValue) error {
 		return n.CheckNamedValue(nv)
 	}
 	return driver.ErrSkip // database/sql falls back to its default conversion
+}
+
+func (c *tapConn) wrapStmt(query string, st driver.Stmt, err error) (driver.Stmt, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &tapStmt{inner: st, conn: c.inner, query: query}, nil
+}
+
+// tapStmt observes a prepared statement each time it runs: a placeholder's
+// value (DOLT_CHECKOUT(?)) is only known then, and preparing sends nothing
+// that mutates.
+type tapStmt struct {
+	inner driver.Stmt
+	conn  driver.Conn // the inner connection, for its NamedValueChecker
+	query string
+}
+
+var (
+	_ driver.StmtExecContext   = (*tapStmt)(nil)
+	_ driver.StmtQueryContext  = (*tapStmt)(nil)
+	_ driver.NamedValueChecker = (*tapStmt)(nil)
+)
+
+func (s *tapStmt) Close() error  { return s.inner.Close() }
+func (s *tapStmt) NumInput() int { return s.inner.NumInput() }
+
+func namedValues(args []driver.Value) []driver.NamedValue {
+	nv := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		nv[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return nv
+}
+
+//nolint:staticcheck // driver.Stmt requires Exec; ExecContext is preferred when present.
+func (s *tapStmt) Exec(args []driver.Value) (driver.Result, error) {
+	observe(s.query, namedValues(args))
+	return s.inner.Exec(args)
+}
+
+//nolint:staticcheck // driver.Stmt requires Query; QueryContext is preferred when present.
+func (s *tapStmt) Query(args []driver.Value) (driver.Rows, error) {
+	observe(s.query, namedValues(args))
+	return s.inner.Query(args)
+}
+
+func (s *tapStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	observe(s.query, args)
+	if ec, ok := s.inner.(driver.StmtExecContext); ok {
+		return ec.ExecContext(ctx, args)
+	}
+	vals, err := plainValues(args)
+	if err != nil {
+		return nil, err
+	}
+	return s.inner.Exec(vals) //nolint:staticcheck // fallback for statements without ExecContext
+}
+
+func (s *tapStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	observe(s.query, args)
+	if qc, ok := s.inner.(driver.StmtQueryContext); ok {
+		return qc.QueryContext(ctx, args)
+	}
+	vals, err := plainValues(args)
+	if err != nil {
+		return nil, err
+	}
+	return s.inner.Query(vals) //nolint:staticcheck // fallback for statements without QueryContext
+}
+
+// plainValues mirrors database/sql's own fallback for a statement without the
+// context methods: named parameters cannot be passed through.
+func plainValues(named []driver.NamedValue) ([]driver.Value, error) {
+	vals := make([]driver.Value, len(named))
+	for i, nv := range named {
+		if nv.Name != "" {
+			return nil, errors.New("sqltap: driver does not support the use of Named Parameters")
+		}
+		vals[i] = nv.Value
+	}
+	return vals, nil
+}
+
+// CheckNamedValue follows database/sql's own order — the statement's checker,
+// then the connection's — so arguments convert exactly as they would
+// unwrapped. A statement-level ColumnConverter is not consulted: neither
+// wrapped driver has one without a checker (go-sql-driver's statement has
+// both; the embedded driver's has neither), and forwarding it would change
+// the fallback for drivers whose NumInput is -1.
+func (s *tapStmt) CheckNamedValue(nv *driver.NamedValue) error {
+	if n, ok := s.inner.(driver.NamedValueChecker); ok {
+		return n.CheckNamedValue(nv)
+	}
+	if n, ok := s.conn.(driver.NamedValueChecker); ok {
+		return n.CheckNamedValue(nv)
+	}
+	return driver.ErrSkip
 }
