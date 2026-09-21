@@ -112,6 +112,9 @@ func TestIsWrite(t *testing.T) {
 		"SELECT 1 /*M! ; SELECT 2 *//* \n 3; DELETE FROM t; # */",
 		"SELECT 1; SELEC 2; DELETE FROM t", // a piece Dolt cannot parse
 		"HELP 'x'",                         // Dolt cannot parse it either
+		// When the first statement is empty, vitess ends it one byte past the
+		// ;, so Dolt skips the # and runs the DELETE.
+		";#DELETE FROM t",
 		// The vitess parser panics on these; classification must not.
 		"SELECT 1/*!,*/''", "SET sql_mode='ANSI_QUOTES'; SELECT 1/*!,*/''",
 	}
@@ -149,6 +152,25 @@ func TestIsWrite(t *testing.T) {
 }
 
 // A DOLT_CHECKOUT placeholder is judged by its bound value.
+// The piece walk costs pieces x length; a long script spends its parse
+// budget and is judged a write, while one large read stays a read.
+func TestIsWriteParseBudget(t *testing.T) {
+	ids := strings.Repeat("'op-abcdef', ", 40000) // ~520 KB
+	if q := "SELECT id FROM issues WHERE id IN (" + ids + "'op-x')"; IsWrite(q) {
+		t.Errorf("a large single read was judged a write")
+	}
+	start := time.Now()
+	if !IsWrite(strings.Repeat("SELECT 1; ", 40000)) {
+		t.Errorf("a script past the parse budget was judged a read")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("a script past the parse budget took %v", d)
+	}
+	if IsWrite(strings.Repeat("SELECT 1; ", 200)) {
+		t.Errorf("a short script of reads was judged a write")
+	}
+}
+
 func TestIsWriteArgsCheckoutPlaceholder(t *testing.T) {
 	arg := func(v driver.Value) []driver.NamedValue { return []driver.NamedValue{{Ordinal: 1, Value: v}} }
 	cases := []struct {

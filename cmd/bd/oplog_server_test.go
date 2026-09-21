@@ -67,8 +67,10 @@ func TestOplogServerSQLProbes(t *testing.T) {
 	// comment and statement boundaries unlike MySQL, and each DELETE ran with
 	// no op logged. The round-5 review's (rows 15-16): Dolt re-lexes each
 	// statement's remainder from scratch, so a ; inside /*! ends statement 1
-	// and the */ that closed it becomes * and a // comment.
-	sql(1, "INSERT INTO oplog_probe VALUES (10), (11), (12), (13), (14), (15), (16)")
+	// and the */ that closed it becomes * and a // comment. The round-7
+	// review's (row 17): after an empty first statement Dolt skips the byte
+	// following the ;, so the # never starts a comment.
+	sql(1, "INSERT INTO oplog_probe VALUES (10), (11), (12), (13), (14), (15), (16), (17)")
 	for _, q := range []string{
 		"SELECT 1; /*M! DELETE FROM oplog_probe WHERE x = 10 */",
 		"SELECT 1 /*! , 1 # */ ; DELETE FROM oplog_probe WHERE x = 11",
@@ -77,13 +79,14 @@ func TestOplogServerSQLProbes(t *testing.T) {
 		"SELECT 1 /*+ ' */ ; DELETE FROM oplog_probe WHERE x = 14; SELECT 'x'",
 		"/*! SELECT 1; SELECT 2 *//* \n 3; DELETE FROM oplog_probe WHERE x = 15; # */",
 		"SELECT 1 /*! ; SELECT 2 *//* \n 3; DELETE FROM oplog_probe WHERE x = 16; # */",
+		";#DELETE FROM oplog_probe WHERE x = 17",
 	} {
 		sql(1, q)
 	}
 	if out := sql(0, "SELECT GROUP_CONCAT(x) AS xs FROM oplog_probe WHERE x >= 10"); !strings.Contains(out, "<nil>") {
 		t.Fatalf("a vitess-lexed DELETE did not run: %s", out)
 	}
-	t.Logf("vitess probes deleted rows 10-16; checkout next")
+	t.Logf("vitess probes deleted rows 10-17; checkout next")
 	// The vitess parser panics on this query. bd must neither crash nor let
 	// it pass unlogged; the server may reject it.
 	if out, _ := step(1, "sql", "--quiet", "sql", "SELECT 1/*!,*/''"); strings.Contains(out, "panic:") {

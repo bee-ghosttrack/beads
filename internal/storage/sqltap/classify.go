@@ -80,9 +80,15 @@ func IsWriteArgs(query string, args []driver.NamedValue) bool {
 // multi mode): parse one statement, then re-parse what follows it. The server
 // loads sql_mode afresh for each parse, so each remainder is parsed with and
 // without ANSI_QUOTES regardless of the mode that produced it; the walk is
-// memoized on (offset, mode), so it stays linear in the number of pieces. ok
+// memoized on (offset, mode), so it makes at most two parses per piece. ok
 // is false when any piece does not parse in a mode that can reach it.
+//
+// Each parse reads the whole remainder, so the walk costs pieces x length,
+// as Dolt's own split does. Past maxParseBytes of parser input the query is
+// reported unparseable, i.e. a write: a large single statement stays well
+// inside the budget, and only a long multi-statement script exceeds it.
 func doltPieces(query string) (pieces []string, ok bool) {
+	budget := maxParseBytes
 	type state struct {
 		off  int
 		ansi bool
@@ -97,6 +103,9 @@ func doltPieces(query string) (pieces []string, ok bool) {
 				continue
 			}
 			seen[st] = true
+			if budget -= len(query) - off; budget < 0 {
+				return false
+			}
 			piece, next, ok := doltPiece(query[off:], ansi)
 			if !ok {
 				return false
@@ -116,6 +125,9 @@ func doltPieces(query string) (pieces []string, ok bool) {
 	}
 	return pieces, true
 }
+
+// maxParseBytes bounds the parser input doltPieces spends on one query.
+const maxParseBytes = 4 << 20
 
 // doltPiece parses the first statement Dolt would execute from s. It returns
 // that statement ("" when only comments remain), the byte offset in s where
