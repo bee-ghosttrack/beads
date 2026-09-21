@@ -221,6 +221,12 @@ func Initialize() error {
 	// `bd config set events-journal true` or BD_EVENTS_JOURNAL=1; read it with
 	// `bd events tail/export`.
 	v.SetDefault("events-journal", false)
+	// Client-side write-ahead op log (internal/oplog). OFF when oplog.dir is
+	// empty. Each write-classified command appends an intent record before it
+	// touches the store and an outcome record after; oplog.sync adds an fsync
+	// per record. Env: BD_OPLOG_DIR / BD_OPLOG_SYNC.
+	v.SetDefault("oplog.dir", "")
+	v.SetDefault("oplog.sync", false)
 	// Retention floors. retain-days keeps rows younger than N days; retain-rows
 	// always keeps the newest N rows. They bound every prune, whether an
 	// operator asked for it (`bd events prune`) or maintenance applied it
