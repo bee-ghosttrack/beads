@@ -84,6 +84,11 @@ func TestOplogServerSQLProbes(t *testing.T) {
 		t.Fatalf("a vitess-lexed DELETE did not run: %s", out)
 	}
 	t.Logf("vitess probes deleted rows 10-16; checkout next")
+	// The vitess parser panics on this query. bd must neither crash nor let
+	// it pass unlogged; the server may reject it.
+	if out, _ := step(1, "sql", "--quiet", "sql", "SELECT 1/*!,*/''"); strings.Contains(out, "panic:") {
+		t.Fatalf("bd sql panicked: %s", out)
+	}
 	// DOLT_CHECKOUT of a table name resets that table's working set.
 	sql(1, "CALL DOLT_CHECKOUT('oplog_probe')")
 }

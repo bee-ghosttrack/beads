@@ -55,49 +55,101 @@ func IsWrite(query string) bool { return IsWriteArgs(query, nil) }
 // the middle of that comment, where its */ is no longer a close. So each
 // piece Dolt would execute is found by running Dolt's own loop, with and
 // without ANSI_QUOTES, and classified the same several ways. A piece Dolt
-// cannot parse is a write.
+// cannot parse is a write. The server re-reads the session's sql_mode before
+// each piece, so a SET earlier in the query can flip ANSI_QUOTES for the rest;
+// every piece is therefore parsed in both modes, whatever mode split the
+// pieces before it.
 func IsWriteArgs(query string, args []driver.NamedValue) bool {
 	if lexedWrite(query, args) {
 		return true
 	}
-	for _, ansi := range []bool{false, true} {
-		pieces, ok := doltPieces(query, ansi)
-		if !ok {
+	pieces, ok := doltPieces(query)
+	if !ok {
+		return true
+	}
+	for _, piece := range pieces {
+		if piece != query && lexedWrite(piece, args) {
 			return true
-		}
-		for _, piece := range pieces {
-			if piece != query && lexedWrite(piece, args) {
-				return true
-			}
 		}
 	}
 	return false
 }
 
-// doltPieces splits query into the statements Dolt executes for it, by the
-// loop its server and embedded driver run (go-mysql-server MysqlParser.Parse
-// in multi mode): parse one statement, then re-parse what follows it. ok is
-// false when a piece does not parse.
-func doltPieces(query string, ansiQuotes bool) (pieces []string, ok bool) {
-	opts := sqlparser.ParserOptions{AnsiQuotes: ansiQuotes}
-	for s := trimStatement(query); s != ""; {
-		_, next, err := sqlparser.ParseOneWithOptions(context.Background(), s, opts)
-		switch {
-		case err == sqlparser.ErrEmpty:
-			// Only comments before the next statement, if any.
-		case err != nil:
-			return nil, false
-		case next > 0 && next < len(s):
-			pieces = append(pieces, s[:next])
-		default:
-			pieces = append(pieces, s)
+// doltPieces returns every statement Dolt may execute for query, by the loop
+// its server and embedded driver run (go-mysql-server MysqlParser.Parse in
+// multi mode): parse one statement, then re-parse what follows it. The server
+// loads sql_mode afresh for each parse, so each remainder is parsed with and
+// without ANSI_QUOTES regardless of the mode that produced it; the walk is
+// memoized on (offset, mode), so it stays linear in the number of pieces. ok
+// is false when any piece does not parse in a mode that can reach it.
+func doltPieces(query string) (pieces []string, ok bool) {
+	type state struct {
+		off  int
+		ansi bool
+	}
+	seen := map[state]bool{}
+	found := map[string]bool{}
+	var walk func(off int) bool
+	walk = func(off int) bool {
+		for _, ansi := range []bool{false, true} {
+			st := state{off, ansi}
+			if seen[st] {
+				continue
+			}
+			seen[st] = true
+			piece, next, ok := doltPiece(query[off:], ansi)
+			if !ok {
+				return false
+			}
+			if piece != "" && !found[piece] {
+				found[piece] = true
+				pieces = append(pieces, piece)
+			}
+			if next > 0 && !walk(off+next) {
+				return false
+			}
 		}
-		if next <= 0 || next >= len(s) {
-			return pieces, true
-		}
-		s = trimStatement(s[next:])
+		return true
+	}
+	if !walk(0) {
+		return nil, false
 	}
 	return pieces, true
+}
+
+// doltPiece parses the first statement Dolt would execute from s. It returns
+// that statement ("" when only comments remain), the byte offset in s where
+// the remainder starts (0 when nothing follows), and ok false when the
+// statement does not parse. The vitess parser panics on some input (an
+// empty string literal after an executable comment, as in the unit tests);
+// that is ok false too.
+func doltPiece(s string, ansiQuotes bool) (piece string, next int, ok bool) {
+	defer func() {
+		if recover() != nil {
+			piece, next, ok = "", 0, false
+		}
+	}()
+	lead := len(s) - len(strings.TrimLeftFunc(s, unicode.IsSpace))
+	t := trimStatement(s)
+	if t == "" {
+		return "", 0, true
+	}
+	opts := sqlparser.ParserOptions{AnsiQuotes: ansiQuotes}
+	_, ri, err := sqlparser.ParseOneWithOptions(context.Background(), t, opts)
+	switch {
+	case err == sqlparser.ErrEmpty:
+		// Only comments before the next statement, if any.
+	case err != nil:
+		return "", 0, false
+	case ri > 0 && ri < len(t):
+		piece = t[:ri]
+	default:
+		piece = t
+	}
+	if ri <= 0 || ri >= len(t) {
+		return piece, 0, true
+	}
+	return piece, lead + ri, true
 }
 
 // trimStatement trims what go-mysql-server trims before each parse: spaces,

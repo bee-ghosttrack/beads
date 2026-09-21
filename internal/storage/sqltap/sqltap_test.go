@@ -112,6 +112,8 @@ func TestIsWrite(t *testing.T) {
 		"SELECT 1 /*M! ; SELECT 2 *//* \n 3; DELETE FROM t; # */",
 		"SELECT 1; SELEC 2; DELETE FROM t", // a piece Dolt cannot parse
 		"HELP 'x'",                         // Dolt cannot parse it either
+		// The vitess parser panics on these; classification must not.
+		"SELECT 1/*!,*/''", "SET sql_mode='ANSI_QUOTES'; SELECT 1/*!,*/''",
 	}
 	for _, q := range writes {
 		if !IsWrite(q) {
