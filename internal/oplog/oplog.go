@@ -16,6 +16,20 @@
 // Durability defaults to the page cache: a killed process loses nothing it
 // already wrote. oplog.sync=true adds an fsync per record, for a seat whose
 // server lives on another machine.
+//
+// Limits, stated so nobody reads more into the log than it holds:
+//   - Coverage is the commands that pass bd's write gate (CheckReadonly).
+//     Commands that run before or without a store (init, bootstrap, setup,
+//     migrate, doctor --fix and the other store-skipping verbs) and bd's own
+//     maintenance writes (version tracking, auto-migrate, auto-import) are
+//     not logged.
+//   - A panic, or a kill -9, leaves an intent with no outcome. That is the
+//     signal the log exists to give, but it is not proof the write was lost.
+//   - The digest is not a secret. For a low-entropy payload (a status or
+//     priority value) it can be reversed by guessing, and payload_bytes
+//     reveals the payload's length.
+//   - One append per record is atomic on local filesystems. Put oplog.dir on
+//     local disk, not NFS.
 package oplog
 
 import (

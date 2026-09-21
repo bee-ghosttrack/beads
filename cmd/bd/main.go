@@ -1000,7 +1000,7 @@ var rootCmd = &cobra.Command{
 
 		// Reset per-command write tracking (used by Dolt auto-commit).
 		commandDidWrite.Store(false)
-		commandOp = nil
+		stashCommandOplog(cmd, args)
 		commandMayEmptyJSONLExport.Store(false)
 		commandDeletedIssueIDs.reset()
 		commandDidExplicitDoltCommit = false
@@ -1531,9 +1531,6 @@ var rootCmd = &cobra.Command{
 		previewMode := isPreviewCommand(cmd)
 		policy := effectiveRootStorePolicy(cmd.Name(), readonlyMode)
 		useReadOnly := policy.readOnly || previewMode
-		if !useReadOnly {
-			beginCommandOplog(cmd, args)
-		}
 
 		// dc-6jaq: consult the migration freeze marker here, before any of
 		// this hook's own store-touching side effects — trackBdVersion below
@@ -2273,6 +2270,7 @@ func setupGracefulShutdown() (context.Context, context.CancelFunc) {
 			cancel()
 			// On second signal, force exit
 			<-sigCh
+			endCommandOplog(1)
 			os.Exit(1)
 		case <-ctx.Done():
 			signal.Stop(sigCh)

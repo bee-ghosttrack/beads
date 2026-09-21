@@ -13,13 +13,50 @@ import (
 	"github.com/steveyegge/beads/internal/oplog"
 )
 
-func TestCommandOplog_IntentAndOutcome(t *testing.T) {
+// setupOplogTest points oplog.dir at a temp dir with a known issue prefix and
+// restores the package state afterwards.
+func setupOplogTest(t *testing.T) string {
+	t.Helper()
 	if err := config.Initialize(); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
 	config.Set("oplog.dir", dir)
-	t.Cleanup(func() { config.Set("oplog.dir", ""); commandOp = nil })
+	config.Set("issue-prefix", "bd")
+	t.Cleanup(func() {
+		config.Set("oplog.dir", "")
+		config.Set("issue-prefix", "")
+		commandOp, oplogCmd, oplogArgs = nil, nil, nil
+	})
+	return dir
+}
+
+func readOplog(t *testing.T, dir string) []oplog.Record {
+	t.Helper()
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if len(matches) == 0 {
+		return nil
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want one log file, got %v", matches)
+	}
+	raw, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recs []oplog.Record
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var r oplog.Record
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("bad record %q: %v", line, err)
+		}
+		recs = append(recs, r)
+	}
+	return recs
+}
+
+func TestCommandOplog_CheckReadonlyBeginsOnce(t *testing.T) {
+	dir := setupOplogTest(t)
 
 	root := &cobra.Command{Use: "bd"}
 	dep := &cobra.Command{Use: "dep"}
@@ -32,45 +69,99 @@ func TestCommandOplog_IntentAndOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	beginCommandOplog(add, []string{"bd-a1", "bd-b2", "not an id"})
-	if commandOp == nil {
-		t.Fatal("no op begun with oplog.dir set")
+	stashCommandOplog(add, []string{"bd-a1", "bd-b2.3", "not an id"})
+	if commandOp != nil {
+		t.Fatal("op begun before the write gate")
 	}
+	CheckReadonly("dep add")
+	if commandOp == nil {
+		t.Fatal("CheckReadonly did not begin an op with oplog.dir set")
+	}
+	CheckReadonly("dep add") // a second gate call must not log a second intent
 	endCommandOplog(7)
 	endCommandOplog(0) // second call is a no-op
 
-	matches, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
-	if len(matches) != 1 {
-		t.Fatalf("want one log file, got %v", matches)
+	recs := readOplog(t, dir)
+	if len(recs) != 2 {
+		t.Fatalf("want 2 records, got %d: %+v", len(recs), recs)
 	}
-	raw, _ := os.ReadFile(matches[0])
-	if strings.Contains(string(raw), "private words") {
-		t.Fatal("flag value written to the op log")
-	}
-	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("want 2 records, got %d", len(lines))
-	}
-	var in, out oplog.Record
-	_ = json.Unmarshal([]byte(lines[0]), &in)
-	_ = json.Unmarshal([]byte(lines[1]), &out)
-	if in.Verb != "dep add" || strings.Join(in.IDs, ",") != "bd-a1,bd-b2" || strings.Join(in.Flags, ",") != "note" {
+	in, out := recs[0], recs[1]
+	if in.Phase != oplog.PhaseIntent || in.Verb != "dep add" ||
+		strings.Join(in.IDs, ",") != "bd-a1,bd-b2.3" || strings.Join(in.Flags, ",") != "note" {
 		t.Fatalf("intent %+v", in)
 	}
 	if out.RC == nil || *out.RC != 7 || out.OpID != in.OpID {
 		t.Fatalf("outcome %+v", out)
 	}
+	raw, _ := json.Marshal(recs)
+	if strings.Contains(string(raw), "private words") {
+		t.Fatal("flag value written to the op log")
+	}
+}
+
+func TestCommandOplog_NoGateNoLog(t *testing.T) {
+	dir := setupOplogTest(t)
+	show := &cobra.Command{Use: "show"}
+	stashCommandOplog(show, []string{"bd-a1"})
+	endCommandOplog(0)
+	if recs := readOplog(t, dir); len(recs) != 0 {
+		t.Fatalf("a command that never passed the write gate logged %+v", recs)
+	}
+}
+
+func TestCommandOplog_ServeExcluded(t *testing.T) {
+	dir := setupOplogTest(t)
+	stashCommandOplog(&cobra.Command{Use: "serve"}, nil)
+	CheckReadonly("serve")
+	endCommandOplog(0)
+	if recs := readOplog(t, dir); len(recs) != 0 {
+		t.Fatalf("serve logged %+v", recs)
+	}
+}
+
+func TestCommandOplog_StashClearsPreviousOp(t *testing.T) {
+	setupOplogTest(t)
+	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
+	CheckReadonly("create")
+	if commandOp == nil {
+		t.Fatal("no op begun")
+	}
+	stashCommandOplog(&cobra.Command{Use: "list"}, nil)
+	if commandOp != nil {
+		t.Fatal("op from the previous command survived the stash")
+	}
 }
 
 func TestCommandOplog_OffWhenDirUnset(t *testing.T) {
-	if err := config.Initialize(); err != nil {
-		t.Fatal(err)
-	}
+	setupOplogTest(t)
 	config.Set("oplog.dir", "")
-	cmd := &cobra.Command{Use: "create"}
-	beginCommandOplog(cmd, nil)
+	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
+	CheckReadonly("create")
 	if commandOp != nil {
 		t.Fatal("op begun with oplog.dir unset")
 	}
 	endCommandOplog(0) // must not panic on a nil op
+}
+
+func TestOplogIssueIDs(t *testing.T) {
+	long := "bd-" + strings.Repeat("a", maxOplogIDLen)
+	args := []string{
+		"bd-a1", "bd-a1.2.3", // kept
+		"jira-token", "ATATT3x-SECRET", // hyphenated, wrong prefix
+		"fix-payroll-export-for-alice", // a title
+		"bd-payroll-export",            // right prefix, prose after it
+		"bd-", "bd-a1.", "bd-a b",      // malformed
+		long, // over the cap
+		"xbd-a1",
+	}
+	got := oplogIssueIDs(args, "bd")
+	if strings.Join(got, ",") != "bd-a1,bd-a1.2.3" {
+		t.Fatalf("got %v", got)
+	}
+	if ids := oplogIssueIDs(args, ""); ids != nil {
+		t.Fatalf("no prefix must log no ids, got %v", ids)
+	}
+	if ids := oplogIssueIDs([]string{"my-proj-x9k2"}, "my-proj"); strings.Join(ids, ",") != "my-proj-x9k2" {
+		t.Fatalf("hyphenated prefix: got %v", ids)
+	}
 }
