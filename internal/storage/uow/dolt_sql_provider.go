@@ -23,6 +23,7 @@ import (
 	db "github.com/steveyegge/beads/internal/storage/domain/db"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 const (
@@ -701,7 +702,7 @@ func openDBProbe(ctx context.Context, dsn string) (*sql.DB, error) {
 // on "uow: open db" and "uow: ping db" — and a pool whose prove fails is
 // closed here rather than leaked to a caller that only sees an error.
 func openPool(dsn string, prove func(*sql.DB) error) (*sql.DB, error) {
-	conn, err := sql.Open("mysql", dsn)
+	conn, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("uow: open db: %w", err)
 	}

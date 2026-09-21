@@ -23,6 +23,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/proxy"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/ui"
 	"golang.org/x/term"
@@ -1253,7 +1254,7 @@ func runExternalDoltStatus(beadsDir string, cfg *configfile.Config) {
 		"tls":      tls,
 	}
 
-	db, openErr := sql.Open("mysql", dsn)
+	db, openErr := sql.Open(sqltap.MySQLDriverName, dsn)
 	var running bool
 	var version string
 	var connErr error
@@ -2358,7 +2359,7 @@ func openDoltServerConnection() (*sql.DB, func(), error) {
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
 
-	db, err := sql.Open("mysql", connStr)
+	db, err := sql.Open(sqltap.MySQLDriverName, connStr)
 	if err != nil {
 		return nil, nil, HandleError("connecting to Dolt server: %v", err)
 	}

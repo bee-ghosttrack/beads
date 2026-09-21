@@ -15,6 +15,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // openDoltDB opens a connection to the Dolt SQL server via MySQL protocol.
@@ -56,7 +57,7 @@ func openDoltDB(beadsDir string) (*sql.DB, *configfile.Config, error) {
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
 
-	db, err := sql.Open("mysql", connStr)
+	db, err := sql.Open(sqltap.MySQLDriverName, connStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open server connection: %w", err)
 	}

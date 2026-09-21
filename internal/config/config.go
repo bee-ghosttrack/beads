@@ -222,8 +222,8 @@ func Initialize() error {
 	// `bd events tail/export`.
 	v.SetDefault("events-journal", false)
 	// Client-side write-ahead op log (internal/oplog). OFF when oplog.dir is
-	// empty. Each write-classified command appends an intent record before it
-	// touches the store and an outcome record after; oplog.sync adds an fsync
+	// empty. Each command that writes appends an intent record before its first
+	// write statement and an outcome record after; oplog.sync adds an fsync
 	// per record. Env: BD_OPLOG_DIR / BD_OPLOG_SYNC.
 	v.SetDefault("oplog.dir", "")
 	v.SetDefault("oplog.sync", false)

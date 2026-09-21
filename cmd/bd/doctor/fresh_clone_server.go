@@ -10,6 +10,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // freshCloneDBCheck holds the result of checking whether a database exists on
@@ -33,7 +34,7 @@ func checkFreshCloneDB(host string, port int, user, password, dbName string, tls
 		TLS:      tls,
 	}.String()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return freshCloneDBCheck{Reachable: false, Err: err}
 	}

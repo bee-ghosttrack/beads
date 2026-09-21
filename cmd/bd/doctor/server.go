@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // ServerHealthResult holds the results of all server health checks
@@ -305,7 +306,7 @@ func checkDoltVersion(cfg *configfile.Config, beadsDir string) (DoctorCheck, *sq
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
 
-	db, err := sql.Open("mysql", connStr)
+	db, err := sql.Open(sqltap.MySQLDriverName, connStr)
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Dolt Version",

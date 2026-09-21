@@ -194,7 +194,6 @@ func CheckReadonly(operation string) {
 		endCommandOplog(ExitMigrationFrozen)
 		os.Exit(ExitMigrationFrozen)
 	}
-	beginCommandOplog()
 }
 
 // freezeSearchRoots returns the directories whose ancestry the freeze lookup

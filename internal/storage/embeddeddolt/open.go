@@ -15,6 +15,8 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	doltembed "github.com/dolthub/driver/v2"
+
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // validIdentifier matches safe SQL identifiers (letters, digits, underscores).
@@ -47,7 +49,7 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 		return nil, nil, err
 	}
 
-	db := sql.OpenDB(connector)
+	db := sql.OpenDB(sqltap.WrapConnector(connector))
 	db.SetMaxOpenConns(2)
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxIdleTime(0)

@@ -11,9 +11,11 @@ import (
 	"github.com/steveyegge/beads/internal/oplog"
 )
 
-// TestOplogEmbedded drives the real binary so the wiring in main.go is
-// covered: the stash at the top of the root hook, the begin in CheckReadonly,
-// and the outcome written after ExecuteC.
+// TestOplogEmbedded drives the real binary so the wiring is covered end to
+// end: the tap arms at the top of the root hook, the intent is written at the
+// first write statement, and the outcome after ExecuteC. The probes are the
+// ones that broke earlier designs: previews that pass the write gate, writes
+// that skip it, and arguments that must never reach the log.
 func TestOplogEmbedded(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
 		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt oplog tests")
@@ -23,43 +25,69 @@ func TestOplogEmbedded(t *testing.T) {
 	logDir := t.TempDir()
 	env := []string{"BD_OPLOG_DIR=" + logDir}
 
+	seen := 0
+	// step runs one command and checks how many ops it logged and, when it
+	// logged one, the verb and that the outcome carries the command's rc.
+	step := func(wantOps int, wantVerb string, args ...string) (string, int) {
+		t.Helper()
+		out, rc := bdRunRaw(t, bd, dir, env, args...)
+		recs := readOplog(t, logDir)
+		got := recs[seen:]
+		seen = len(recs)
+		if len(got) != 2*wantOps {
+			t.Fatalf("%v (rc %d): want %d op(s), got records %+v\n%s", args, rc, wantOps, got, out)
+		}
+		if wantOps == 1 {
+			in, res := got[0], got[1]
+			if in.Phase != oplog.PhaseIntent || in.Verb != wantVerb || len(in.IDs) != 0 ||
+				res.OpID != in.OpID || res.RC == nil || *res.RC != rc {
+				t.Fatalf("%v (rc %d): intent %+v outcome %+v", args, rc, in, res)
+			}
+		}
+		return out, rc
+	}
+
 	const title = "fix-payroll-export-for-alice"
-	out, rc := bdRunRaw(t, bd, dir, env, "create", "--silent", title)
+	out, rc := step(1, "create", "create", "--silent", title)
 	if rc != 0 {
 		t.Fatalf("create rc %d: %s", rc, out)
 	}
 	id := strings.TrimSpace(out)
-	recs := readOplog(t, logDir)
-	if len(recs) != 2 || recs[0].Phase != oplog.PhaseIntent || recs[0].Verb != "create" ||
-		recs[1].RC == nil || *recs[1].RC != 0 || recs[1].OpID != recs[0].OpID {
-		t.Fatalf("create: want intent+outcome rc 0, got %+v", recs)
-	}
 
-	// Read commands never reach the write gate, whatever the store policy.
-	for _, args := range [][]string{{"show", id}, {"status"}, {"list"}} {
-		if out, rc := bdRunRaw(t, bd, dir, env, args...); rc != 0 {
+	export := filepath.Join(t.TempDir(), "issues.jsonl")
+	for _, args := range [][]string{{"show", id}, {"status"}, {"list"}, {"ready"}, {"export", "-o", export}} {
+		if out, rc := step(0, "", args...); rc != 0 {
 			t.Fatalf("%v rc %d: %s", args, rc, out)
 		}
 	}
-	if n := len(readOplog(t, logDir)); n != 2 {
-		t.Fatalf("read commands logged %d new records", n-2)
+
+	// Previews pass the CLI write gate but write nothing.
+	step(0, "", "delete", id)
+	step(0, "", "create", "--dry-run", "preview-title-never-created")
+	if _, rc := bdRunRaw(t, bd, dir, nil, "show", id); rc != 0 {
+		t.Fatal("delete preview removed the issue")
 	}
 
-	if out, rc := bdRunRaw(t, bd, dir, env, "update", id, "--status", "in_progress"); rc != 0 {
+	if out, rc := step(1, "update", "update", id, "--status", "in_progress"); rc != 0 {
 		t.Fatalf("update rc %d: %s", rc, out)
 	}
-	if _, rc := bdRunRaw(t, bd, dir, env, "update", "op-nope9", "--status", "closed"); rc == 0 {
+	// A write that fails before it writes logs nothing.
+	if _, rc := step(0, "", "update", "op-nope9", "--status", "closed"); rc == 0 {
 		t.Fatal("update of a missing issue succeeded")
 	}
-	recs = readOplog(t, logDir)
-	if len(recs) != 6 {
-		t.Fatalf("want 6 records after two updates, got %+v", recs)
+
+	// Writes that never call the CLI write gate.
+	if out, rc := step(1, "rename", "rename", id, "op-renamed"); rc != 0 {
+		t.Fatalf("rename rc %d: %s", rc, out)
 	}
-	if strings.Join(recs[2].IDs, ",") != id || recs[3].RC == nil || *recs[3].RC != 0 {
-		t.Fatalf("update: %+v %+v", recs[2], recs[3])
+	if out, rc := step(1, "kv set", "kv", "set", "op-apikey", "op-Hunter2"); rc != 0 {
+		t.Fatalf("kv set rc %d: %s", rc, out)
 	}
-	if strings.Join(recs[4].IDs, ",") != "op-nope9" || recs[5].RC == nil || *recs[5].RC == 0 {
-		t.Fatalf("failed update: %+v %+v", recs[4], recs[5])
+	if out, rc := step(1, "q", "q", "op-v2.0 release notes"); rc != 0 {
+		t.Fatalf("q rc %d: %s", rc, out)
+	}
+	if out, rc := step(1, "import", "import", export); rc != 0 {
+		t.Fatalf("import rc %d: %s", rc, out)
 	}
 
 	files, _ := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
@@ -68,7 +96,9 @@ func TestOplogEmbedded(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := string(b)
-	if strings.Contains(raw, title) || strings.Contains(raw, "in_progress") {
-		t.Fatalf("payload text reached the log:\n%s", raw)
+	for _, leak := range []string{title, "in_progress", "Hunter2", "op-apikey", "op-v2.0", "release notes", id, "op-renamed"} {
+		if strings.Contains(raw, leak) {
+			t.Fatalf("%q reached the log:\n%s", leak, raw)
+		}
 	}
 }

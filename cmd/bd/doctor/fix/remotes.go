@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 func openFixDB(beadsDir string, cfg *configfile.Config) (*sql.DB, error) {
@@ -28,7 +29,7 @@ func openFixDB(beadsDir string, cfg *configfile.Config) (*sql.DB, error) {
 		Database: database,
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
-	return sql.Open("mysql", connStr)
+	return sql.Open(sqltap.MySQLDriverName, connStr)
 }
 
 // errUnverifiableFixTarget marks a verifyFixTargetIdentity failure that is

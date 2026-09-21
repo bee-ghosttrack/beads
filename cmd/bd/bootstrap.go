@@ -28,6 +28,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"golang.org/x/term"
 )
@@ -71,7 +72,7 @@ var checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrap
 		TLS:      probeCfg.tls,
 	}.String()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return bootstrapServerDBCheck{Reachable: false, Err: err}
 	}
@@ -1216,7 +1217,7 @@ func cloneViaServer(ctx context.Context, beadsDir, remoteURL, dbName string, cfg
 		// No Database — DOLT_CLONE creates the database.
 	}.String()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return fmt.Errorf("connect to dolt server for clone: %w", err)
 	}

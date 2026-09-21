@@ -1,20 +1,25 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/spf13/cobra"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/oplog"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
-// setupOplogTest points oplog.dir at a temp dir with a known issue prefix and
-// restores the package state afterwards.
+// setupOplogTest points oplog.dir at a temp dir and restores the package
+// state afterwards.
 func setupOplogTest(t *testing.T) string {
 	t.Helper()
 	if err := config.Initialize(); err != nil {
@@ -22,11 +27,11 @@ func setupOplogTest(t *testing.T) string {
 	}
 	dir := t.TempDir()
 	config.Set("oplog.dir", dir)
-	config.Set("issue-prefix", "bd")
 	t.Cleanup(func() {
 		config.Set("oplog.dir", "")
-		config.Set("issue-prefix", "")
-		commandOp, oplogCmd, oplogArgs = nil, nil, nil
+		sqltap.Disarm()
+		commandOp.Store(nil)
+		oplogCmd, oplogArgs = nil, nil
 	})
 	return dir
 }
@@ -55,8 +60,39 @@ func readOplog(t *testing.T, dir string) []oplog.Record {
 	return recs
 }
 
-func TestCommandOplog_CheckReadonlyBeginsOnce(t *testing.T) {
+// nopConn stands in for a Dolt connection: statements go through the tap and
+// nowhere else.
+type nopConn struct{}
+
+func (nopConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (nopConn) Close() error                        { return nil }
+func (nopConn) Begin() (driver.Tx, error)           { return nil, driver.ErrSkip }
+func (nopConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return driver.RowsAffected(0), nil
+}
+
+type nopConnector struct{}
+
+func (nopConnector) Connect(context.Context) (driver.Conn, error) { return nopConn{}, nil }
+func (nopConnector) Driver() driver.Driver                        { return nil }
+
+func tappedDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db := sql.OpenDB(sqltap.WrapConnector(nopConnector{}))
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func oplogExec(t *testing.T, db *sql.DB, q string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), q); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommandOplog_FirstWriteBeginsOnce(t *testing.T) {
 	dir := setupOplogTest(t)
+	db := tappedDB(t)
 
 	root := &cobra.Command{Use: "bd"}
 	dep := &cobra.Command{Use: "dep"}
@@ -69,15 +105,20 @@ func TestCommandOplog_CheckReadonlyBeginsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stashCommandOplog(add, []string{"bd-a1", "bd-b2.3", "not an id"})
-	if commandOp != nil {
-		t.Fatal("op begun before the write gate")
+	stashCommandOplog(add, []string{"bd-a1", "op-Hunter2"})
+	oplogExec(t, db, "SELECT * FROM issues")
+	if commandOp.Load() != nil {
+		t.Fatal("a read began an op")
 	}
-	CheckReadonly("dep add")
-	if commandOp == nil {
-		t.Fatal("CheckReadonly did not begin an op with oplog.dir set")
+	CheckReadonly("dep add") // the write gate alone is not a write
+	if commandOp.Load() != nil {
+		t.Fatal("the write gate began an op before any write")
 	}
-	CheckReadonly("dep add") // a second gate call must not log a second intent
+	oplogExec(t, db, "INSERT INTO dependencies VALUES (1)")
+	if commandOp.Load() == nil {
+		t.Fatal("the first write did not begin an op")
+	}
+	oplogExec(t, db, "CALL DOLT_COMMIT('-Am', 'x')") // must not log a second intent
 	endCommandOplog(7)
 	endCommandOplog(0) // second call is a no-op
 
@@ -86,82 +127,91 @@ func TestCommandOplog_CheckReadonlyBeginsOnce(t *testing.T) {
 		t.Fatalf("want 2 records, got %d: %+v", len(recs), recs)
 	}
 	in, out := recs[0], recs[1]
-	if in.Phase != oplog.PhaseIntent || in.Verb != "dep add" ||
-		strings.Join(in.IDs, ",") != "bd-a1,bd-b2.3" || strings.Join(in.Flags, ",") != "note" {
+	if in.Phase != oplog.PhaseIntent || in.Verb != "dep add" || len(in.IDs) != 0 ||
+		strings.Join(in.Flags, ",") != "note" {
 		t.Fatalf("intent %+v", in)
 	}
 	if out.RC == nil || *out.RC != 7 || out.OpID != in.OpID {
 		t.Fatalf("outcome %+v", out)
 	}
 	raw, _ := json.Marshal(recs)
-	if strings.Contains(string(raw), "private words") {
-		t.Fatal("flag value written to the op log")
+	for _, leak := range []string{"private words", "Hunter2", "bd-a1"} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("%q written to the op log", leak)
+		}
 	}
 }
 
-func TestCommandOplog_NoGateNoLog(t *testing.T) {
+func TestCommandOplog_NoWriteNoLog(t *testing.T) {
 	dir := setupOplogTest(t)
-	show := &cobra.Command{Use: "show"}
-	stashCommandOplog(show, []string{"bd-a1"})
+	db := tappedDB(t)
+	stashCommandOplog(&cobra.Command{Use: "delete"}, []string{"bd-a1"})
+	CheckReadonly("delete") // a preview passes the gate, then only reads
+	oplogExec(t, db, "SELECT id FROM issues WHERE id = 'bd-a1'")
+	oplogExec(t, db, "CALL DOLT_CHECKOUT('main')")
 	endCommandOplog(0)
 	if recs := readOplog(t, dir); len(recs) != 0 {
-		t.Fatalf("a command that never passed the write gate logged %+v", recs)
+		t.Fatalf("a command that never wrote logged %+v", recs)
 	}
 }
 
 func TestCommandOplog_ServeExcluded(t *testing.T) {
 	dir := setupOplogTest(t)
+	db := tappedDB(t)
 	stashCommandOplog(&cobra.Command{Use: "serve"}, nil)
-	CheckReadonly("serve")
+	oplogExec(t, db, "INSERT INTO t VALUES (1)")
 	endCommandOplog(0)
 	if recs := readOplog(t, dir); len(recs) != 0 {
 		t.Fatalf("serve logged %+v", recs)
 	}
 }
 
-func TestCommandOplog_StashClearsPreviousOp(t *testing.T) {
-	setupOplogTest(t)
+func TestCommandOplog_StashClearsAndRearms(t *testing.T) {
+	dir := setupOplogTest(t)
+	db := tappedDB(t)
 	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
-	CheckReadonly("create")
-	if commandOp == nil {
+	oplogExec(t, db, "INSERT INTO t VALUES (1)")
+	if commandOp.Load() == nil {
 		t.Fatal("no op begun")
 	}
-	stashCommandOplog(&cobra.Command{Use: "list"}, nil)
-	if commandOp != nil {
+	stashCommandOplog(&cobra.Command{Use: "rename"}, nil)
+	if commandOp.Load() != nil {
 		t.Fatal("op from the previous command survived the stash")
+	}
+	oplogExec(t, db, "UPDATE t SET x = 1")
+	endCommandOplog(0)
+	recs := readOplog(t, dir)
+	if len(recs) != 3 || recs[1].Verb != "rename" {
+		t.Fatalf("second command in the process not logged: %+v", recs)
 	}
 }
 
 func TestCommandOplog_OffWhenDirUnset(t *testing.T) {
 	setupOplogTest(t)
+	db := tappedDB(t)
 	config.Set("oplog.dir", "")
 	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
-	CheckReadonly("create")
-	if commandOp != nil {
+	oplogExec(t, db, "INSERT INTO t VALUES (1)")
+	if commandOp.Load() != nil {
 		t.Fatal("op begun with oplog.dir unset")
 	}
 	endCommandOplog(0) // must not panic on a nil op
 }
 
-func TestOplogIssueIDs(t *testing.T) {
-	long := "bd-" + strings.Repeat("a", maxOplogIDLen)
-	args := []string{
-		"bd-a1", "bd-a1.2.3", // kept
-		"jira-token", "ATATT3x-SECRET", // hyphenated, wrong prefix
-		"fix-payroll-export-for-alice", // a title
-		"bd-payroll-export",            // right prefix, prose after it
-		"bd-", "bd-a1.", "bd-a b",      // malformed
-		long, // over the cap
-		"xbd-a1",
+// The second-signal path ends the op from another goroutine while main may
+// be ending it too: one outcome, no race (run with -race).
+func TestCommandOplog_ConcurrentEnd(t *testing.T) {
+	dir := setupOplogTest(t)
+	db := tappedDB(t)
+	stashCommandOplog(&cobra.Command{Use: "create"}, nil)
+	oplogExec(t, db, "INSERT INTO t VALUES (1)")
+	var wg sync.WaitGroup
+	for _, rc := range []int{1, 0} {
+		wg.Add(1)
+		go func(rc int) { defer wg.Done(); endCommandOplog(rc) }(rc)
 	}
-	got := oplogIssueIDs(args, "bd")
-	if strings.Join(got, ",") != "bd-a1,bd-a1.2.3" {
-		t.Fatalf("got %v", got)
-	}
-	if ids := oplogIssueIDs(args, ""); ids != nil {
-		t.Fatalf("no prefix must log no ids, got %v", ids)
-	}
-	if ids := oplogIssueIDs([]string{"my-proj-x9k2"}, "my-proj"); strings.Join(ids, ",") != "my-proj-x9k2" {
-		t.Fatalf("hyphenated prefix: got %v", ids)
+	wg.Wait()
+	if recs := readOplog(t, dir); len(recs) != 2 {
+		t.Fatalf("want intent + one outcome, got %+v", recs)
 	}
 }

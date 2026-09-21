@@ -48,6 +48,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/kvkeys"
 	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -2352,7 +2353,7 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open(sqltap.MySQLDriverName, cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
@@ -2401,7 +2402,7 @@ func (s *DoltStore) oneShotConn(readTimeout time.Duration) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = readTimeout
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open(sqltap.MySQLDriverName, cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
@@ -2512,7 +2513,7 @@ func assertGatewaySessionDatabase(ctx context.Context, db *sql.DB, want string) 
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, serverConnFacts, error) {
 	connStr := buildServerDSN(cfg, cfg.Database)
 
-	db, err := sql.Open("mysql", connStr)
+	db, err := sql.Open(sqltap.MySQLDriverName, connStr)
 	if err != nil {
 		return nil, "", serverConnFacts{}, fmt.Errorf("failed to open Dolt server connection: %w", err)
 	}
@@ -2619,7 +2620,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 	// Ensure database exists (may need to create it)
 	// First connect without database to create it
 	initConnStr := buildServerDSN(cfg, "")
-	initDB, err := sql.Open("mysql", initConnStr)
+	initDB, err := sql.Open(sqltap.MySQLDriverName, initConnStr)
 	if err != nil {
 		return nil, "", serverConnFacts{}, fmt.Errorf("failed to open init connection: %w", err)
 	}
@@ -3055,7 +3056,7 @@ func (s *DoltStore) openMigrationDB() (*sql.DB, error) {
 	}
 	cfg.ReadTimeout = 0
 	cfg.WriteTimeout = 0
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open(sqltap.MySQLDriverName, cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open migration connection: %w", err)
 	}
@@ -3077,7 +3078,7 @@ func (s *DoltStore) rebuildPoolAfterMigration(ctx context.Context, applied int) 
 		return nil
 	}
 
-	newDB, err := sql.Open("mysql", s.connStr)
+	newDB, err := sql.Open(sqltap.MySQLDriverName, s.connStr)
 	if err != nil {
 		return fmt.Errorf("rebuild pool after migration: %w", err)
 	}
@@ -4646,7 +4647,7 @@ func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open(sqltap.MySQLDriverName, cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}

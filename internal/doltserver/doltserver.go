@@ -41,6 +41,7 @@ import (
 	"github.com/steveyegge/beads/internal/gittraceenv"
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // ErrServerNotRunning is returned by Stop when the Dolt server is not running.
@@ -1626,7 +1627,7 @@ func EnsureGlobalDatabase(host string, port int, user, password string) error {
 		User:     user,
 		Password: password,
 	}.String()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return fmt.Errorf("ensure global db: failed to open connection: %w", err)
 	}
@@ -1664,7 +1665,7 @@ func FlushWorkingSet(host string, port int) error {
 		Port: port,
 		User: "root",
 	}.String()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return fmt.Errorf("flush: failed to open connection: %w", err)
 	}

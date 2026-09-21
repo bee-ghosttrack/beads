@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 // DoltPerfMetrics holds performance metrics for Dolt operations
@@ -130,7 +131,7 @@ func runDoltServerDiagnostics(metrics *DoltPerfMetrics, host string, port int, d
 
 	// Measure connection time
 	start := time.Now()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open MySQL connection: %w", err)
 	}

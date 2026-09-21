@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -318,7 +319,7 @@ func (s *DoltStore) beginIgnoredTxOnBranch(ctx context.Context, branch string) (
 	// Fallback: a dedicated single-connection pool, paying the fresh dial the
 	// borrow path exists to avoid.
 	doltMetrics.ignoredTxFreshPool.Add(ctx, 1)
-	db, err := sql.Open("mysql", s.connStr)
+	db, err := sql.Open(sqltap.MySQLDriverName, s.connStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open ignored tx connection: %w", err)
 	}

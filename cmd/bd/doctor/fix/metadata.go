@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 )
 
 type serverDatabaseMetadata struct {
@@ -530,5 +531,5 @@ func openServerCatalogDB(beadsDir string, cfg *configfile.Config) (*sql.DB, erro
 		Password: cfg.GetDoltServerPasswordForPort(port),
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
-	return sql.Open("mysql", connStr)
+	return sql.Open(sqltap.MySQLDriverName, connStr)
 }

@@ -11,6 +11,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -37,7 +38,7 @@ func checkDatabaseOnServer(host string, port int, user, password, dbName string,
 		TLS:      tls,
 	}.String()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err != nil {
 		return initGuardDBCheck{Reachable: false, Err: err}
 	}

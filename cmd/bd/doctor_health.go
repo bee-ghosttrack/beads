@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/sqltap"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -54,7 +55,7 @@ func runCheckHealth(path string) error {
 		Timeout:  2 * time.Second,
 		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(sqltap.MySQLDriverName, dsn)
 	if err == nil {
 		defer db.Close()
 		if pingErr := db.Ping(); pingErr == nil {
