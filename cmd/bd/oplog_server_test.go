@@ -65,21 +65,25 @@ func TestOplogServerSQLProbes(t *testing.T) {
 
 	// The round-4 review's probes: Dolt's vitess tokenizer draws these
 	// comment and statement boundaries unlike MySQL, and each DELETE ran with
-	// no op logged.
-	sql(1, "INSERT INTO oplog_probe VALUES (10), (11), (12), (13), (14)")
+	// no op logged. The round-5 review's (rows 15-16): Dolt re-lexes each
+	// statement's remainder from scratch, so a ; inside /*! ends statement 1
+	// and the */ that closed it becomes * and a // comment.
+	sql(1, "INSERT INTO oplog_probe VALUES (10), (11), (12), (13), (14), (15), (16)")
 	for _, q := range []string{
 		"SELECT 1; /*M! DELETE FROM oplog_probe WHERE x = 10 */",
 		"SELECT 1 /*! , 1 # */ ; DELETE FROM oplog_probe WHERE x = 11",
 		"SELECT 1 --x '\n; DELETE FROM oplog_probe WHERE x = 12",
 		"SELECT 1 // '\n; DELETE FROM oplog_probe WHERE x = 13",
 		"SELECT 1 /*+ ' */ ; DELETE FROM oplog_probe WHERE x = 14; SELECT 'x'",
+		"/*! SELECT 1; SELECT 2 *//* \n 3; DELETE FROM oplog_probe WHERE x = 15; # */",
+		"SELECT 1 /*! ; SELECT 2 *//* \n 3; DELETE FROM oplog_probe WHERE x = 16; # */",
 	} {
 		sql(1, q)
 	}
 	if out := sql(0, "SELECT GROUP_CONCAT(x) AS xs FROM oplog_probe WHERE x >= 10"); !strings.Contains(out, "<nil>") {
 		t.Fatalf("a vitess-lexed DELETE did not run: %s", out)
 	}
-	t.Logf("vitess probes deleted rows 10-14; checkout next")
+	t.Logf("vitess probes deleted rows 10-16; checkout next")
 	// DOLT_CHECKOUT of a table name resets that table's working set.
 	sql(1, "CALL DOLT_CHECKOUT('oplog_probe')")
 }

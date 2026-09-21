@@ -104,6 +104,14 @@ func TestIsWrite(t *testing.T) {
 		"CALL DOLT_CHECKOUT('o''brien')", "CALL DOLT_CHECKOUT('Main')",
 		"call dolt_checkout(\"main\")", // under ANSI_QUOTES, an identifier
 		"// only a comment",            // MySQL does not take // as a comment
+		// The round-5 review's live probes: Dolt re-lexes each statement's
+		// remainder from scratch, so a ; inside /*! ends statement 1 and the
+		// */ that closed it is lexed as * and a // comment.
+		"/*! SELECT 1; SELECT 2 *//* \n 3; DELETE FROM t; # */",
+		"SELECT 1 /*! ; SELECT 2 *//* \n 3; DELETE FROM t; # */",
+		"SELECT 1 /*M! ; SELECT 2 *//* \n 3; DELETE FROM t; # */",
+		"SELECT 1; SELEC 2; DELETE FROM t", // a piece Dolt cannot parse
+		"HELP 'x'",                         // Dolt cannot parse it either
 	}
 	for _, q := range writes {
 		if !IsWrite(q) {
@@ -122,7 +130,7 @@ func TestIsWrite(t *testing.T) {
 		"EXPLAIN UPDATE t SET x = 1", "EXPLAIN SELECT 1", "DESCRIBE t", "DESC t",
 		"EXPLAIN ANALYZE SELECT * FROM t",
 		"SELECT * FROM t WHERE id = ? FOR UPDATE", "SELECT 'INSERT INTO t'", "SELECT `delete` FROM t",
-		"(SELECT 1) UNION (SELECT 2)", "TABLE t", "VALUES ROW(1)", "HELP 'x'",
+		"(SELECT 1) UNION (SELECT 2)", "TABLE t", "VALUES ROW(1)",
 		"SELECT * FROM dolt_diff('HEAD~1', 'HEAD', 'issues')",
 		"", "   ", ";", "SELECT 1;", "SELECT 1; SELECT 2", "-- only a comment",
 		"SELECT `into` FROM t", "SELECT \"x\" FROM t", "SELECT 1 /*M! , 2 */",

@@ -1,9 +1,11 @@
 package sqltap
 
 import (
+	"context"
 	"database/sql/driver"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/dolthub/vitess/go/vt/sqlparser"
 )
@@ -18,7 +20,7 @@ func IsWrite(query string) bool { return IsWriteArgs(query, nil) }
 // Classification is an allowlist of reads: query is split into statements on
 // top-level semicolons, and it is a write unless EVERY statement is one of
 //
-//   - SELECT, TABLE, VALUES, WITH, SHOW or HELP with no INTO clause and no
+//   - SELECT, TABLE, VALUES, WITH or SHOW with no INTO clause and no
 //     INSERT/UPDATE/DELETE/REPLACE keyword (FOR UPDATE aside);
 //   - EXPLAIN, DESCRIBE, DESC — but EXPLAIN ANALYZE runs its statement, so
 //     it is judged by the same keywords;
@@ -46,7 +48,69 @@ func IsWrite(query string) bool { return IsWriteArgs(query, nil) }
 // the query is lexed by vitess itself, with and without ANSI_QUOTES; a vitess
 // lex error is a write. It is also lexed MySQL's way — /*! and /*+ bodies
 // read as SQL — with and without backslash escapes in quoted text.
+//
+// Dolt does not split a multi-statement query in one pass, though: it parses
+// the first statement, then re-parses the remainder with a fresh tokenizer. A
+// ; inside /*! ... */ can end statement 1, and the remainder then starts in
+// the middle of that comment, where its */ is no longer a close. So each
+// piece Dolt would execute is found by running Dolt's own loop, with and
+// without ANSI_QUOTES, and classified the same several ways. A piece Dolt
+// cannot parse is a write.
 func IsWriteArgs(query string, args []driver.NamedValue) bool {
+	if lexedWrite(query, args) {
+		return true
+	}
+	for _, ansi := range []bool{false, true} {
+		pieces, ok := doltPieces(query, ansi)
+		if !ok {
+			return true
+		}
+		for _, piece := range pieces {
+			if piece != query && lexedWrite(piece, args) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// doltPieces splits query into the statements Dolt executes for it, by the
+// loop its server and embedded driver run (go-mysql-server MysqlParser.Parse
+// in multi mode): parse one statement, then re-parse what follows it. ok is
+// false when a piece does not parse.
+func doltPieces(query string, ansiQuotes bool) (pieces []string, ok bool) {
+	opts := sqlparser.ParserOptions{AnsiQuotes: ansiQuotes}
+	for s := trimStatement(query); s != ""; {
+		_, next, err := sqlparser.ParseOneWithOptions(context.Background(), s, opts)
+		switch {
+		case err == sqlparser.ErrEmpty:
+			// Only comments before the next statement, if any.
+		case err != nil:
+			return nil, false
+		case next > 0 && next < len(s):
+			pieces = append(pieces, s[:next])
+		default:
+			pieces = append(pieces, s)
+		}
+		if next <= 0 || next >= len(s) {
+			return pieces, true
+		}
+		s = trimStatement(s[next:])
+	}
+	return pieces, true
+}
+
+// trimStatement trims what go-mysql-server trims before each parse: spaces,
+// and trailing semicolons.
+func trimStatement(s string) string {
+	return strings.TrimRightFunc(strings.TrimSpace(s), func(r rune) bool {
+		return r == ';' || unicode.IsSpace(r)
+	})
+}
+
+// lexedWrite reports whether query holds a write under any of the lexings
+// IsWriteArgs describes.
+func lexedWrite(query string, args []driver.NamedValue) bool {
 	// Whether a backslash escapes a quote, or a double quote starts a string,
 	// depends on the session's sql_mode (NO_BACKSLASH_ESCAPES, ANSI_QUOTES),
 	// which the client cannot see; the lexings can draw different statement
@@ -271,7 +335,7 @@ func isRead(stmt []token, args []driver.NamedValue) bool {
 		return false
 	}
 	switch stmt[0].text {
-	case "SELECT", "TABLE", "VALUES", "WITH", "SHOW", "HELP":
+	case "SELECT", "TABLE", "VALUES", "WITH", "SHOW":
 		return !mutates(stmt)
 	case "EXPLAIN", "DESCRIBE", "DESC":
 		// Plain EXPLAIN only plans its statement; EXPLAIN ANALYZE runs it.
