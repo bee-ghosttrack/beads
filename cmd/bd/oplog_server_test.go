@@ -62,6 +62,26 @@ func TestOplogServerSQLProbes(t *testing.T) {
 	if out := sql(0, "SELECT name FROM dolt_branches"); !strings.Contains(out, "oplog-probe-branch") {
 		t.Fatalf("checkout -b made no branch: %s", out)
 	}
+
+	// The round-4 review's probes: Dolt's vitess tokenizer draws these
+	// comment and statement boundaries unlike MySQL, and each DELETE ran with
+	// no op logged.
+	sql(1, "INSERT INTO oplog_probe VALUES (10), (11), (12), (13), (14)")
+	for _, q := range []string{
+		"SELECT 1; /*M! DELETE FROM oplog_probe WHERE x = 10 */",
+		"SELECT 1 /*! , 1 # */ ; DELETE FROM oplog_probe WHERE x = 11",
+		"SELECT 1 --x '\n; DELETE FROM oplog_probe WHERE x = 12",
+		"SELECT 1 // '\n; DELETE FROM oplog_probe WHERE x = 13",
+		"SELECT 1 /*+ ' */ ; DELETE FROM oplog_probe WHERE x = 14; SELECT 'x'",
+	} {
+		sql(1, q)
+	}
+	if out := sql(0, "SELECT GROUP_CONCAT(x) AS xs FROM oplog_probe WHERE x >= 10"); !strings.Contains(out, "<nil>") {
+		t.Fatalf("a vitess-lexed DELETE did not run: %s", out)
+	}
+	t.Logf("vitess probes deleted rows 10-14; checkout next")
+	// DOLT_CHECKOUT of a table name resets that table's working set.
+	sql(1, "CALL DOLT_CHECKOUT('oplog_probe')")
 }
 
 // startOplogDoltServer runs a private dolt sql-server for one test and stops

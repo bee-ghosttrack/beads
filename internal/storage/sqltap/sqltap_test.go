@@ -17,6 +17,24 @@ import (
 	"time"
 )
 
+// The MySQL lexing keeps non-ASCII bytes inside a word and a backslash
+// inside backticks; the dual and vitess lexings would mask a slip here.
+func TestTokenizeMySQL(t *testing.T) {
+	for _, backslash := range []bool{true, false} {
+		toks := tokenize("SELECT t\u00fcinsert, `a\\` FROM t", backslash)
+		want := []token{{tWord, "SELECT"}, {tWord, "T\u00dcINSERT"}, {tPunct, ","},
+			{tIdent, "a\\"}, {tWord, "FROM"}, {tWord, "T"}}
+		if len(toks) != len(want) {
+			t.Fatalf("tokenize(backslash=%v) = %v, want %v", backslash, toks, want)
+		}
+		for i := range want {
+			if toks[i] != want[i] {
+				t.Errorf("tokenize(backslash=%v)[%d] = %v, want %v", backslash, i, toks[i], want[i])
+			}
+		}
+	}
+}
+
 func TestIsWrite(t *testing.T) {
 	writes := []string{
 		"INSERT INTO issues VALUES (?)",
@@ -70,6 +88,22 @@ func TestIsWrite(t *testing.T) {
 		"SELECT 1--1; INSERT INTO t VALUES (1)",           // --1 is not a comment
 		"SELECT /*+ SET_VAR(x=1) */ 1; DELETE FROM t",
 		"INSERTED", "UPDATES", "DELETED_AT", ";;;x", "?",
+		// The round-4 review's live probes: Dolt's vitess tokenizer lexes
+		// these differently from MySQL, and each hid a DELETE in server mode.
+		"SELECT 1; /*M! DELETE FROM t */",               // (a) MariaDB executable comment
+		"SELECT 1 /*! , 1 # */ ; DELETE FROM t",         // (b) /*! ends at the first */
+		"SELECT 1 --x '\n; DELETE FROM t",               // (c) any -- is a comment
+		"SELECT 1 // '\n; DELETE FROM t",                // (d) // is a comment
+		"SELECT 1 /*+ ' */ ; DELETE FROM t; SELECT 'x'", // (e) /*+ is a plain comment
+		"SELECT /*+ ; DELETE FROM t; */ 1",              // ...but MySQL reads it as SQL
+		"/* unterminated",                               // vitess cannot lex it
+		"START REPLICA", "START SLAVE", "RELEASE x", "RELEASE_LOCK('x')",
+		"SET @@persist_only.x = 1",
+		// DOLT_CHECKOUT of a literal outside bd's branches may name a table.
+		"CALL DOLT_CHECKOUT('probe')", "call dolt_checkout(\"feature/x\")",
+		"CALL DOLT_CHECKOUT('o''brien')", "CALL DOLT_CHECKOUT('Main')",
+		"call dolt_checkout(\"main\")", // under ANSI_QUOTES, an identifier
+		"// only a comment",            // MySQL does not take // as a comment
 	}
 	for _, q := range writes {
 		if !IsWrite(q) {
@@ -82,15 +116,16 @@ func TestIsWrite(t *testing.T) {
 		"SET @v = 'GLOBAL'", "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
 		"USE beads", "START TRANSACTION", "BEGIN", "COMMIT", "ROLLBACK",
 		"SAVEPOINT s", "RELEASE SAVEPOINT s", "ROLLBACK TO SAVEPOINT s",
-		"CALL DOLT_CHECKOUT('main')", "call dolt_checkout(\"feature/x\")",
-		"CALL DOLT_CHECKOUT('o''brien')",
+		"CALL DOLT_CHECKOUT('main')",
+		"CALL DOLT_CHECKOUT('flatten-tmp')", "CALL DOLT_CHECKOUT('compact-tmp')",
 		"WITH x AS (SELECT 1) SELECT * FROM x", "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
 		"EXPLAIN UPDATE t SET x = 1", "EXPLAIN SELECT 1", "DESCRIBE t", "DESC t",
 		"EXPLAIN ANALYZE SELECT * FROM t",
 		"SELECT * FROM t WHERE id = ? FOR UPDATE", "SELECT 'INSERT INTO t'", "SELECT `delete` FROM t",
 		"(SELECT 1) UNION (SELECT 2)", "TABLE t", "VALUES ROW(1)", "HELP 'x'",
 		"SELECT * FROM dolt_diff('HEAD~1', 'HEAD', 'issues')",
-		"", "   ", ";", "SELECT 1;", "SELECT 1; SELECT 2", "/* unterminated", "-- only a comment",
+		"", "   ", ";", "SELECT 1;", "SELECT 1; SELECT 2", "-- only a comment",
+		"SELECT `into` FROM t", "SELECT \"x\" FROM t", "SELECT 1 /*M! , 2 */",
 		"/*! SELECT 1 */", "/*!40000 SET NAMES utf8mb4 */",
 		"/*!32312 CREATE DATABASE IF NOT EXISTS op */", // mysqldump's form
 		"CREATE DATABASE IF NOT EXISTS `op`", "create schema /* c */ if not exists op",

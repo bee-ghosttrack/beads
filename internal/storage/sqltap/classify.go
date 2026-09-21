@@ -2,7 +2,10 @@ package sqltap
 
 import (
 	"database/sql/driver"
+	"fmt"
 	"strings"
+
+	"github.com/dolthub/vitess/go/vt/sqlparser"
 )
 
 // IsWrite reports whether query may mutate stored state. It is IsWriteArgs
@@ -24,29 +27,82 @@ func IsWrite(query string) bool { return IsWriteArgs(query, nil) }
 //   - transaction control: BEGIN, START TRANSACTION, COMMIT, ROLLBACK,
 //     SAVEPOINT, RELEASE SAVEPOINT;
 //   - CREATE DATABASE|SCHEMA IF NOT EXISTS <name>, which every store open
-//     sends and which creates nothing once the database exists;
-//   - CALL DOLT_CHECKOUT with exactly one argument that is not a flag: a
-//     session branch switch. Dolt gives a table name the same syntax (it
-//     resets that table's working set), which this cannot tell apart; bd
-//     only ever passes a branch.
+//     sends and which creates nothing once the database exists. A first
+//     create goes unlogged: the client cannot tell it from the no-op, and
+//     bd init's create already runs inside a logged write command;
+//   - CALL DOLT_CHECKOUT(<branch>): a session branch switch, where <branch>
+//     is one of bd's literal branches (main, flatten-tmp, compact-tmp) or a
+//     ? bound to a non-flag string. Dolt gives a table name the same syntax
+//     (it resets that table's working set); a literal outside the list is
+//     therefore a write, and a bound value is trusted to be a branch, as bd
+//     only ever binds one.
 //
-// Anything else, including any statement this cannot parse, is a write. The
-// comment forms MySQL executes — /*! ... */ and /*+ ... */ — are read as SQL,
-// not skipped. The query is lexed both with and without backslash escapes in
-// quoted text, and a write under either counts.
+// Anything else, including any statement this cannot parse, is a write.
+//
+// The query is lexed several ways and a write under ANY of them counts. Dolt
+// splits and parses with its vitess tokenizer, which differs from MySQL's on
+// comments (it executes MariaDB /*M! ... */, ends /*! at the first */ even
+// after a #, takes any -- and // as a line comment, and skips /*+ ... */), so
+// the query is lexed by vitess itself, with and without ANSI_QUOTES; a vitess
+// lex error is a write. It is also lexed MySQL's way — /*! and /*+ bodies
+// read as SQL — with and without backslash escapes in quoted text.
 func IsWriteArgs(query string, args []driver.NamedValue) bool {
-	// Whether a backslash escapes a quote depends on the session's sql_mode
-	// (NO_BACKSLASH_ESCAPES), which the client cannot see; the two lexings can
-	// draw different statement boundaries, so either one finding a write is
-	// enough.
-	for _, backslash := range []bool{true, false} {
-		for _, stmt := range splitStatements(tokenize(query, backslash)) {
+	// Whether a backslash escapes a quote, or a double quote starts a string,
+	// depends on the session's sql_mode (NO_BACKSLASH_ESCAPES, ANSI_QUOTES),
+	// which the client cannot see; the lexings can draw different statement
+	// boundaries, so any one of them finding a write is enough.
+	lexings := [][]token{tokenize(query, true), tokenize(query, false)}
+	for _, ansi := range []bool{false, true} {
+		toks, ok := vitessTokenize(query, ansi)
+		if !ok {
+			return true
+		}
+		lexings = append(lexings, toks)
+	}
+	for _, toks := range lexings {
+		for _, stmt := range splitStatements(toks) {
 			if !isRead(stmt, args) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// vitessTokenize lexes query with the tokenizer Dolt's server and embedded
+// driver split and parse with, mapped onto this file's tokens. ok is false
+// when vitess cannot lex the query.
+func vitessTokenize(query string, ansiQuotes bool) (toks []token, ok bool) {
+	tkn := sqlparser.NewStringTokenizer(query)
+	if ansiQuotes {
+		tkn = sqlparser.NewStringTokenizerForAnsiQuotes(query)
+	}
+	for {
+		typ, val := tkn.Scan()
+		switch {
+		case typ == 0:
+			return toks, tkn.LastError == nil
+		case typ == sqlparser.LEX_ERROR:
+			return nil, false
+		case typ == sqlparser.COMMENT:
+		case typ == sqlparser.STRING:
+			toks = append(toks, token{tString, string(val)})
+		case typ == sqlparser.VALUE_ARG && strings.HasPrefix(string(val), ":v"):
+			toks = append(toks, token{tPunct, "?"}) // a ? placeholder, renamed :vN
+		case typ < 256:
+			toks = append(toks, token{tPunct, string(rune(typ))})
+		case typ == sqlparser.ID && mutatingKeywords[strings.ToUpper(string(val))]:
+			// vitess returns an unquoted keyword as its keyword token, so an
+			// identifier spelled like one was quoted: `delete`.
+			toks = append(toks, token{tIdent, string(val)})
+		case val != nil:
+			// A keyword, identifier (quoted or not), number or variable.
+			toks = append(toks, token{tWord, strings.ToUpper(string(val))})
+		default:
+			// A multi-byte operator: never a statement boundary or keyword.
+			toks = append(toks, token{tPunct, fmt.Sprintf("op%d", typ)})
+		}
+	}
 }
 
 type tokKind int
@@ -274,8 +330,11 @@ func isEnsureDatabase(rest []token) bool {
 	return rest[4].kind == tWord || rest[4].kind == tIdent
 }
 
+// bdBranches are the branch names bd passes to DOLT_CHECKOUT as literals.
+var bdBranches = map[string]bool{"main": true, "flatten-tmp": true, "compact-tmp": true}
+
 // isBranchSwitch reports whether rest (what follows CALL) is
-// DOLT_CHECKOUT(<one non-flag argument>). A ? placeholder is resolved from
+// DOLT_CHECKOUT(<one of bdBranches>) or DOLT_CHECKOUT(<? bound to a non-flag>). A ? placeholder is resolved from
 // args; unresolvable, it counts as a write.
 func isBranchSwitch(rest []token, args []driver.NamedValue) bool {
 	if len(rest) != 4 || rest[0].kind != tWord || rest[0].text != "DOLT_CHECKOUT" ||
@@ -285,7 +344,7 @@ func isBranchSwitch(rest []token, args []driver.NamedValue) bool {
 	arg := rest[2]
 	switch {
 	case arg.kind == tString:
-		return arg.text != "" && !strings.HasPrefix(arg.text, "-")
+		return bdBranches[arg.text]
 	case isPunct(arg, "?"):
 		if len(args) != 1 {
 			return false
