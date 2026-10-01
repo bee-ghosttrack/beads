@@ -1061,7 +1061,7 @@ func TestCheckGitignore_VariousStatuses(t *testing.T) {
 				// Don't create .beads directory
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd init (safe to re-run) or bd doctor --fix",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning when .beads directory doesn't exist",
 		},
 		{
@@ -1073,7 +1073,7 @@ func TestCheckGitignore_VariousStatuses(t *testing.T) {
 				}
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd init (safe to re-run) or bd doctor --fix",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning when .gitignore doesn't exist",
 		},
 		{
@@ -1109,7 +1109,7 @@ daemon.log
 				}
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd doctor --fix or bd init (safe to re-run)",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning when missing required patterns like dolt/ and redirect",
 		},
 		{
@@ -1128,7 +1128,7 @@ daemon.log
 				}
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd doctor --fix or bd init (safe to re-run)",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning when missing multiple patterns",
 		},
 		{
@@ -1144,7 +1144,7 @@ daemon.log
 				}
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd doctor --fix or bd init (safe to re-run)",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning for empty file",
 		},
 		{
@@ -1164,7 +1164,7 @@ daemon.log
 				}
 			},
 			expectedStatus: StatusWarning,
-			expectedFix:    "Run: bd doctor --fix or bd init (safe to re-run)",
+			expectedFix:    "Run: bd doctor --fix",
 			description:    "returns warning for comments-only file",
 		},
 		{
@@ -3057,8 +3057,10 @@ func TestCheckGitignore_WarnsOnLoosePermsWhenPatternComplete(t *testing.T) {
 	if !strings.Contains(check.Detail, "0644") {
 		t.Errorf("Detail = %q, want the observed mode 0644", check.Detail)
 	}
-	if check.Fix == "" {
-		t.Error("expected a Fix suggestion for loose permissions")
+	// Pin the exact hint: re-running bd init is not a safe repair to suggest
+	// (be-5up5), and FixGitignore below is what actually restores the mode.
+	if check.Fix != "Run: bd doctor --fix" {
+		t.Errorf("Fix = %q, want %q", check.Fix, "Run: bd doctor --fix")
 	}
 
 	// After the fix runs, the check must go green.

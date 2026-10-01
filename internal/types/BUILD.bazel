@@ -19,6 +19,7 @@ go_test(
         "explain_test.go",
         "gated_test.go",
         "id_generator_test.go",
+        "issue_summary_test.go",
         "storage_class_test.go",
         "types_test.go",
     ],

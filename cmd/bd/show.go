@@ -193,7 +193,13 @@ var showCmd = &cobra.Command{
 			// so hoisting the read decorates the header and the meta block
 			// without a second query. Best effort, as it always was: a failed
 			// read renders the issue undecorated rather than not at all.
-			depsWithMeta, _ := issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
+			//
+			// Counts first — see readDepCounts for why the order matters. The
+			// listing's error is KEPT, not discarded: rendering stays best
+			// effort, but a FAILED listing and a SHORT one both leave the
+			// slice empty, and only the second is an unresolvable edge.
+			depCountsSnapshot := readDepCounts(ctx, issueStore, issue.ID)
+			depsWithMeta, depsErr := issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
 			gates := types.GatesHolding(issue, depsWithMeta)
 
 			if idx > 0 {
@@ -245,13 +251,23 @@ var showCmd = &cobra.Command{
 			}
 
 			// Show dependents - grouped by dependency type for clarity
-			dependentsWithMeta, _ := issueStore.GetDependentsWithMetadata(ctx, issue.ID) // Best effort: show issue even if dependents unavailable
+			dependentsWithMeta, dependentsErr := issueStore.GetDependentsWithMetadata(ctx, issue.ID) // Best effort: show issue even if dependents unavailable
 			for _, sec := range groupDepSections(dependentsWithMeta, false, relatedSeen) {
 				printDepSection(sec)
 				if sec.Type == types.DepParentChild && issue.IssueType == types.TypeEpic {
 					printEpicChildProgress(sec.Deps)
 				}
 			}
+
+			// Both listings above drop every edge whose far end has no row in
+			// this database, so a cross-repo or `external:` dependency renders
+			// as no dependency at all — indistinguishable from having none
+			// (be-lpi). --json says so in unresolvable_dependencies; say it
+			// here too, or `bd dep add x liveop-y` reports success and then
+			// `bd show x` shows nothing.
+			warnUnresolvableDepEdges(issue.ID, depCountsSnapshot,
+				depListing{rows: len(depsWithMeta), err: depsErr},
+				depListing{rows: len(dependentsWithMeta), err: dependentsErr})
 
 			printRelatedSection(relatedSeen)
 

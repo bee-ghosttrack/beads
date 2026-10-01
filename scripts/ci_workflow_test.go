@@ -253,6 +253,47 @@ func TestPRWorkflowExercisesNativeUserConfigDiagnostics(t *testing.T) {
 	}
 }
 
+func TestPRWorkflowRequiresNativeInitGatewayCredential(t *testing.T) {
+	const (
+		jobName     = "pr-preflight-platforms"
+		stepCommand = `bash scripts/ci/test-init-gateway-credential.sh "$RUNNER_OS"`
+		gateKey     = "PR_PREFLIGHT_PLATFORMS"
+	)
+
+	workflow := readCIWorkflow(t, "pr.yml")
+	job := workflow.job(t, jobName)
+	if job.RunsOn != "${{ matrix.os }}" || !equalStrings(job.Strategy.Matrix.OS, []string{"ubuntu-latest", "macos-latest", "windows-latest"}) {
+		t.Errorf("credential shell boundary requires the native three-host matrix: runner=%q matrix=%v", job.RunsOn, job.Strategy.Matrix.OS)
+	}
+	if job.If != "" || job.ContinueOnError {
+		t.Errorf("credential process job is bypassable: if=%q continue-on-error=%v", job.If, job.ContinueOnError)
+	}
+	matchingSteps := 0
+	for _, step := range job.Steps {
+		if strings.TrimSpace(step.Run) != stepCommand {
+			continue
+		}
+		matchingSteps++
+		if step.Shell != "bash" || step.Env["RUNNER_OS"] != "" {
+			t.Errorf("credential driver needs Bash and the native runner OS: shell=%q env=%v", step.Shell, step.Env)
+		}
+		if step.If != "" || (step.ContinueOnError != nil && step.ContinueOnError != false) {
+			t.Errorf("gateway credential step is bypassable: if=%q continue-on-error=%v", step.If, step.ContinueOnError)
+		}
+	}
+	if matchingSteps != 1 {
+		t.Fatalf("native preflight job has %d gateway credential commands, want 1", matchingSteps)
+	}
+
+	gate := workflow.job(t, "ci-gate")
+	gateEnv := gate.step(t, "Evaluate CI gate").Env
+	if !contains(gate.Needs, jobName) || gateEnv[gateKey] != "${{ needs.pr-preflight-platforms.result }}" ||
+		!contains(strings.Fields(gateEnv["CI_GATE_REQUIRED"]), gateKey) {
+		t.Errorf("ci-gate does not require the native credential process lane: needs=%v %s=%q required=%q",
+			gate.Needs, gateKey, gateEnv[gateKey], gateEnv["CI_GATE_REQUIRED"])
+	}
+}
+
 func TestPRWorkflowExercisesWindowsBenchmarkEnvScrubbing(t *testing.T) {
 	workflow := readCIWorkflow(t, "pr.yml")
 	job := workflow.job(t, "pr-preflight-platforms")
@@ -616,6 +657,65 @@ func TestMacOSTestJobsReuseWorkspaceBDBinary(t *testing.T) {
 	}
 }
 
+// TestDoltTestcontainerStepsDisableRyuk pins TESTCONTAINERS_RYUK_DISABLED on
+// the four steps enumerated in the table below — the two Dolt-backed steps of
+// the test-domain-uow job, in pr.yml and main.yml. It is an allow-list of
+// literal (workflow, job, step) triples, so it catches an un-pinning
+// regression on those four steps only; it does not detect the class, and a
+// newly added container-starting step passes it unpinned.
+//
+// Why the pin: testcontainers-go shares one Ryuk reaper per host; when a step
+// runs several container-starting packages as concurrent test binaries (plain
+// "go test" parallelizes across packages), they race to attach to that shared
+// reaper, and a failed handshake from one process reaps a sibling's live
+// container mid-suite (be-2on). A GitHub Actions runner is destroyed after the
+// job, so the reaper buys nothing there and only costs this race.
+//
+// The scope is the job, not a per-step predicate: "Test domain + uow +
+// tracker" runs three container-starting package trees in one invocation and
+// is the step the race is concrete on, while "Test doctor/fix" runs the single
+// ./cmd/bd/doctor/fix/ package and is pinned for consistency inside the same
+// job rather than because it has an in-step sibling.
+//
+// Left unpinned, deliberately. A step can only start a Dolt container if its
+// job pre-caches the image via scripts/ci/pull-dolt-image.sh: checkDolt in
+// internal/testutil gates on `docker image inspect` and never auto-pulls. The
+// other jobs that do pull it are pr.yml/contract-corpus,
+// main.yml/test-proxied-cmd, pr-risk.yml/test-proxied-cmd,
+// pr-risk.yml/test-server-storage and -full, regression.yml/regression, and
+// bazel.yml's --config=docker lane. They are out of scope for this change, not
+// immune: no reap has been attributed to them, and the docker lane would
+// additionally need --test_env=TESTCONTAINERS_RYUK_DISABLED=true because bazel
+// does not forward ambient environment into tests. Extending the pin — and
+// teaching this guard to scan for the class, the way assertGoCacheWriter below
+// walks every job and step — is follow-up work on be-2on.
+//
+// Steps that run under BEADS_TEST_SKIP=dolt (pr-core.sh's hermetic wrapper,
+// the sharded main-linux-integration-* jobs) never start a container at all
+// and are correctly excluded: internal/testutil's readiness check treats
+// BEADS_TEST_SKIP=dolt as an explicit opt-out before it ever reaches Docker.
+func TestDoltTestcontainerStepsDisableRyuk(t *testing.T) {
+	type doltContainerStep struct {
+		workflow string
+		job      string
+		step     string
+	}
+
+	steps := []doltContainerStep{
+		{"pr.yml", "test-domain-uow", "Test domain + uow + tracker"},
+		{"pr.yml", "test-domain-uow", "Test doctor/fix (Dolt-backed, hard-require container)"},
+		{"main.yml", "test-domain-uow", "Test domain + uow + tracker"},
+		{"main.yml", "test-domain-uow", "Test doctor/fix (Dolt-backed, hard-require container)"},
+	}
+
+	for _, tc := range steps {
+		t.Run(tc.workflow+"/"+tc.job+"/"+tc.step, func(t *testing.T) {
+			job := readCIWorkflow(t, tc.workflow).job(t, tc.job)
+			assertStepEnvValue(t, job, tc.step, "TESTCONTAINERS_RYUK_DISABLED", "true")
+		})
+	}
+}
+
 func TestPRPreflightPlatformsRunsTestScriptPrebuiltBinaryContract(t *testing.T) {
 	workflow := readCIWorkflow(t, "pr.yml")
 	job := workflow.job(t, "pr-preflight-platforms")
@@ -698,9 +798,12 @@ func TestRepositoryTextEOLPolicyWorkflow(t *testing.T) {
 	}
 
 	docStep := job.step(t, "Exercise native date and Bash process boundary")
-	const wantDocCommand = "go test '-tags=integration,gms_pure_go' -count=1 -run '^TestDocFreshness' ./scripts"
+	const (
+		requiredSuiteSelector = "-required-suite=doc-freshness"
+		wantDocCommand        = "go test '-tags=integration,gms_pure_go' -count=1 -run '^(TestDocFreshness.*|TestRequiredSuiteContract)$' ./scripts -args " + requiredSuiteSelector
+	)
 	if docStep.Run != wantDocCommand {
-		t.Errorf("doc-freshness command = %q, want exact original %q", docStep.Run, wantDocCommand)
+		t.Errorf("doc-freshness command = %q, want required-suite execution %q", docStep.Run, wantDocCommand)
 	}
 
 	eolStep := job.step(t, "Exercise repository text EOL policy boundary")
@@ -1704,23 +1807,31 @@ var bazelLaneGateIDs = map[string]string{
 	// pr-risk.yml's legacy jobs, like the embedded tier's).
 	bazelProxiedJobName: "BAZEL_PROXIED",
 	bazelServerJobName:  "BAZEL_SERVER_STORAGE",
+	// main.yml's integration jobs, required on same-repo PRs although their
+	// legacy twins run only on push to main. Remote-only: fork and
+	// Dependabot PRs skip it until the farm has a read-only cache for them
+	// (then it becomes local-capable for forks, here and in bazel-gate.sh).
+	bazelIntegJobName: "BAZEL_INTEGRATION",
 }
 
-var bazelAdvisoryLanes = map[string]string{
-	bazelIntegJobName: "its legacy counterparts, main.yml's integration jobs, run only on push to main",
-}
+// None today: every lane is gated. Kept so a future lane that pr.yml's call
+// turns off has a place to record why.
+var bazelAdvisoryLanes = map[string]string{}
 
-// bazel-integration's if: remote only, and off when the caller passes
-// integration: "off" (pr.yml). A string input: on push and dispatch it is
-// null, and null != 'off', so the lane keeps running on main.
+// bazel-integration's if: remote only, and off when a caller passes
+// integration: "off" (pr.yml and bazel-farm.yml pass "on"). A string input:
+// on push and dispatch it is null, and null != 'off', so the lane keeps
+// running on main.
 const bazelIntegIf = "${{ needs.rbe.outputs.enabled == 'true' && inputs.integration != 'off' }}"
 
 // pr.yml's call of bazel.yml: exactly these inputs (review D1 v2 N3). An rbe
 // override would put every PR in local mode and ungate the embedded tier
-// while the gate stays self-consistent.
+// while the gate stays self-consistent; integration: "off" would drop the
+// required integration lane (explicit "on", so the pin and the gate
+// simulation, which reads these inputs, do not depend on the default).
 var bazelPRCallWith = map[string]string{
 	"build-artifact-name": "bazel-ci-build-artifacts",
-	"integration":         "off",
+	"integration":         "on",
 }
 
 // The call's aggregate result (needs.bazel.result, through bazel-gate.sh).
@@ -2218,9 +2329,10 @@ func runPRGateStep(t *testing.T, step ciWorkflowStep, sc bazelGateScenario) (boo
 // The gate over every execution mode (review D1 F3): the skip script allows
 // exactly the skips the lanes' own `if:`s produce in that mode, and for every
 // lane that should run, that lane alone skipped, failed or cancelled turns
-// pr.yml's actual gate step red, whatever the aggregate says. The advisory
-// integration lane's failure alone keeps it green; a missing or inconsistent
-// mode, or an aggregate failure no lane explains, turns it red.
+// pr.yml's actual gate step red, whatever the aggregate says (in mode remote
+// that includes the integration lane, which skips green in mode local); a
+// missing or inconsistent mode, or an aggregate failure no lane explains,
+// turns it red.
 func TestBazelGateSimulation(t *testing.T) {
 	requireHostTool(t, "bash")
 	root := sourceRepoRoot(t)
@@ -2962,12 +3074,32 @@ func bazelRuleBlock(build, name string) string {
 func TestBazelIntegrationJob(t *testing.T) {
 	workflow := readCIWorkflow(t, bazelWorkflowName)
 	job := workflow.job(t, bazelIntegJobName)
-	if job.TimeoutMinutes > 45 {
-		t.Errorf("%s timeout-minutes = %d; it runs remotely only, keep it near the step's 30", bazelIntegJobName, job.TimeoutMinutes)
-	}
 	test := job.step(t, "bazel test //... --config=integration")
-	if test.TimeoutMinutes == 0 || test.TimeoutMinutes >= job.TimeoutMinutes {
-		t.Errorf("%s test step timeout-minutes = %d, want set and below the job's %d", bazelIntegJobName, test.TimeoutMinutes, job.TimeoutMinutes)
+	// A required PR lane: the step must fit a cold compile (the first
+	// GitHub run took 17 minutes end to end) followed by the longest test
+	// action, which .bazelrc caps at its test:integration --test_timeout
+	// (rbe-west's 1200s limit). The job adds setup and log upload, but
+	// stays remote-only short.
+	const coldCompileMinutes = 20
+	actionCapMinutes := 0
+	for line := range bazelrcLines(t) {
+		if v, ok := strings.CutPrefix(line, "test:integration --test_timeout="); ok {
+			secs, err := strconv.Atoi(v)
+			if err != nil || secs <= 0 || secs > 1200 {
+				t.Fatalf(".bazelrc test:integration --test_timeout=%s, want one value of at most 1200 (rbe-west's cap)", v)
+			}
+			actionCapMinutes = (secs + 59) / 60
+		}
+	}
+	if actionCapMinutes == 0 {
+		t.Fatal(".bazelrc has no test:integration --test_timeout")
+	}
+	if want := coldCompileMinutes + actionCapMinutes; test.TimeoutMinutes < want {
+		t.Errorf("%s test step timeout-minutes = %d, want at least %d (cold compile %d + action cap %d)",
+			bazelIntegJobName, test.TimeoutMinutes, want, coldCompileMinutes, actionCapMinutes)
+	}
+	if job.TimeoutMinutes <= test.TimeoutMinutes || job.TimeoutMinutes > test.TimeoutMinutes+15 {
+		t.Errorf("%s timeout-minutes = %d, want above the test step's %d by at most 15", bazelIntegJobName, job.TimeoutMinutes, test.TimeoutMinutes)
 	}
 	cmd := regexp.MustCompile(`\s*\\\n\s*`).ReplaceAllString(test.Run, " ")
 	const wantCmd = `bazel test //... --config=integration --build_event_json_file="$RUNNER_TEMP/bazel-bep.json" 2>&1 | tee "$RUNNER_TEMP/bazel-test.log" || rc=$?`
@@ -3110,7 +3242,7 @@ func TestBazelDoltServerTiersMirrorPRRisk(t *testing.T) {
 	// is not race: bd_proxied_test (race, like PR Risk's) is the stricter of
 	// the two. Pinned so a change there is a decision, not drift.
 	mainYML := readCIWorkflow(t, "main.yml")
-	if run := mainYML.job(t, "build-artifacts").step(t, "Build reusable Linux artifacts").Run; !strings.Contains(run, `go test -tags "$BEADS_BUILD_TAGS" -c -o artifacts/bd-cmd-test ./cmd/bd`+"\n") {
+	if run := mainYML.job(t, "build-artifacts").step(t, "Build reusable Linux artifacts").Run; !strings.Contains(run, `go test -tags gms_pure_go -c -o artifacts/bd-cmd-test ./cmd/bd`+"\n") {
 		t.Errorf("main.yml build-artifacts no longer builds the non-race bd-cmd-test this tier is documented against (.bazelrc, cmd/bd:bd_proxied_test):\n%s", run)
 	}
 	if got := mainYML.job(t, "test-proxied-cmd").step(t, "Test proxied-server cmd shard").Env["BEADS_TEST_CMD_BINARY"]; got != "${{ github.workspace }}/ci-build-artifacts/bd-cmd-test" {
@@ -3227,7 +3359,7 @@ func TestBazelDoltServerTiersMirrorPRRisk(t *testing.T) {
 	// pr.yml's gate requires it: bazelLaneGateIDs): not a step of
 	// bazel-doltserver (which also runs locally, and whose job a gate may
 	// require) or of bazel-integration (which a caller may switch off,
-	// although the server tier is a PR-time tier).
+	// while the server tier always runs remotely).
 	workflow := readCIWorkflow(t, bazelWorkflowName)
 	for _, c := range []struct{ job, config, logs string }{
 		{bazelProxiedJobName, "doltserver-proxied", "bazel-proxied-testlogs"},
