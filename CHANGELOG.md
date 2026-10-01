@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`BEADS_DOLT_POOL_READ_TIMEOUT` / `dolt.pool-read-timeout` (and the write
+  twins) now apply to every `bd` command in server mode.** The knobs shipped in
+  #5089, but their env/config ladder ran only for callers of `NewFromConfig*`;
+  the CLI's own store open hand-builds its config and goes straight to `New`,
+  so every `bd` command kept the built-in 10 s pool
+  deadline whatever the knob said — on a large shared server that is what made
+  `bd close` of a bead with dependents die in its recompute with `i/o timeout`
+  and no relief valve. The ladder now runs from the constructor every DoltStore
+  open shares — the CLI's store and library callers of
+  `New`/`NewFromConfig*`; `bd serve`'s HTTP data path builds its own
+  DSN without pool deadlines and is unchanged
+  ([#6144](https://github.com/gastownhall/beads/issues/6144)). Note for
+  operators of loaded servers: the documented precedence now reaches `bd
+  import` as well — it used to inherit the 5 m long-read fallback
+  unconditionally because the CLI's knob value was always 0, so a
+  `BEADS_DOLT_POOL_READ_TIMEOUT` set below that now bounds import too; size the
+  knob for your largest import, or leave it unset for the fallback.
+
+- **No-DB commands in a redirected workspace no longer lose the source
+  repo's `dolt_database`** (be-xil, be-fyt). `bd doctor`, `bootstrap`,
+  `context`, `dolt`, `init` and `version` skip store init, and the beads dir
+  they select is resolved through `beads.FindBeadsDir()`, which follows a
+  `.beads/redirect` internally. The source repo's configured database name was
+  therefore gone before anything could capture it, so `bd doctor` fell through
+  to the shared target directory's own default database and reported
+  `Dolt Schema: wrong database` — offering a `--fix` that would have repointed
+  the rig at an unrelated rig's store. The redirect source is now captured
+  before that resolution, matching the store-requiring path.
+- **An explicit `--db`, `BEADS_DB` or `BD_DB` target is no longer shadowed by
+  the ambient repo's redirect-source database** (be-fyt). `beads.GetRedirectInfo()`
+  deliberately resolves from the CWD repo's local `.beads` regardless of
+  `--db`/`BEADS_DIR` (bd-wayc3), so when the ambient repo itself had an active
+  redirect, the preservation above re-opened the same "wrong database" failure
+  through a narrower door. Preservation is now skipped whenever the caller
+  named an explicit target, asking the same question `selectedNoDBBeadsDir`
+  asks so the two cannot drift apart. Note that a `--db` value naming a
+  *database* rather than a path is not an explicit *directory* target: it is
+  consumed only on the store-requiring path, the ambient workspace is still
+  what gets selected, and its source database is still preserved.
+
+- **An ambient `BEADS_DOLT_SERVER_PORT` now marks a workspace externally
+  managed — suppressing auto-start — and no longer stops bd reaping its own
+  orphaned server**
+  ([#5934](https://github.com/gastownhall/beads/pull/5934)). Setting
+  `BEADS_DOLT_SERVER_PORT` (or the legacy `BEADS_DOLT_PORT`) now makes
+  `ResolveServerMode` classify a workspace as an externally-managed server, so
+  bd stops trying to own a lifecycle it does not own. The stale-server cleanup
+  path is deliberately carved out of that rule: it keeps resolving the mode
+  without the port var, so bd still reaps a same-repo orphan it started
+  (GH#2430) instead of declining because the environment named a port. A
+  `proxied-server` workspace is exempt from the new rule entirely — it reaches
+  its server through the proxy, so an ambient port does not describe its
+  lifecycle.
+
 - **`bd doctor` no longer flags a `.local_version` that starts with `v`.** The
   canonical spelling of a Go module version — and the string a build stamped
   from a Go pseudo-version reports and writes into `.local_version` itself —
@@ -467,6 +521,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial, and the count alone cannot tell the two apart.
 
 
+- **`PATCH /v0/beads/issues/{id}` accepts `claim: true`**, the wire spelling of
+  `bd update <id> --claim`. It passes through to the same lifecycle role the
+  direct route uses (`issueops.UpdateRequest.Claim`), so the claim and the
+  patch land in one transaction with the direct route's semantics: a
+  same-actor re-claim is idempotent (`changed: false`), a foreign holder is
+  409 `already_claimed` and an unclaimable status 409 `not_claimable` — both
+  naming `claim` and carrying `{id}:claim`'s `assignee` / `issue_status`
+  members — and a refused claim writes none of the patch. With `claim: true`
+  the `patch` may be empty. `claim` beside `expected_assignee`,
+  `expected_status` or `force_assignee_transfer` is a 400. A server that
+  predates the member refuses it as `unknown_parameter` before any database
+  work, so an HTTP client can forward `bd update --claim` instead of refusing
+  it, and can never mistake an older server for one that dropped the claim.
+
 ### Fixed
 
 - **`bd show` counts a wisp's comments instead of reporting `comment_count: 0`**
@@ -610,6 +678,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `blocks` is no longer purged (reported as `live_dependent_skipped`), so a
   purge that used to delete a closed molecule root under a live step now
   leaves it. See the `--wisps-plane` entry under Added.
+
+- **`bd status` now discloses the counted rows a default `bd list` will not
+  show.** `Total Issues` counts the database; `bd list` shows a filtered view of
+  it, and the two disagreed silently — an operator reconciling a total against
+  a listing found rows they could not account for. A new line names the
+  breakdown and the flags that reveal each part: `Not shown by bd list: 2 gates
+  (--include-gates --all), 1 template (--include-templates --all)`, omitted
+  entirely when there is nothing to disclose. The counts describe the database,
+  every status included, which is why the remedy names `--all` beside the type
+  flag: the default listing hides closed rows independently of what a row is,
+  so a closed gate is counted here and the type flag alone would not show it.
+  `gate_issues` and `template_issues` join the `--json` payload and the OpenAPI
+  `Statistics` schema, additively; they are broken out of `TotalIssues` rather
+  than removed from it, so the buckets still do not sum to the total in either
+  direction. `bd status --assigned` gets the same breakdown, which it needs for
+  the same reason against `bd list --assignee`. Not yet covered: durable rows
+  carrying a configured infra type (GH#6439), which need the workspace's
+  `types.infra` set that the portable count has no seam to read.
 
 - **Proxied-server refusals now say *why* they refuse.** The JSON a refused
   command prints gains a `reason` field next to the existing `code`, `error`
