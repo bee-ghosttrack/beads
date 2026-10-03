@@ -38,8 +38,9 @@ var advisoryPathFilteredWorkflows = []string{
 }
 
 // advisoryPathFilterBase is the shared prefix of the allowlist: any non-test
-// Go change or build input. It must appear, in this order, at the start of
-// each of advisoryPathFilteredWorkflows' pull_request.paths list.
+// Go change, build input, or embedded schema migration. It must appear, in
+// this order, at the start of each of advisoryPathFilteredWorkflows'
+// pull_request.paths list.
 var advisoryPathFilterBase = []string{
 	"**.go",
 	"!**_test.go",
@@ -47,6 +48,10 @@ var advisoryPathFilterBase = []string{
 	"go.sum",
 	"Makefile",
 	".buildflags",
+	// The .up.sql files are go:embed'd by internal/storage/schema, so they
+	// change upgrade behavior without matching "**.go"; a migration that
+	// ships with only a _test.go beside it would otherwise skip all three.
+	"internal/storage/schema/migrations/**",
 }
 
 // advisoryPathFilterOwnEntries is each workflow's own file/script additions,

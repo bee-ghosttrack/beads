@@ -22,6 +22,9 @@ on:
       - 'go.sum'
       - 'Makefile'
       - '.buildflags'
+      # Embedded into the binary (go:embed in internal/storage/schema), so a
+      # migration-only change is an upgrade-relevant code change.
+      - 'internal/storage/schema/migrations/**'
       - '.github/workflows/cross-version-smoke.yml'
       - 'scripts/upgrade-smoke-test.sh'
 

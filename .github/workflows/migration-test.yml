@@ -13,6 +13,9 @@ on:
       - 'go.sum'
       - 'Makefile'
       - '.buildflags'
+      # Embedded into the binary (go:embed in internal/storage/schema), so a
+      # migration-only change is an upgrade-relevant code change.
+      - 'internal/storage/schema/migrations/**'
       - '.github/workflows/migration-test.yml'
       - 'scripts/migration-test/**'
       - 'scripts/migrate-legacy-to-current.sh'
