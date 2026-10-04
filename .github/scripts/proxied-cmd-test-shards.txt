@@ -51,7 +51,7 @@
 #   a doc comment.
 
 15 1 TestProxiedServerBlocked
-15 1 TestProxiedServerClose3
+15 13 TestProxiedServerClose3
 15 1 TestProxiedServerCompactDolt
 15 1 TestProxiedServerCreate
 15 1 TestProxiedServerDep2
@@ -119,7 +119,7 @@
 
 15 7 TestProxiedServerAssign
 15 7 TestProxiedServerBackupRefusedOnExternalTopology
-15 7 TestProxiedServerClose4
+15 2 TestProxiedServerClose4
 15 7 TestProxiedServerCount
 15 7 TestProxiedServerGC
 15 7 TestProxiedServerList
