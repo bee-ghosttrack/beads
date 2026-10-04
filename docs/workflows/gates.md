@@ -45,11 +45,20 @@ write `24h`, not `1d`).
 GitHub gates use the current Git repository by default. To evaluate a PR or
 workflow run in another repository, set the gate's string `metadata.repo` value
 to `OWNER/REPO` or `HOST/OWNER/REPO`. An ad-hoc `gh:run`/`gh:pr` gate created
-with `bd gate create` inherits a valid `metadata.repo` value from the issue it
-blocks; `human`/`timer`/`bead` gates do not, since `metadata.repo` is
-unrelated, ordinary metadata for those types. `bd gate check` rejects
-malformed repository values instead of falling back to the current
-repository.
+with `bd gate create` takes that value from `--repo`, or, without the flag,
+inherits a valid `metadata.repo` value from the issue it blocks;
+`human`/`timer`/`bead` gates do neither (`--repo` is refused on them), since
+`metadata.repo` is unrelated, ordinary metadata for those types. `bd gate check`
+rejects malformed repository values instead of falling back to the current
+repository, and when a PR number does not resolve, the escalation names the
+repository it was looked up in. A gate for a PR in another repository whose
+blocked issue carries no `metadata.repo` needs `--repo`: without it the number
+is looked up in the current repository and escalates as not found on every
+check.
+
+```bash
+bd gate create --type=gh:pr --blocks bd-abc --await-id=42 --repo=owner/other-repo
+```
 
 ### Known limitations: multi-rig and proxied-server topologies
 

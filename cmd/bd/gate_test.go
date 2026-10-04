@@ -6,10 +6,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1156,4 +1158,134 @@ func gateIDs(gs []*types.Issue) []string {
 		ids = append(ids, g.ID)
 	}
 	return ids
+}
+
+func TestGateMetadataForCreateExplicitRepo(t *testing.T) {
+	inherited := &types.Issue{ID: "bd-target", Metadata: json.RawMessage(`{"repo":"acme/inherited"}`)}
+	decodeRepo := func(t *testing.T, metadata json.RawMessage) string {
+		t.Helper()
+		var decoded struct {
+			Repo string `json:"repo"`
+		}
+		if err := json.Unmarshal(metadata, &decoded); err != nil {
+			t.Fatalf("metadata %s is not valid JSON: %v", metadata, err)
+		}
+		return decoded.Repo
+	}
+
+	t.Run("explicit_repo_wins_over_inherited", func(t *testing.T) {
+		metadata, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:pr", repo: "gastownhall/beads"}, inherited)
+		if err != nil {
+			t.Fatalf("gateMetadataForCreate returned error: %v", err)
+		}
+		if got := decodeRepo(t, metadata); got != "gastownhall/beads" {
+			t.Fatalf("repo = %q, want gastownhall/beads (the flag, not the blocked issue's value)", got)
+		}
+	})
+
+	t.Run("no_flag_inherits", func(t *testing.T) {
+		metadata, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:run"}, inherited)
+		if err != nil {
+			t.Fatalf("gateMetadataForCreate returned error: %v", err)
+		}
+		if got := decodeRepo(t, metadata); got != "acme/inherited" {
+			t.Fatalf("repo = %q, want the inherited acme/inherited", got)
+		}
+	})
+
+	t.Run("no_flag_no_metadata_is_nil", func(t *testing.T) {
+		metadata, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:pr"}, &types.Issue{ID: "bd-plain"})
+		if err != nil {
+			t.Fatalf("gateMetadataForCreate returned error: %v", err)
+		}
+		if metadata != nil {
+			t.Fatalf("metadata = %s, want nil (current repository)", metadata)
+		}
+	})
+
+	t.Run("inherited_error_names_the_blocked_issue", func(t *testing.T) {
+		_, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:pr"}, &types.Issue{ID: "bd-bad", Metadata: json.RawMessage(`{"repo":"owner/repo;echo"}`)})
+		if err == nil {
+			t.Fatal("malformed inherited metadata.repo must fail closed")
+		}
+		if !strings.Contains(err.Error(), "invalid GitHub repository metadata on bd-bad") {
+			t.Fatalf("error %q does not name the blocked issue's metadata", err)
+		}
+	})
+
+	t.Run("invalid_explicit_repo_is_rejected", func(t *testing.T) {
+		for _, bad := range []string{"not-owner-slash-repo", "owner/repo;echo", "owner//repo", "https://github.com/owner/repo"} {
+			_, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:pr", repo: bad}, inherited)
+			if err == nil {
+				t.Errorf("--repo %q accepted, want validation error", bad)
+				continue
+			}
+			if !strings.Contains(err.Error(), "--repo") {
+				t.Errorf("error for --repo %q does not name the flag: %v", bad, err)
+			}
+		}
+	})
+
+	t.Run("host_form_is_accepted", func(t *testing.T) {
+		metadata, err := gateMetadataForCreate(gateCreateInput{gateType: "gh:run", repo: "ghe.example.com/acme/widgets"}, nil)
+		if err != nil {
+			t.Fatalf("HOST/OWNER/REPO rejected: %v", err)
+		}
+		if got := decodeRepo(t, metadata); got != "ghe.example.com/acme/widgets" {
+			t.Fatalf("repo = %q", got)
+		}
+	})
+
+	t.Run("non_github_type_refuses_the_flag", func(t *testing.T) {
+		for _, gateType := range []string{"human", "timer", "bead"} {
+			_, err := gateMetadataForCreate(gateCreateInput{gateType: gateType, repo: "acme/widgets"}, inherited)
+			if err == nil {
+				t.Errorf("--repo on a %s gate accepted, want refusal (nothing would read it)", gateType)
+				continue
+			}
+			if !strings.Contains(err.Error(), "--repo applies only to gh:run and gh:pr gates") {
+				t.Errorf("refusal for %s gate has the wrong text: %v", gateType, err)
+			}
+		}
+	})
+}
+
+func TestCheckGHPRNotFoundNamesTheRepository(t *testing.T) {
+	notFound := func(t *testing.T, wantArgs ...string) ghCommandRunner {
+		t.Helper()
+		return func(args ...string) ([]byte, []byte, error) {
+			if strings.Join(args, " ") != strings.Join(wantArgs, " ") {
+				t.Fatalf("gh args = %q, want %q", args, wantArgs)
+			}
+			return nil, []byte("GraphQL: Could not resolve to a PullRequest with the number of 7173. (repository.pullRequest)"), fmt.Errorf("exit status 1")
+		}
+	}
+
+	t.Run("cross_repo", func(t *testing.T) {
+		resolved, escalated, reason, err := checkGHPRWithRunner(&types.Issue{
+			IssueType: "gate", AwaitType: "gh:pr", AwaitID: "7173",
+			Metadata: json.RawMessage(`{"repo":"gastownhall/beads"}`),
+		}, notFound(t, "pr", "view", "7173", "--json", "state,title", "--repo", "gastownhall/beads"))
+		if err != nil {
+			t.Fatalf("checkGHPR returned error: %v", err)
+		}
+		if resolved || !escalated {
+			t.Fatalf("resolved, escalated = %v, %v; want false, true", resolved, escalated)
+		}
+		if reason != "pull request not found: #7173 in gastownhall/beads" {
+			t.Fatalf("reason = %q; it must name the repository the number was resolved against", reason)
+		}
+	})
+
+	t.Run("current_repo", func(t *testing.T) {
+		_, escalated, reason, err := checkGHPRWithRunner(&types.Issue{
+			IssueType: "gate", AwaitType: "gh:pr", AwaitID: "7173",
+		}, notFound(t, "pr", "view", "7173", "--json", "state,title"))
+		if err != nil || !escalated {
+			t.Fatalf("escalated, err = %v, %v; want true, nil", escalated, err)
+		}
+		if reason != "pull request not found: #7173 in the current repository" {
+			t.Fatalf("reason = %q", reason)
+		}
+	})
 }
