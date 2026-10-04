@@ -107,6 +107,7 @@
 15 5 TestProxiedServerWispCreate
 
 15 6 TestProxiedServerClose2
+15 6 TestProxiedServerClose3
 15 6 TestProxiedServerContext
 15 6 TestProxiedServerExternalCreate
 15 6 TestProxiedServerLink
@@ -359,6 +360,7 @@
 30 16 TestProxiedServerUpdateConcurrentMetadata
 
 30 17 TestProxiedServerClose
+30 17 TestProxiedServerClose3
 30 17 TestProxiedServerConfigConcurrent
 30 17 TestProxiedServerDeleteConcurrent
 30 17 TestProxiedServerSearch

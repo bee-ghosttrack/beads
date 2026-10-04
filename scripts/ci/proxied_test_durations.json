@@ -56,7 +56,13 @@
     "single sweep's value: local --config=doltserver-proxied runs measured it at",
     "55-79 s alone, 60-70 s inside its shard, and a reviewer's 68-109 s under load;",
     "80 s is a rounded middle of that spread. seconds_per_init_fallback was",
-    "recomputed to include it."
+    "recomputed to include it.",
+    "",
+    "TestProxiedServerClose / TestProxiedServerClose3 (gastownhall/beads#7151): the",
+    "174.6s capture above was taken for the undivided TestProxiedServerClose (23",
+    "bd-init subtests). The suite was then split after close_nonexistent_id, so the",
+    "two entries hold that one capture apportioned by bd-init count (11 and 12 of",
+    "23), not two fresh measurements; the next sweep replaces both."
   ],
   "seconds_per_init_fallback": 17.2952,
   "tests": {
@@ -70,8 +76,9 @@
     "TestProxiedServerChildren": 11.28,
     "TestProxiedServerCleanDatabases": 7.14,
     "TestProxiedServerCleanDatabasesPurgeDropped": 7.76,
-    "TestProxiedServerClose": 174.6,
+    "TestProxiedServerClose": 83.5,
     "TestProxiedServerClose2": 218.83,
+    "TestProxiedServerClose3": 91.1,
     "TestProxiedServerCloseConcurrent": 38.25,
     "TestProxiedServerCloseSiblingBlockersFanIn": 99.71,
     "TestProxiedServerComment": 64.04,

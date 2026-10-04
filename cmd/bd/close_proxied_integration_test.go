@@ -349,6 +349,18 @@ func TestProxiedServerClose(t *testing.T) {
 		}
 	})
 
+}
+
+// TestProxiedServerClose3 is the second half of TestProxiedServerClose,
+// split off (as TestProxiedServerClose2 was before it) so that no single
+// top-level suite carries 23 bd-init subtests: that one parent alone cost
+// ~2060 slot-seconds under -test.parallel=4 and pushed its 15-shard legacy
+// shard past go test's 15m timeout on every run (gastownhall/beads#7151).
+func TestProxiedServerClose3(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
+
 	t.Run("close_blocked_refuses_without_force", func(t *testing.T) {
 		t.Parallel()
 		p := newSharedProxiedProject(t, bd, "cbr")
