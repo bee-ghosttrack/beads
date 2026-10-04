@@ -608,6 +608,13 @@ func TestPRWorkflowRequiresNativeInitGatewayCredential(t *testing.T) {
 		if step.If != "" || (step.ContinueOnError != nil && step.ContinueOnError != false) {
 			t.Errorf("gateway credential step is bypassable: if=%q continue-on-error=%v", step.If, step.ContinueOnError)
 		}
+		// The driver runs `go test ./cmd/bd`. Without the job's restored
+		// non-race GOCACHE it compiles into the default cache and rebuilds
+		// the cmd/bd test binary cold (113s on Windows for 0.27s of tests,
+		// #7156's run 37166912570) while its neighbours reuse the seed.
+		if got, want := step.Env["GOCACHE"], "${{ runner.temp }}/go-cache/non-race"; got != want {
+			t.Errorf("gateway credential step GOCACHE = %q, want %q", got, want)
+		}
 	}
 	if matchingSteps != 1 {
 		t.Fatalf("native preflight job has %d gateway credential commands, want 1", matchingSteps)

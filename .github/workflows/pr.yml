@@ -1026,6 +1026,8 @@ jobs:
 
       - name: Exercise native init gateway credential shell
         shell: bash
+        env:
+          GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: bash scripts/ci/test-init-gateway-credential.sh "$RUNNER_OS"
 
       - name: Exercise credential command fixtures on Windows
