@@ -51,6 +51,7 @@ func TestEveryRepositoryMutatorJournals(t *testing.T) {
 		"RecordDeleteInTx":                      true,
 		"RecordDepEventInTx":                    true,
 		"RecordCommentEventInTx":                true,
+		"RecordMemoryEventInTx":                 true,
 		"RecordDependencyRemovalsForTableInTx":  true,
 		"RecordDependencyRemovalsForIssuesInTx": true,
 		"CloseIssueInTx":                        true,

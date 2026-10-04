@@ -19,8 +19,8 @@ import (
 // contract, not two that agree today.
 //
 // The storage row is deliberately NOT this type. storage.EventsJournalRow is
-// the substrate's shape — three payload columns as strings, one of which is
-// empty most of the time — and Record is the published one. The projection
+// the substrate's shape — four payload columns as strings, most of them empty
+// on any given row — and Record is the published one. The projection
 // between them is the whole content of this file.
 
 // Record is one journal line as a consumer receives it, on the CLI's stdout and
@@ -36,9 +36,11 @@ type Record struct {
 	// TS is the UTC insert time stamped inside the committing transaction,
 	// normalized to RFC 3339 at the read seam (normalizeEventsTimestamp).
 	TS string `json:"ts"`
-	// Op is one of create, update, close, delete, dep_add, dep_remove, comment.
+	// Op is one of create, update, close, delete, dep_add, dep_remove, comment,
+	// memory_remember, memory_forget.
 	Op string `json:"op"`
-	// IssueID is the mutated issue's id.
+	// IssueID is the mutated issue's id. Empty on a memory op: a memory is not
+	// a bead, and its key travels in Memory, never here.
 	IssueID string `json:"issue_id"`
 	// Actor is the acting identity that performed the mutation, as resolved
 	// for the audit-events table; on an op=comment row it is the comment's
@@ -64,6 +66,12 @@ type Record struct {
 	// Comment is {"id","author","text","created_at","source"} on comment, and
 	// absent otherwise, for Dep's reason.
 	Comment json.RawMessage `json:"comment,omitempty"`
+	// Memory is {"key","content","previous"} on memory_remember and
+	// memory_forget — content present on remember only, previous present when
+	// a value existed before the write — and absent otherwise, for Dep's
+	// reason. Issue is the literal null beside it: the record describes no
+	// bead.
+	Memory json.RawMessage `json:"memory,omitempty"`
 }
 
 // NewRecord projects one stored row onto the published envelope.
@@ -84,6 +92,9 @@ func NewRecord(row storage.EventsJournalRow) Record {
 	}
 	if row.CommentJSON != "" {
 		rec.Comment = json.RawMessage(row.CommentJSON)
+	}
+	if row.MemoryJSON != "" {
+		rec.Memory = json.RawMessage(row.MemoryJSON)
 	}
 	return rec
 }

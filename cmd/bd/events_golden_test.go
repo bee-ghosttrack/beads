@@ -150,6 +150,17 @@ func renderGoldenLines(t *testing.T) []byte {
 		ID: "cmt-2", Author: "worker-1", Text: "status note",
 		CreatedAt: updated, Source: issueops.CommentSourceAudit,
 	}
+	// The engine-only memory ops: a memory is a config row, not a bead, so the
+	// record names no issue (issue_id empty, issue null) and carries the user
+	// key — verbatim, spaces and all — in its memory payload. Three rows pin the
+	// three payload shapes: a first remember (content, no previous), a replace
+	// (content and previous), and a forget (previous, no content).
+	firstRemember := &issueops.EventMemory{Key: "dolt phantoms", Content: strptr("Dolt phantom DBs hide in three places")}
+	replaceRemember := &issueops.EventMemory{
+		Key: "dolt phantoms", Content: strptr("Dolt phantom DBs hide in FOUR places"),
+		Previous: strptr("Dolt phantom DBs hide in three places"),
+	}
+	forget := &issueops.EventMemory{Key: "dolt phantoms", Previous: strptr("Dolt phantom DBs hide in FOUR places")}
 
 	// actor pins both halves of the attribution contract: an attributed row
 	// emits the acting identity (the same one the audit-events table resolves),
@@ -180,6 +191,11 @@ func renderGoldenLines(t *testing.T) []byte {
 			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100"}), ""),
 		goldenRecord(12, ts, string(issueops.EventDelete), "bd-100", "deleter-1", "", "", ""), // null issue on delete; requested delete
 		goldenRecord(13, ts, string(issueops.EventDelete), "bd-wisp-1", "", "", "", ""),       // actorless system delete surface
+		// The memory plane: attributed when the front door passes an actor
+		// (`bd remember`), actorless from one that does not (the HTTP route).
+		goldenMemoryRecord(14, ts, string(issueops.EventMemoryRemember), "worker-1", mustJSON(t, firstRemember)),
+		goldenMemoryRecord(15, ts, string(issueops.EventMemoryRemember), "worker-1", mustJSON(t, replaceRemember)),
+		goldenMemoryRecord(16, ts, string(issueops.EventMemoryForget), "", mustJSON(t, forget)),
 	}
 
 	var buf bytes.Buffer
@@ -205,6 +221,18 @@ func goldenRecord(seq int64, ts, op, issueID, actor, issueJS, depJS, commentJS s
 		IssueJSON:   issueJS,
 		DepJSON:     depJS,
 		CommentJSON: commentJS,
+	})
+}
+
+// goldenMemoryRecord spells one memory-plane row: no issue id, no issue, no dep,
+// no comment — only the op, the actor and the memory payload.
+func goldenMemoryRecord(seq int64, ts, op, actor, memoryJS string) eventsjournal.Record {
+	return eventsjournal.NewRecord(storage.EventsJournalRow{
+		Seq:        seq,
+		TS:         ts,
+		Op:         op,
+		Actor:      actor,
+		MemoryJSON: memoryJS,
 	})
 }
 

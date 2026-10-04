@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/memoryapi"
+	"github.com/steveyegge/beads/internal/storage/domain"
 	storagememoryops "github.com/steveyegge/beads/internal/storage/memoryops"
 	"github.com/steveyegge/beads/memoryops"
 )
@@ -43,6 +44,16 @@ var _ memoryops.Memories = (*memories)(nil)
 // through that package's StorageKey and MemoriesFromConfig — the one encode and
 // the one decode in the tree.
 //
+// JOURNALING IS THE ONE THING THIS BODY DOES NOT GET FOR FREE. A bead write
+// journals itself at the issueops seam beneath every repository; a config
+// write does not, because most config rows are settings. So each write here
+// records its own memory_remember / memory_forget row through the unit of
+// work's EventsJournalUseCase — the same transaction, so row and record commit
+// together — with the same payload the InTx route builds (the repository maps
+// domain.MemoryJournalEntry onto issueops.EventMemory). The two routes' journal
+// rows are byte-comparable for that reason, and the journal conformance
+// contract drives both.
+//
 // VALIDATION HAPPENS BEFORE THE UNIT OF WORK IS OPENED, for the reason
 // workspace_config.go gives: a validation failure raised inside RunTx is
 // indistinguishable at the call site from a write that rolled back.
@@ -70,8 +81,16 @@ func (m *memories) Remember(ctx context.Context, req memoryops.RememberRequest) 
 		if err != nil {
 			return false, "", err
 		}
-		_, replaced := all[storageKey]
+		previous, replaced := all[storageKey]
 		if err := cfg.SetConfig(ctx, storageKey, req.Content); err != nil {
+			return false, "", err
+		}
+		content := req.Content
+		entry := domain.MemoryJournalEntry{Key: key, Content: &content, Actor: req.Actor}
+		if replaced {
+			entry.Previous = &previous
+		}
+		if err := uw.EventsJournalUseCase().RecordMemoryEvent(ctx, entry); err != nil {
 			return false, "", err
 		}
 		return replaced, "bd: remember " + key, nil
@@ -119,6 +138,10 @@ func (m *memories) Forget(ctx context.Context, req memoryops.ForgetRequest) (mem
 			return memoryops.ForgetResult{Key: key}, "", nil
 		}
 		if err := cfg.DeleteConfig(ctx, storageKey); err != nil {
+			return memoryops.ForgetResult{}, "", err
+		}
+		entry := domain.MemoryJournalEntry{Forget: true, Key: key, Previous: &previous, Actor: req.Actor}
+		if err := uw.EventsJournalUseCase().RecordMemoryEvent(ctx, entry); err != nil {
 			return memoryops.ForgetResult{}, "", err
 		}
 		return memoryops.ForgetResult{Key: key, Value: previous, Found: true}, "bd: forget " + key, nil

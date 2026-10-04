@@ -42,7 +42,7 @@ func (m *memories) Remember(ctx context.Context, req memoryops.RememberRequest) 
 	var replaced bool
 	if err := m.store.withRetryTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		replaced, err = storagememoryops.RememberInTx(ctx, tx, key, req.Content)
+		replaced, err = storagememoryops.RememberInTx(ctx, tx, key, req.Content, req.Actor)
 		return err
 	}); err != nil {
 		return memoryops.RememberResult{}, err
@@ -79,7 +79,7 @@ func (m *memories) Forget(ctx context.Context, req memoryops.ForgetRequest) (mem
 	)
 	if err := m.store.withRetryTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		previous, found, err = storagememoryops.ForgetInTx(ctx, tx, key)
+		previous, found, err = storagememoryops.ForgetInTx(ctx, tx, key, req.Actor)
 		return err
 	}); err != nil {
 		return memoryops.ForgetResult{}, err

@@ -2,12 +2,15 @@ package uow
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/steveyegge/beads/backend/conformance"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // TestJournalContract runs the Journal contract against the unit-of-work
@@ -129,6 +132,104 @@ func newUOWJournalFixture(t *testing.T, ctx context.Context, prefix string) conf
 					return "comment " + id, err
 				})
 			},
+			Remember: func(ctx context.Context, key, content string) error {
+				memories, err := provider.(MemoriesSource).Memories()
+				if err != nil {
+					return err
+				}
+				_, err = memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: content, Actor: "actor"})
+				return err
+			},
+			Forget: func(ctx context.Context, key string) error {
+				memories, err := provider.(MemoriesSource).Memories()
+				if err != nil {
+					return err
+				}
+				_, err = memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "actor"})
+				return err
+			},
 		},
+	}
+}
+
+// TestMemoriesJournalRecords pins the memory-plane records the unit-of-work
+// route writes. This route composes ConfigUseCase rather than the shared InTx
+// body, so its journaling is its own code (memories.go calling
+// EventsJournalUseCase.RecordMemoryEvent in the same unit of work); the
+// payloads it must produce are the ones the store route produces
+// (dolt.TestEventsJournal_MemoryPayloads), row for row.
+func TestMemoriesJournalRecords(t *testing.T) {
+	ctx := context.Background()
+	provider := newUOWRoleFixtureProvider(t, ctx, "mjr")
+	configurer, ok := provider.(storage.EventsJournalConfigurer)
+	if !ok {
+		t.Fatalf("provider %T does not implement storage.EventsJournalConfigurer", provider)
+	}
+	configurer.SetEventsJournalEnabled(true)
+	memories, err := provider.(MemoriesSource).Memories()
+	if err != nil {
+		t.Fatalf("Memories(): %v", err)
+	}
+	readPage := func(since int64) storage.EventsJournalPage {
+		page, err := RunTxRead(ctx, provider, func(ctx context.Context, uw UnitOfWork) (storage.EventsJournalPage, error) {
+			return uw.EventsJournalUseCase().ReadPage(ctx, since, 0)
+		})
+		if err != nil {
+			t.Fatalf("ReadPage(%d): %v", since, err)
+		}
+		return page
+	}
+	head := readPage(0).Head
+
+	key := "journal memory key"
+	if _, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "one", Actor: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "two", Actor: "bob"}); err != nil || !res.Replaced {
+		t.Fatalf("second remember = %+v, %v; want Replaced", res, err)
+	}
+	if res, err := memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "carol"}); err != nil || !res.Found || res.Value != "two" {
+		t.Fatalf("forget = %+v, %v; want found with value two", res, err)
+	}
+	if res, err := memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "carol"}); err != nil || res.Found {
+		t.Fatalf("second forget = %+v, %v; want not found, nil", res, err)
+	}
+	if _, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "three"}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readPage(head).Rows
+	if len(rows) != 4 {
+		t.Fatalf("journal rows above %d = %d, want four (remember, replace, forget, actorless remember): %+v", head, len(rows), rows)
+	}
+	str := func(p *string) string {
+		if p == nil {
+			return "<absent>"
+		}
+		return *p
+	}
+	want := []struct {
+		op, actor, content, previous string
+	}{
+		{string(issueops.EventMemoryRemember), "alice", "one", "<absent>"},
+		{string(issueops.EventMemoryRemember), "bob", "two", "one"},
+		{string(issueops.EventMemoryForget), "carol", "<absent>", "two"},
+		{string(issueops.EventMemoryRemember), "", "three", "<absent>"},
+	}
+	for i, w := range want {
+		row := rows[i]
+		if row.IssueJSON != "" || row.DepJSON != "" || row.CommentJSON != "" {
+			t.Errorf("row %d carries a bead payload; a memory record must carry only memory_json: %+v", i, row)
+		}
+		var memory issueops.EventMemory
+		if err := json.Unmarshal([]byte(row.MemoryJSON), &memory); err != nil {
+			t.Fatalf("row %d memory_json %q: %v", i, row.MemoryJSON, err)
+		}
+		if row.Op != w.op || row.IssueID != "" || row.Actor != w.actor || memory.Key != key ||
+			str(memory.Content) != w.content || str(memory.Previous) != w.previous {
+			t.Errorf("row %d = op %s issue_id %q actor %q key %q content %s previous %s; want op %s issue_id \"\" actor %q key %q content %s previous %s",
+				i, row.Op, row.IssueID, row.Actor, memory.Key, str(memory.Content), str(memory.Previous),
+				w.op, w.actor, key, w.content, w.previous)
+		}
 	}
 }

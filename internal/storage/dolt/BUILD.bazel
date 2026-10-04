@@ -235,6 +235,7 @@ go_test(
         "indeterminate_commit_test.go",
         "initschema_0067_versioned_beads_replay_test.go",
         "initschema_0069_datetime_precision_replay_test.go",
+        "initschema_0070_events_journal_memory_replay_test.go",
         "initschema_concurrent_test.go",
         "initschema_fresh_bootstrap_heal_test.go",
         "initschema_gate_test.go",

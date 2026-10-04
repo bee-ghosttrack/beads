@@ -138,6 +138,11 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// Replays over a database that never synced the wisp tables must use
 		// the frozen source text instead -- see cliSubstituteAssumesWispTables.
 		return cliMigration0067AddVersionedBeadsSchema
+	case "0070_add_events_journal_memory.up.sql":
+		// Direct DDL for the same reason as 0066, whose shape this is: a
+		// guarded prepared ADD COLUMN on the always-present (0064) journal
+		// table, which the 2.2.x CLI would silently no-op.
+		return cliMigration0070AddEventsJournalMemory
 	case "0068_add_attribution_status.up.sql":
 		// Direct DDL for the same reason as 0067: the source migration's
 		// PREPARE guards (INFORMATION_SCHEMA probes) are what make the raw
@@ -239,6 +244,7 @@ ALTER TABLE wisps ADD COLUMN storage_class VARCHAR(16);`
 
 const cliMigration0065WidenWispCommentsText = `ALTER TABLE wisp_comments MODIFY COLUMN text LONGTEXT NOT NULL;`
 const cliMigration0066AddEventsJournalActor = `ALTER TABLE bd_events_journal ADD COLUMN actor VARCHAR(255) NOT NULL DEFAULT '';`
+const cliMigration0070AddEventsJournalMemory = `ALTER TABLE bd_events_journal ADD COLUMN memory_json LONGTEXT;`
 
 // cliMigration0067AddVersionedBeadsSchema is 0067 with its two guarded
 // PREPARE blocks replaced by the direct ALTERs they would run on a fresh

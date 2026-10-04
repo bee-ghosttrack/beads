@@ -1971,6 +1971,8 @@ func TestAllMigrationsSQLUsesDirectDDLForKnownCLIIncompatibilities(t *testing.T)
 		// removed_at to DATETIME(6)), same shape as 0068's step 7.
 		"ALTER TABLE issue_versions MODIFY COLUMN change_at DATETIME(6) NOT NULL;",
 		"ALTER TABLE issue_versions MODIFY COLUMN removed_at DATETIME(6);",
+		// 0070: same prepared-ALTER shape as 0066, same CLI no-op on 2.2.x.
+		"ALTER TABLE bd_events_journal ADD COLUMN memory_json LONGTEXT;",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("AllMigrationsSQL missing direct CLI DDL %q", want)
@@ -2004,6 +2006,9 @@ func TestAllMigrationsSQLUsesDirectDDLForKnownCLIIncompatibilities(t *testing.T)
 		// 0069 guards both of its MODIFYs the same way.
 		"@issue_versions_change_at_needs_widen",
 		"@issue_versions_removed_at_needs_widen",
+		// 0070 guards its ALTER the same way 0066 does; only its source text
+		// (and the ignored twin, which is not bundled) carries this probe.
+		"@needs_memory_json",
 	} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("AllMigrationsSQL contains source prepared-DDL guard %q", forbidden)

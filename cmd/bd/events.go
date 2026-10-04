@@ -93,15 +93,16 @@ var eventsTailCmd = &cobra.Command{
 	Long: `Print events journal records with seq greater than --since, in order.
 
 Each line is a JSON record:
-  {"seq":N,"ts":"...","op":"create|update|close|delete|dep_add|dep_remove|comment",
-   "issue_id":"...","actor":"...","issue":{...|null},"dep":{"kind":..,"target":..,"metadata":..},"comment":{...}}
+  {"seq":N,"ts":"...","op":"create|update|close|delete|dep_add|dep_remove|comment|memory_remember|memory_forget",
+   "issue_id":"...","actor":"...","issue":{...|null},"dep":{"kind":..,"target":..,"metadata":..},"comment":{...},"memory":{...}}
 
 Record contract (stable for external consumers):
   seq       int64   counter-assigned inside the mutation's transaction; gapless,
                     strictly increasing in commit order, never reused or reset
   ts        string  UTC insert time, stamped inside the committing transaction
-  op        string  one of the seven ops above
-  issue_id  string  the mutated issue's id
+  op        string  one of the nine ops above
+  issue_id  string  the mutated issue's id; "" on memory_remember / memory_forget
+                    (a memory is not a bead — its key is in memory.key)
   actor     string  the acting identity that performed the mutation, as resolved
                     for the audit-events table (on a comment row: the comment's
                     author). A delete — and the dep_remove rows a cascading
@@ -113,6 +114,10 @@ Record contract (stable for external consumers):
   issue     object  full issue state AFTER the mutation; null on delete
   dep       object  {"kind","target","metadata"} for dep_add / dep_remove; omitted otherwise
   comment   object  {"id","author","text","created_at","source"} for comment; omitted otherwise
+  memory    object  {"key","content","previous"} for memory_remember / memory_forget;
+                    omitted otherwise. key is the user key verbatim (never an id);
+                    content is the value after a remember; previous is the value
+                    before a replace or a forget, omitted on a first remember.
 
 Poll with the highest seq seen to consume new mutations incrementally, or pass
 --follow to keep printing new records as they are committed (Ctrl-C to stop).

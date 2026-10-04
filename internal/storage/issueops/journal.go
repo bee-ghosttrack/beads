@@ -61,14 +61,27 @@ const (
 	EventDepAdd       EventOp = "dep_add"
 	EventDepRemove    EventOp = "dep_remove"
 	EventCommentWrite EventOp = "comment"
+	// EventMemoryRemember and EventMemoryForget record writes to the memory
+	// plane (`bd remember` / `bd forget`): config-table rows under
+	// kvkeys.MemoryConfigKeyPrefix, which are not beads and were never
+	// journaled before. They are engine-only for the reason a comment is: no
+	// wire event names a memory, and a projector skips them rather than
+	// faulting. The row names NO issue — issue_id is empty — because a memory
+	// key is a verbatim user string, not an id, and a consumer that spliced it
+	// into an id-shaped query would be wrong (see EventMemory.Key).
+	EventMemoryRemember EventOp = "memory_remember"
+	EventMemoryForget   EventOp = "memory_forget"
 )
 
-// The engine journals SEVEN ops; the public event vocabulary is SIX. The
-// seventh, EventCommentWrite, is engine-only: a projector advances its source
-// cursor across a comment row without minting a wire event, so a comment never
-// reaches an external consumer as an event of its own (its effect is already
-// visible in the next issue snapshot). That reconciliation is the frozen wire
-// contract, not an implementation detail to be re-litigated per consumer.
+// The engine journals NINE ops; the public event vocabulary is SIX. The other
+// three are engine-only: a projector advances its source cursor across such a
+// row without minting a wire event. EventCommentWrite is skipped because a
+// comment's effect is already visible in the next issue snapshot; the two
+// memory ops are skipped because the wire vocabulary is about beads and a
+// memory is not one — its record exists for replay and durability (a memory
+// plane with no journal has no second copy anywhere), not for event delivery.
+// That reconciliation is the frozen wire contract, not an implementation
+// detail to be re-litigated per consumer.
 //
 // The split is stated here, once, so both halves are checkable from one place:
 // adding an op without deciding which side it lands on breaks
@@ -78,7 +91,7 @@ var (
 	// are the only ops that may appear in an event delivered to a consumer.
 	wireEventOps = []EventOp{EventCreate, EventUpdate, EventClose, EventDelete, EventDepAdd, EventDepRemove}
 	// engineOnlyEventOps are journaled but never minted as wire events.
-	engineOnlyEventOps = []EventOp{EventCommentWrite}
+	engineOnlyEventOps = []EventOp{EventCommentWrite, EventMemoryRemember, EventMemoryForget}
 )
 
 // WireEventOps returns the six-op public event vocabulary in canonical order.
@@ -134,6 +147,27 @@ const (
 // canonical order.
 func CommentSources() []string {
 	return []string{CommentSourceStructured, CommentSourceAudit}
+}
+
+// EventMemory is the replayable payload of a memory-plane write — the
+// `memory` member of a memory_remember / memory_forget record.
+//
+// Key is the USER key (`bd remember --key`), verbatim: not the kv.memory.
+// storage key, and not an issue id. It may hold spaces, dots, unicode or
+// anything else the caller typed, so a consumer must treat it as opaque text
+// — never splice it into an id-shaped query or path. That is also why the row's
+// issue_id stays empty rather than carrying the key.
+//
+// Content is the value AFTER the write, present on memory_remember and absent
+// on memory_forget (nothing survives a forget). Previous is the value BEFORE
+// the write, present when there was one — a remember that replaced a row, and
+// every forget — and absent on a first remember. Both are pointers so a value
+// that is the empty string (a row seeded past the role) stays distinguishable
+// from no value: on this plane "" and absent are different rows.
+type EventMemory struct {
+	Key      string  `json:"key"`
+	Content  *string `json:"content,omitempty"`
+	Previous *string `json:"previous,omitempty"`
 }
 
 // Journal activation is carried by the operation context. Store instances add
@@ -320,7 +354,7 @@ func RecordEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, actor st
 		// record a hole.
 		return fmt.Errorf("journal: snapshot %s for %s: %w", op, issueID, err)
 	}
-	return insertEventRow(ctx, tx, op, issueID, issue, nil, nil, actor)
+	return insertEventRow(ctx, tx, op, issueID, issue, nil, nil, nil, actor)
 }
 
 // RecordDeleteInTx records a delete for issueID with a null issue payload (the
@@ -330,7 +364,7 @@ func RecordDeleteInTx(ctx context.Context, tx DBTX, issueID, actor string) error
 	if !journalEnabled(ctx, tx) {
 		return nil
 	}
-	return insertEventRow(ctx, tx, EventDelete, issueID, nil, nil, nil, actor)
+	return insertEventRow(ctx, tx, EventDelete, issueID, nil, nil, nil, nil, actor)
 }
 
 // journalableDeletesInTx narrows ids to the ones that actually exist in table,
@@ -360,11 +394,11 @@ func RecordDepEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, kind,
 		// The dependency source may itself have been deleted (cascade); record
 		// the edge change with a null snapshot rather than failing.
 		if errors.Is(err, storage.ErrNotFound) {
-			return insertEventRow(ctx, tx, op, issueID, nil, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil, actor)
+			return insertEventRow(ctx, tx, op, issueID, nil, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil, nil, actor)
 		}
 		return fmt.Errorf("journal: snapshot %s for %s: %w", op, issueID, err)
 	}
-	return insertEventRow(ctx, tx, op, issueID, issue, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil, actor)
+	return insertEventRow(ctx, tx, op, issueID, issue, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil, nil, actor)
 }
 
 // RecordCommentEventInTx records a replayable structured or audit comment. The
@@ -378,7 +412,37 @@ func RecordCommentEventInTx(ctx context.Context, tx DBTX, issueID string, commen
 	if err != nil {
 		return fmt.Errorf("journal: snapshot comment for %s: %w", issueID, err)
 	}
-	return insertEventRow(ctx, tx, EventCommentWrite, issueID, issue, nil, comment, comment.Author)
+	return insertEventRow(ctx, tx, EventCommentWrite, issueID, issue, nil, comment, nil, comment.Author)
+}
+
+// RecordMemoryEventInTx journals one memory-plane write (op is
+// EventMemoryRemember or EventMemoryForget) in the caller's transaction — the
+// same transaction as the config-row write it describes, so the record and the
+// row commit or roll back together, exactly as every bead record does. A no-op
+// when journaling is disabled.
+//
+// It is the ONE emit for the memory plane. Both write routes bottom out here:
+// the store route through memoryops.RememberInTx / ForgetInTx, and the
+// unit-of-work route through its EventsJournalUseCase, whose repository holds
+// the transaction's runner. The row carries no issue snapshot, no dep and no
+// comment; its issue_id is empty (see EventMemory). actor is as on
+// RecordEventInTx: the acting identity, or "" for a caller that has none —
+// which, until the front doors thread one, is every HTTP memory write.
+//
+// A memory op with no payload is a caller bug and is refused rather than
+// journaled as an unreadable row; so is a non-memory op, which would otherwise
+// put a memory payload under an op consumers decode as something else.
+func RecordMemoryEventInTx(ctx context.Context, tx DBTX, op EventOp, memory *EventMemory, actor string) error {
+	if !journalEnabled(ctx, tx) {
+		return nil
+	}
+	if op != EventMemoryRemember && op != EventMemoryForget {
+		return fmt.Errorf("journal: %q is not a memory op", op)
+	}
+	if memory == nil || memory.Key == "" {
+		return fmt.Errorf("journal: %s without a memory key", op)
+	}
+	return insertEventRow(ctx, tx, op, "", nil, nil, nil, memory, actor)
 }
 
 // getJournalIssueInTx augments the normal issue snapshot with the persisted
@@ -420,7 +484,7 @@ func getJournalIssueInTx(ctx context.Context, tx DBTX, issueID string) (*types.I
 // (non-dependency ops). ts is the insert time, stamped inside the committing
 // transaction. actor is stored as-is — "" for the genuinely unattributable
 // paths — in the NOT NULL DEFAULT ” actor column.
-func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, issue *types.Issue, dep *EventDep, comment *EventComment, actor string) error {
+func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, issue *types.Issue, dep *EventDep, comment *EventComment, memory *EventMemory, actor string) error {
 	var issueJSON any
 	if issue != nil {
 		b, err := json.Marshal(issue)
@@ -445,11 +509,19 @@ func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, is
 		}
 		commentJSON = string(b)
 	}
+	var memoryJSON any
+	if memory != nil {
+		b, err := json.Marshal(memory)
+		if err != nil {
+			return fmt.Errorf("journal: marshal memory %s: %w", memory.Key, err)
+		}
+		memoryJSON = string(b)
+	}
 	insert := func(seq int64) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO bd_events_journal (seq, ts, op, issue_id, actor, issue_json, dep_json, comment_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, seq, time.Now().UTC(), string(op), issueID, actor, issueJSON, depJSON, commentJSON)
+			INSERT INTO bd_events_journal (seq, ts, op, issue_id, actor, issue_json, dep_json, comment_json, memory_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, seq, time.Now().UTC(), string(op), issueID, actor, issueJSON, depJSON, commentJSON, memoryJSON)
 		return err
 	}
 

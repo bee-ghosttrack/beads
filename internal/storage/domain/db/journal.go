@@ -30,3 +30,16 @@ func (r *eventsJournalSQLRepository) ReadPage(ctx context.Context, since int64, 
 func (r *eventsJournalSQLRepository) Prune(ctx context.Context, before int64, retainDays, retainRows int) (int64, error) {
 	return issueops.PruneEventsInTx(ctx, r.runner, before, retainDays, retainRows, time.Now().UTC())
 }
+
+// RecordMemoryEvent journals a memory-plane write on this repository's runner —
+// the unit of work's pinned transaction, so the record lands beside the config
+// write it describes. The runner satisfies issueops.DBTX the same way the
+// issue repository's does when it calls RecordEventInTx.
+func (r *eventsJournalSQLRepository) RecordMemoryEvent(ctx context.Context, entry domain.MemoryJournalEntry) error {
+	op := issueops.EventMemoryRemember
+	if entry.Forget {
+		op = issueops.EventMemoryForget
+	}
+	memory := &issueops.EventMemory{Key: entry.Key, Content: entry.Content, Previous: entry.Previous}
+	return issueops.RecordMemoryEventInTx(ctx, r.runner, op, memory, entry.Actor)
+}

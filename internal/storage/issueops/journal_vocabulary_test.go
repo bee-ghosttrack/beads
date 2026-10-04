@@ -1,14 +1,18 @@
 package issueops
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 )
 
 // TestEventOpVocabularyIsFrozen pins the journal's op vocabulary and its split
-// into the six-op public wire set plus the engine-only remainder.
+// into the six-op public wire set plus the three-op engine-only remainder (the
+// comment write and the two memory-plane writes).
 //
 // The two sets are declared independently of the EventOp constants, so this
 // fails on any drift in either direction: a new EventOp constant that nobody
@@ -19,11 +23,11 @@ import (
 func TestEventOpVocabularyIsFrozen(t *testing.T) {
 	const (
 		wantWire       = 6
-		wantEngineOnly = 1
+		wantEngineOnly = 3
 	)
 
 	frozenWire := []EventOp{"create", "update", "close", "delete", "dep_add", "dep_remove"}
-	frozenEngineOnly := []EventOp{"comment"}
+	frozenEngineOnly := []EventOp{"comment", "memory_remember", "memory_forget"}
 
 	if got := WireEventOps(); !equalOps(got, frozenWire) {
 		t.Errorf("wire event vocabulary changed: got %v, frozen %v", got, frozenWire)
@@ -128,4 +132,42 @@ func equalOps(a, b []EventOp) bool {
 		}
 	}
 	return true
+}
+
+// TestRecordMemoryEventInTxRefusesMalformedCalls pins the memory emit's two
+// refusals — a non-memory op, and a payload with no key — and that a disabled
+// journal makes it a no-op before any SQL. The refusals matter because the
+// alternative is a row consumers cannot decode: a memory payload under an op
+// they parse as something else, or a memory record naming no memory.
+func TestRecordMemoryEventInTxRefusesMalformedCalls(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	on := WithEventsJournal(context.Background(), true)
+	memory := &EventMemory{Key: "k"}
+
+	if err := RecordMemoryEventInTx(on, tx, EventCreate, memory, "actor"); err == nil {
+		t.Error("a non-memory op was accepted; the payload would land under an op consumers decode as a bead mutation")
+	}
+	if err := RecordMemoryEventInTx(on, tx, EventMemoryRemember, nil, "actor"); err == nil {
+		t.Error("a nil payload was accepted; the record would name no memory")
+	}
+	if err := RecordMemoryEventInTx(on, tx, EventMemoryForget, &EventMemory{}, "actor"); err == nil {
+		t.Error("an empty key was accepted; the record would name no memory")
+	}
+	off := WithEventsJournal(context.Background(), false)
+	if err := RecordMemoryEventInTx(off, tx, EventMemoryRemember, memory, "actor"); err != nil {
+		t.Errorf("disabled journal: %v, want a silent no-op", err)
+	}
+	// None of the above may have reached the database.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected SQL: %v", err)
+	}
 }

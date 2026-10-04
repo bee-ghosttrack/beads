@@ -243,12 +243,13 @@ build, and says nothing about whether this workspace has a journal.
 |---|---|---|
 | `seq` | integer | Assigned inside the mutation's transaction. Gapless, strictly increasing in commit order, never reused and never reset. A rolled-back write burns no sequence number. |
 | `ts` | string | UTC insert time, stamped inside the committing transaction. |
-| `op` | string | One of the seven operations below. |
-| `issue_id` | string | The mutated issue. |
+| `op` | string | One of the nine operations below. |
+| `issue_id` | string | The mutated issue. Empty on the two `memory_*` operations: a memory is not a bead, and its key is in `memory.key`. |
 | `actor` | string | The acting identity that performed the mutation, as resolved for the audit-events table; on a `comment` row, the comment's author. A `delete` and the `dep_remove` records a cascading delete produces carry the identity that *requested* the delete, not the beads the cascade reached. Absent when the path genuinely has no actor — derived maintenance (`is_blocked` recomputes), system cleanup with no request behind it, and rows written before the journal recorded actors. An absent `actor` is never user attribution: read it as "system/unknown", not as a conflicting writer. |
 | `issue` | object or null | The issue's full state *after* the mutation; `null` on a delete. |
 | `dep` | object | `{"kind","target","metadata"}` on `dep_add` and `dep_remove`; absent otherwise. |
 | `comment` | object | `{"id","author","text","created_at","source"}` on `comment`; absent otherwise. |
+| `memory` | object | `{"key","content","previous"}` on `memory_remember` and `memory_forget`; absent otherwise. |
 
 Six operations are the public vocabulary — the only kinds a downstream event
 feed built on the journal may carry:
@@ -278,6 +279,24 @@ audit-trail entry.
 Anything projecting the journal outward as a public event feed *skips* a
 `comment` record rather than faulting on it — the write is already visible in
 the issue snapshot beside it.
+
+The eighth and ninth, `memory_remember` and `memory_forget`, record the memory
+plane — `bd remember` and `bd forget`. A memory is a configuration row, not a
+bead, so these records name no issue: `issue_id` is the empty string and
+`issue` is `null`. The `memory` member carries the user key *verbatim* (it may
+hold spaces, dots or anything else the caller typed, and is never safe to use
+as an id), the `content` after a remember, and the `previous` value when one
+existed — on a remember that replaced a row, and on every forget. A first
+remember has no `previous`; a forget has no `content`. A forget that found
+nothing to remove records nothing, like a `dep_remove` of an edge already gone.
+
+```json
+{"key":"dolt phantoms","content":"Dolt phantom DBs hide in FOUR places","previous":"Dolt phantom DBs hide in three places"}
+```
+
+A public event feed skips these two as it skips `comment`. They exist so a
+workspace's memories have a replayable second copy at all: before them the
+memory plane had none.
 
 ### The issue snapshot
 

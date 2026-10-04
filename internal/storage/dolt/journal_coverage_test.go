@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	publicops "github.com/steveyegge/beads/issueops"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // errRollbackProbe is the sentinel a journal test returns from a transaction
@@ -1021,5 +1022,116 @@ func TestEventsJournal_DeleteRoleAttributesTheRequester(t *testing.T) {
 	// not to whoever created the edge.
 	if actor, ok := journalActorFor(t, store, "dep_remove", dependent.ID); !ok || actor != "deleter-1" {
 		t.Errorf("cascade dep_remove row actor = %q, %v; want %q", actor, ok, "deleter-1")
+	}
+}
+
+// TestEventsJournal_MemoryPayloads pins the memory-plane records the store
+// route writes (memoryops.RememberInTx / ForgetInTx through DoltStore.Memories):
+// one memory_remember per remember, carrying the user key verbatim, the content
+// after the write and — on a replace — the value before it; one memory_forget
+// per forget that removed something, carrying the previous value and no
+// content; nothing at all for a forget that found no row. issue_id is empty and
+// issue_json NULL on every one of them, because a memory is not a bead, and
+// the actor is whatever the request carried, "" included.
+func TestEventsJournal_MemoryPayloads(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	enableJournalForTest(t, store)
+	clearJournal(t, store)
+
+	memories, err := store.Memories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A key with a space: verbatim user text, which is exactly why it travels
+	// in the payload and not in issue_id.
+	key := "journal memory key"
+	if _, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "one", Actor: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "two", Actor: "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced.Replaced {
+		t.Fatalf("second remember reported Replaced=false; the probe the journal's previous comes from is wrong")
+	}
+	forgot, err := memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "carol"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !forgot.Found || forgot.Value != "two" {
+		t.Fatalf("forget = %+v, want found with value two", forgot)
+	}
+	// A forget of a key nothing holds mutates nothing and must journal nothing.
+	if again, err := memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "carol"}); err != nil || again.Found {
+		t.Fatalf("second forget = %+v, %v; want not found, nil", again, err)
+	}
+	// No actor: the column stays "" and the record reads as system/unknown.
+	if _, err := memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: "three"}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.db.QueryContext(ctx,
+		`SELECT op, issue_id, actor, issue_json, dep_json, comment_json, memory_json FROM bd_events_journal ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type memRow struct {
+		op, issueID, actor string
+		memory             issueops.EventMemory
+	}
+	var got []memRow
+	for rows.Next() {
+		var (
+			r                                   memRow
+			issueJS, depJS, commentJS, memoryJS sql.NullString
+		)
+		if err := rows.Scan(&r.op, &r.issueID, &r.actor, &issueJS, &depJS, &commentJS, &memoryJS); err != nil {
+			t.Fatal(err)
+		}
+		if issueJS.Valid || depJS.Valid || commentJS.Valid {
+			t.Fatalf("memory row %q carries a bead payload (issue %v dep %v comment %v); a memory record must carry only memory_json", r.op, issueJS.Valid, depJS.Valid, commentJS.Valid)
+		}
+		if !memoryJS.Valid {
+			t.Fatalf("memory row %q has NULL memory_json", r.op)
+		}
+		if err := json.Unmarshal([]byte(memoryJS.String), &r.memory); err != nil {
+			t.Fatalf("memory_json %q: %v", memoryJS.String, err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("journal rows = %+v, want four (remember, replace, forget, actorless remember)", got)
+	}
+
+	str := func(p *string) string {
+		if p == nil {
+			return "<absent>"
+		}
+		return *p
+	}
+	want := []struct {
+		op, actor, content, previous string
+	}{
+		{string(issueops.EventMemoryRemember), "alice", "one", "<absent>"},
+		{string(issueops.EventMemoryRemember), "bob", "two", "one"},
+		{string(issueops.EventMemoryForget), "carol", "<absent>", "two"},
+		{string(issueops.EventMemoryRemember), "", "three", "<absent>"},
+	}
+	for i, w := range want {
+		g := got[i]
+		if g.op != w.op || g.issueID != "" || g.actor != w.actor || g.memory.Key != key ||
+			str(g.memory.Content) != w.content || str(g.memory.Previous) != w.previous {
+			t.Errorf("row %d = op %s issue_id %q actor %q key %q content %s previous %s; want op %s issue_id \"\" actor %q key %q content %s previous %s",
+				i, g.op, g.issueID, g.actor, g.memory.Key, str(g.memory.Content), str(g.memory.Previous),
+				w.op, w.actor, key, w.content, w.previous)
+		}
 	}
 }

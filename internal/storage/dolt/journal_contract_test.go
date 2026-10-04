@@ -7,6 +7,7 @@ import (
 	"github.com/steveyegge/beads/backend/conformance"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // TestJournalContract runs the Journal contract against the server-backed
@@ -89,6 +90,22 @@ func newDoltJournalFixture(t *testing.T, prefix string) (conformance.JournalFixt
 			},
 			Comment: func(ctx context.Context, id, text string) error {
 				return store.AddComment(ctx, id, "actor", text)
+			},
+			Remember: func(ctx context.Context, key, content string) error {
+				memories, err := store.Memories()
+				if err != nil {
+					return err
+				}
+				_, err = memories.Remember(ctx, memoryops.RememberRequest{Key: key, Content: content, Actor: "actor"})
+				return err
+			},
+			Forget: func(ctx context.Context, key string) error {
+				memories, err := store.Memories()
+				if err != nil {
+					return err
+				}
+				_, err = memories.Forget(ctx, memoryops.ForgetRequest{Key: key, Actor: "actor"})
+				return err
 			},
 		},
 	}

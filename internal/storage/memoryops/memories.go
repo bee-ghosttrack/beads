@@ -75,7 +75,7 @@ func MemoriesFromConfig(all map[string]string) map[string]string {
 }
 
 // RememberInTx stores one memory and reports whether it replaced one, both in
-// the caller's transaction.
+// the caller's transaction, and journals the write in that same transaction.
 //
 // The probe is not tolerant: a read that fails fails the write. That is
 // strictly better than the shipped `existing, _ :=`, because a database that
@@ -87,13 +87,27 @@ func MemoriesFromConfig(all map[string]string) map[string]string {
 // reports true even though a Recall of it would report Found false. See
 // memoryops.RememberResult.Replaced, which states that divergence rather than
 // smoothing it over.
-func RememberInTx(ctx context.Context, tx *sql.Tx, key, content string) (replaced bool, err error) {
+//
+// The probe reads the row's VALUE rather than its existence because the journal
+// record carries the value being replaced (issueops.EventMemory.Previous); the
+// two questions are one query. The journal row is written by
+// issueops.RecordMemoryEventInTx AFTER the config write, in the same tx, so it
+// commits or rolls back with it; a disabled journal makes that a no-op. actor is
+// the acting identity, "" when the caller has none (see RememberRequest.Actor).
+func RememberInTx(ctx context.Context, tx *sql.Tx, key, content, actor string) (replaced bool, err error) {
 	storageKey := StorageKey(key)
-	replaced, err = configRowExistsInTx(ctx, tx, storageKey)
+	previous, replaced, err := configRowValueInTx(ctx, tx, storageKey)
 	if err != nil {
 		return false, err
 	}
 	if err := issueops.SetConfigInTx(ctx, tx, storageKey, content); err != nil {
+		return false, err
+	}
+	memory := &issueops.EventMemory{Key: key, Content: &content}
+	if replaced {
+		memory.Previous = &previous
+	}
+	if err := issueops.RecordMemoryEventInTx(ctx, tx, issueops.EventMemoryRemember, memory, actor); err != nil {
 		return false, err
 	}
 	return replaced, nil
@@ -108,16 +122,20 @@ func RecallInTx(ctx context.Context, tx *sql.Tx, key string) (string, error) {
 
 // ForgetInTx removes one memory and returns what it held, both in the caller's
 // transaction — which is what makes the returned value the one that was
-// actually deleted rather than the one an earlier read happened to see.
+// actually deleted rather than the one an earlier read happened to see — and
+// journals the removal in that same transaction.
 //
 // found is Recall's found, not the row's: a memory stored as the empty string
 // reports found false and IS NOT DELETED. That keeps Forget's answer and
 // Recall's answer the same statement, which is what a front door printing
 // "No memory with key ..." after a successful Recall would otherwise contradict.
+// A forget that deletes nothing journals nothing, exactly as a dep_remove
+// naming an edge already gone records nothing: the journal is a record of
+// mutations, and there was none.
 //
 // The delete names the one encoded key. There is no LIKE and no prefix sweep in
 // it, so forgetting "a" cannot take "a-b" with it.
-func ForgetInTx(ctx context.Context, tx *sql.Tx, key string) (previous string, found bool, err error) {
+func ForgetInTx(ctx context.Context, tx *sql.Tx, key, actor string) (previous string, found bool, err error) {
 	storageKey := StorageKey(key)
 	previous, err = issueops.GetConfigInTx(ctx, tx, storageKey)
 	if err != nil {
@@ -127,6 +145,10 @@ func ForgetInTx(ctx context.Context, tx *sql.Tx, key string) (previous string, f
 		return "", false, nil
 	}
 	if err := issueops.DeleteConfigInTx(ctx, tx, storageKey); err != nil {
+		return "", false, err
+	}
+	memory := &issueops.EventMemory{Key: key, Previous: &previous}
+	if err := issueops.RecordMemoryEventInTx(ctx, tx, issueops.EventMemoryForget, memory, actor); err != nil {
 		return "", false, err
 	}
 	return previous, true, nil
@@ -148,22 +170,17 @@ func ListInTx(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
 	return MemoriesFromConfig(all), nil
 }
 
-// configRowExistsInTx reports whether the row is there, regardless of what it
-// holds.
-//
-// issueops.GetConfigInTx cannot answer this: it maps a missing row to "" and is
-// right to, because every other caller wants a value. Replaced is a statement
-// about the ROW, so this role needs the distinction that helper deliberately
-// drops — hence the one query in this package that is not composed from the
-// shared config helpers.
-func configRowExistsInTx(ctx context.Context, tx *sql.Tx, storageKey string) (bool, error) {
-	var one int
-	err := tx.QueryRowContext(ctx, "SELECT 1 FROM config WHERE `key` = ?", storageKey).Scan(&one)
+// configRowValueInTx reads one config row's value and whether the row exists.
+// The two come from one query because a missing row and a row stored "" both
+// read as "" through GetConfigInTx, and the memory journal needs to tell them
+// apart (issueops.EventMemory.Previous is absent for one and "" for the other).
+func configRowValueInTx(ctx context.Context, tx *sql.Tx, storageKey string) (value string, exists bool, err error) {
+	err = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", storageKey).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("probe memory row %s: %w", storageKey, err)
+		return "", false, fmt.Errorf("probe memory row %s: %w", storageKey, err)
 	}
-	return true, nil
+	return value, true, nil
 }

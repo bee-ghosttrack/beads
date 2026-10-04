@@ -4,10 +4,12 @@ import "context"
 
 // Row is one raw record of the durable mutation journal.
 //
-// IssueJSON is empty when the op is a delete (no surviving row to snapshot);
+// IssueJSON is empty when the op is a delete (no surviving row to snapshot)
+// and on a memory op (a memory is not a bead; IssueID is empty there too);
 // DepJSON is empty for non-dependency ops; CommentJSON is empty for non-comment
-// ops. TS is the insert-time timestamp, stamped inside the committing
-// transaction and normalized to a string.
+// ops; MemoryJSON is empty for every op but the two memory-plane writes. TS is
+// the insert-time timestamp, stamped inside the committing transaction and
+// normalized to a string.
 //
 // TS IS NOT MONOTONE IN SEQ, and a consumer that sorts by it is wrong. It is
 // client-stamped, so two writers against one SQL server — or one writer whose
@@ -29,6 +31,7 @@ type Row struct {
 	IssueJSON   string
 	DepJSON     string
 	CommentJSON string
+	MemoryJSON  string
 }
 
 // Page is one journal read that also reports how far behind the caller is: the

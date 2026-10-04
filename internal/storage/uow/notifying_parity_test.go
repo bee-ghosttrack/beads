@@ -111,12 +111,14 @@ func TestNotifyingUOWWrapsEveryMutatingUseCase(t *testing.T) {
 			"DoltRemoteUseCase": "Dolt remotes are repository plumbing; no bead changes and no event to name",
 			"RawSQLUseCase": "the raw escape hatch executes statements this layer cannot read, so it " +
 				"cannot say which bead changed; the DoltStorage chain fires nothing for raw access either",
-			"EventsJournalUseCase": "read-only cursor surface; fires no hooks. Two of its three " +
+			"EventsJournalUseCase": "journal surface; fires no hooks. Two of its four " +
 				"operations read bd_events_journal (Read, and ReadPage which adds the counter head " +
-				"GET /v0/beads/events pages with) and the third is a prefix delete of records " +
+				"GET /v0/beads/events pages with), the third is a prefix delete of records " +
 				"already committed — the delete changes no bead, and the journal itself is written " +
 				"at the issueops seam inside the mutation's own transaction, so everything it " +
-				"records is already covered by the use case that made the change",
+				"records is already covered by the use case that made the change — and the fourth, " +
+				"RecordMemoryEvent, journals a memory-plane write, which is a config row and not a " +
+				"bead: no script hook names a memory on the DoltStorage plumbing either",
 		})
 }
 

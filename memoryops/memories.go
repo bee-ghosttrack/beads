@@ -24,6 +24,14 @@ type RememberRequest struct {
 	// all survive. Truncating it to one line is what a front door does when it
 	// prints; it is not what this plane does when it stores.
 	Content string
+	// Actor is the acting identity, recorded on the write's durable events
+	// journal record (op memory_remember) exactly as a bead mutation's actor is
+	// — the same string `bd create` threads to its record. It is OPTIONAL and
+	// changes nothing about what is stored: "" is journaled as the absent
+	// actor, which a consumer reads as system/unknown, never as attribution.
+	// A front door that knows who is acting passes it; one that does not
+	// leaves it empty rather than inventing one.
+	Actor string
 }
 
 // RememberResult reports what landed.
@@ -74,7 +82,12 @@ type RecallResult struct {
 
 // ForgetRequest names one memory to remove. An empty Key is ErrValidation, for
 // the reason RecallRequest's is.
-type ForgetRequest struct{ Key string }
+type ForgetRequest struct {
+	Key string
+	// Actor is as on RememberRequest.Actor: the identity the removal's journal
+	// record (op memory_forget) carries, optional, "" for none.
+	Actor string
+}
 
 // ForgetResult reports the removal.
 type ForgetResult struct {

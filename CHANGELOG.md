@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The durable events journal (`bd events tail`, `GET /v0/beads/events`) now
+  records memory-plane writes: `bd remember` journals a `memory_remember`
+  record and `bd forget` a `memory_forget` record, each carrying a new
+  `memory` member — `{"key","content","previous"}`: the user key verbatim, the
+  value after a remember, the value before a replace or a forget. Both ops are
+  engine-only, like `comment` (a projector skips them; no wire event names a
+  memory), `issue_id` is empty and `issue` is `null` on them, and the
+  `bd_events_journal` table gains a nullable `memory_json` column (migration
+  0070 with its clone-local twin ignored/0028). Before this a workspace's
+  memories had no second copy anywhere a journal consumer could replay from.
+  `memoryops.RememberRequest` and `ForgetRequest` gain an optional `Actor`,
+  which `bd remember` / `bd forget` fill with the CLI actor; the HTTP memory
+  routes leave it empty (system/unknown).
+
 - `backends.Backend` gains an optional `OpenWith(ctx, beadsDir, OpenOptions)`
   and a `Remote bool` field for a registered extension backend (for example
   an HTTP client registrant). `OpenOptions{Credential, HTTPClient,

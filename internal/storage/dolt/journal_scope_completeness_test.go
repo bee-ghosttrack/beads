@@ -58,6 +58,7 @@ func TestEveryRawTxJournalScopeIsScopedOrExempt(t *testing.T) {
 		"RecordDeleteInTx":       true,
 		"RecordDepEventInTx":     true,
 		"RecordCommentEventInTx": true,
+		"RecordMemoryEventInTx":  true,
 		"insertEventRow":         true,
 	}
 	// Deliberately the PLAIN fixpoint, with no readiness-family exclusion: for

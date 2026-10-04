@@ -8020,7 +8020,8 @@ components:
       type: object
       description: >-
         One record of the durable events journal: a single committed issue
-        mutation, as a replaying consumer receives it.
+        mutation — or, on the two `memory_*` ops, a memory-plane write — as a
+        replaying consumer receives it.
 
 
         THIS IS THE CLI'S RECORD. It is pinned to the same Go struct
@@ -8038,7 +8039,10 @@ components:
         to record, so the member is emitted rather than omitted. `dep` and
         `comment` are the opposite: they are ABSENT on the ops that have no such
         half, because their absence says the op has none, not that one was
-        empty.
+        empty. `memory` follows the same rule: present on `memory_remember` and
+        `memory_forget`, absent on every other op; on those two ops `issue_id`
+        is the empty string and `issue` is `null`, because a memory is not a
+        bead.
       x-go-type: eventsjournal.Record
       x-go-type-import:
         name: eventsjournal
@@ -8065,12 +8069,17 @@ components:
           type: string
           description: >-
             What was done: `create`, `update`, `close`, `delete`, `dep_add`,
-            `dep_remove` or `comment`. The set is closed in v0; a client MUST
-            default-branch on an unknown value rather than fail, so that adding
-            one stays additive.
+            `dep_remove`, `comment`, `memory_remember` or `memory_forget`. The
+            set is closed in v0; a client MUST default-branch on an unknown
+            value rather than fail, so that adding one stays additive — which
+            is how the two `memory_*` ops were added.
         issue_id:
           type: string
-          description: The mutated issue's canonical id.
+          description: >-
+            The mutated issue's canonical id. The empty string on
+            `memory_remember` and `memory_forget`: a memory is not a bead, and
+            its key travels in `memory.key`, which is verbatim user text and
+            never an id.
         actor:
           type: string
           description: >-
@@ -8105,6 +8114,15 @@ components:
           description: >-
             On `comment` only: `{"id","author","text","created_at","source"}`.
             Absent on every other op.
+        memory:
+          type: object
+          description: >-
+            On `memory_remember` and `memory_forget` only:
+            `{"key","content","previous"}`. `key` is the memory's user key,
+            verbatim — opaque text, never an id. `content` is the value AFTER
+            the write and is present on `memory_remember` only; `previous` is
+            the value BEFORE it and is present when one existed (a remember
+            that replaced a row, and every forget). Absent on every other op.
 
     EventsPage:
       type: object

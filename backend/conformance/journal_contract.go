@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"testing"
@@ -146,10 +147,17 @@ type JournalMutations struct {
 	// RemoveDependency removes that edge again, and its record is the source's
 	// for the same reason.
 	RemoveDependency func(ctx context.Context, from, to string) error
-	// Comment writes one structured comment on an existing issue. Its op is the
-	// one the engine journals and the wire never carries; see
+	// Comment writes one structured comment on an existing issue. Its op is
+	// journaled and the wire never carries it; see
 	// RunJournalEveryMutationKindLandsARow.
 	Comment func(ctx context.Context, id, text string) error
+	// Remember stores one memory under key (memoryops.Memories.Remember) and
+	// Forget removes it. Their ops are the other two engine-only ones: a memory
+	// is a config row, not a bead, so the record names no issue (issue_id is
+	// empty) and carries the key in its memory payload instead — which is why
+	// the kit matches these two rows by key rather than by subject.
+	Remember func(ctx context.Context, key, content string) error
+	Forget   func(ctx context.Context, key string) error
 }
 
 // RunJournalPagesAreSeqAscendingAndSinceExclusive pins the two properties a
@@ -433,10 +441,10 @@ func RunJournalHeadSurvivesAFullPrune(t *testing.T, ctx context.Context, fixture
 // exist, and a missing KIND is invisible to a reader that only counts.
 //
 // THE ENGINE-ONLY OPS ARE DEMANDED, NOT SKIPPED, and that distinction is the
-// whole reason issueops.IsWireEventOp exists. The journal records seven ops and
-// the public event vocabulary is six; a projector SKIPS the seventh rather than
-// faulting on it, and that skip is only sound while the record is there to be
-// skipped. A contract that dropped the engine-only ops because "no wire event
+// whole reason issueops.IsWireEventOp exists. The journal records nine ops and
+// the public event vocabulary is six; a projector SKIPS the other three rather
+// than faulting on them, and that skip is only sound while the record is there
+// to be skipped. A contract that dropped the engine-only ops because "no wire event
 // carries them" would be asserting the projector's view of the journal instead
 // of the journal's own, and the first backend to stop recording a comment would
 // pass it.
@@ -466,7 +474,7 @@ func RunJournalEveryMutationKindLandsARow(t *testing.T, ctx context.Context, fix
 			t.Fatalf("%s: %v", mutation.what, err)
 		}
 		page := journalRead(t, ctx, fixture, before, 0)
-		if !journalRecords(page.Rows, string(mutation.op), mutation.subject) {
+		if !mutation.recordedIn(page.Rows) {
 			t.Errorf("%s recorded no %q for %s; the journal above seq %d holds %v. A mutation kind the "+
 				"journal drops is a replay that silently diverges from the workspace it claims to mirror",
 				mutation.what, mutation.op, mutation.subject, before, journalOpsOf(page.Rows))
@@ -484,12 +492,38 @@ func RunJournalEveryMutationKindLandsARow(t *testing.T, ctx context.Context, fix
 }
 
 // journalMutation is one row of the mutation kit under test: the op it must
-// record, the id that record names, and how to drive it.
+// record, the id (or, for a memory op, the key) that record names, and how to
+// drive it.
 type journalMutation struct {
 	op      storeops.EventOp
 	what    string
 	subject string
-	run     func(ctx context.Context) error
+	// memory marks the two memory-plane ops, whose records name no issue:
+	// subject is then the memory KEY, matched inside the row's memory payload.
+	memory bool
+	run    func(ctx context.Context) error
+}
+
+// recordedIn reports whether rows holds this mutation's record. A bead op is
+// matched by op and issue_id; a memory op by op, an EMPTY issue_id (a memory is
+// not a bead, and a backend that put the key there would be asserting it is)
+// and the key inside memory_json.
+func (m journalMutation) recordedIn(rows []journalops.Row) bool {
+	if !m.memory {
+		return journalRecords(rows, string(m.op), m.subject)
+	}
+	for _, row := range rows {
+		if row.Op != string(m.op) || row.IssueID != "" || row.MemoryJSON == "" {
+			continue
+		}
+		var payload struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal([]byte(row.MemoryJSON), &payload); err == nil && payload.Key == m.subject {
+			return true
+		}
+	}
+	return false
 }
 
 // journalMutationKit binds each hook the fixture supplies to the op it must
@@ -520,6 +554,14 @@ func journalMutationKit(fixture JournalFixture, subject, other string) []journal
 			run: func(ctx context.Context) error { return m.Close(ctx, subject) }},
 		{op: storeops.EventDelete, what: "deleting an issue", subject: subject,
 			run: func(ctx context.Context) error { return m.Delete(ctx, subject) }},
+		// The memory plane: the key is namespaced like the ids, because config
+		// keys are global to the workspace exactly as ids are.
+		{op: storeops.EventMemoryRemember, what: "remembering a memory", subject: subject + "-memory", memory: true,
+			run: func(ctx context.Context) error {
+				return m.Remember(ctx, subject+"-memory", "a memory the journal records and no wire event carries")
+			}},
+		{op: storeops.EventMemoryForget, what: "forgetting a memory", subject: subject + "-memory", memory: true,
+			run: func(ctx context.Context) error { return m.Forget(ctx, subject+"-memory") }},
 	}
 }
 
