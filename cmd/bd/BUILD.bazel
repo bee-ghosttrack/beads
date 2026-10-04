@@ -1091,6 +1091,7 @@ go_test(
         "shared_store_migrate_gate_test.go",
         "ship_embedded_test.go",
         "show_brief_deps_test.go",
+        "show_comments_tail_test.go",
         "show_current_test.go",
         "show_details_json_test.go",
         "show_embedded_test.go",
