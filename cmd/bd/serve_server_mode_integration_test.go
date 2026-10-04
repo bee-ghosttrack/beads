@@ -170,12 +170,16 @@ func TestServerModeServe(t *testing.T) {
 
 	// The proxy serve fronts the server through must survive every quiet period
 	// the process can have. Its only client is serve's pool, which drops its last
-	// connection after ConnMaxIdleTime (5m) of no requests; a proxy with a finite
-	// idle timeout then exits and takes the OS-assigned port the provider's DSN
-	// pinned at construction, permanently, with /healthz still green.
+	// connection after ConnMaxIdleTime (20s, servePoolLimits) of no requests; a
+	// proxy with a finite idle timeout then exits and takes the OS-assigned port
+	// the provider's DSN pinned at construction, permanently, with /healthz still
+	// green.
 	//
-	// Asserted on the spawned child's own command line because the failure is
-	// otherwise only visible after five idle minutes, which no test can wait for.
+	// Asserted on the spawned child's own command line because observing the
+	// failure directly means idling out serve's pool and then the proxy's own
+	// idle timeout (20s + the 30s default) before a request can fail — a minute
+	// of enforced dead time gated on two independent timers, which is neither
+	// cheap nor reliable enough for a test.
 	assertProxyChildNeverIdles(t, filepath.Join(p.beadsDir, "dolt"))
 
 	sp.shutdown(t)
@@ -280,6 +284,16 @@ func TestServerModeServeSkipsPostRunMaintenance(t *testing.T) {
 // identity, so it naming the project database while every operation answers
 // from the global one is a lie with a straight face. Without the fix the
 // handshake and the startup line both report p.database here.
+//
+// Deliberately not named TestServerMode...: this would make it discovered by
+// the shard scripts' ^Test(ProxiedServer|ServerMode) regex, but it still
+// fails: `bd serve --global` refuses to auto-apply 4 pending schema
+// migrations (v65 to v69) to a shared/proxied server database and exits 1
+// with a consent-required usage message instead of starting (bead filed:
+// shared-server global DB created at schema v65, serve --global refuses the
+// #5920 migration guard). Renaming it into a required lane before that's
+// resolved would turn Bazel + the legacy 15-shard hash-fallback + main.yml's
+// push job red. Rename it once the guard interaction is resolved.
 func TestSharedServerModeServeGlobalReportsTheServedDatabase(t *testing.T) {
 	requireSharedProxiedServer(t)
 	t.Parallel()
