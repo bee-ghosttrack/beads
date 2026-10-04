@@ -495,6 +495,17 @@ func TestProxiedServerClose3(t *testing.T) {
 			t.Errorf("status: got %q, want closed", got)
 		}
 	})
+}
+
+// TestProxiedServerClose4 is the second half of TestProxiedServerClose3. With
+// all 12 of its bd-init subtests in one parent, whichever 15-shard legacy
+// shard hosted Close3 timed out in turn (6, then 1) while shard 5 dropped to
+// 5m, so the remaining weight is carried as two parents of six on two shards
+// (gastownhall/beads#7151).
+func TestProxiedServerClose4(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
 
 	// ga-ktn9pe.4.8: this used to have an embedded twin
 	// (TestEmbeddedClose/close_boolean_pinned_reclose_is_idempotent), but

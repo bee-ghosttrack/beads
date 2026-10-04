@@ -119,6 +119,7 @@
 
 15 7 TestProxiedServerAssign
 15 7 TestProxiedServerBackupRefusedOnExternalTopology
+15 7 TestProxiedServerClose4
 15 7 TestProxiedServerCount
 15 7 TestProxiedServerGC
 15 7 TestProxiedServerList
@@ -361,6 +362,7 @@
 
 30 17 TestProxiedServerClose
 30 17 TestProxiedServerClose3
+30 17 TestProxiedServerClose4
 30 17 TestProxiedServerConfigConcurrent
 30 17 TestProxiedServerDeleteConcurrent
 30 17 TestProxiedServerSearch
