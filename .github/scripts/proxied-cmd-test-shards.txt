@@ -51,6 +51,7 @@
 #   a doc comment.
 
 15 1 TestProxiedServerBlocked
+15 1 TestProxiedServerClose3
 15 1 TestProxiedServerCompactDolt
 15 1 TestProxiedServerCreate
 15 1 TestProxiedServerDep2
@@ -107,7 +108,6 @@
 15 5 TestProxiedServerWispCreate
 
 15 6 TestProxiedServerClose2
-15 6 TestProxiedServerClose3
 15 6 TestProxiedServerContext
 15 6 TestProxiedServerExternalCreate
 15 6 TestProxiedServerLink
