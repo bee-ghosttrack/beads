@@ -1199,6 +1199,35 @@ func TestIntentLockOrderExclusiveHoldsEarlierGate(t *testing.T) {
 	recv(t, s2, "shared {a,b}")
 }
 
+// The wait budget can run out while an iteration is deferring to queued
+// intent (the queue check is file I/O). That iteration never tried the gate,
+// so it must not be the one that reports ErrBusy: the final attempt still runs.
+func TestBudgetExpiringDuringIntentDeferralStillMakesFinalAttempt(t *testing.T) {
+	g, _ := ForWorkspace(filepath.Join(t.TempDir(), "ws"))
+	intent := g.tryTakeIntent("test queued")
+	if intent == nil {
+		t.Fatal("tryTakeIntent failed")
+	}
+	t.Cleanup(func() { g.releaseIntent(intent) })
+
+	const wait = 50 * time.Millisecond
+	deferrals := 0
+	testHookDeferredToIntent = func() {
+		deferrals++
+		time.Sleep(2 * wait) // the budget expires inside the deferral
+	}
+	t.Cleanup(func() { testHookDeferredToIntent = nil })
+
+	h, err := g.Acquire(context.Background(), Shared, Options{Wait: wait, PollInterval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("free gate with queued intent: %v, want the final attempt to acquire it", err)
+	}
+	_ = h.Release()
+	if deferrals != 1 {
+		t.Errorf("deferred to intent %d times, want 1", deferrals)
+	}
+}
+
 // An exhausted AcquireAll budget leaves later gates exactly one attempt,
 // and queued intent on such a gate cannot fail the set (the gate is free).
 func TestAcquireAllExhaustedBudgetFinalAttemptIgnoresIntent(t *testing.T) {

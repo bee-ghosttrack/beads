@@ -501,8 +501,13 @@ func (g Gate) Acquire(ctx context.Context, mode Mode, opts Options) (*Handle, er
 		// The final attempt (budget spent) ignores intent: queued
 		// maintenance may delay a shared acquirer, never fail it.
 		final := time.Until(deadline) <= 0
+		deferred := false
 		if defersToIntent && !final && g.ExclusiveQueued() {
 			detail = g.queuedDetail()
+			deferred = true
+			if testHookDeferredToIntent != nil {
+				testHookDeferredToIntent()
+			}
 		} else {
 			err := try(f)
 			if err == nil {
@@ -525,6 +530,12 @@ func (g Gate) Acquire(ctx context.Context, mode Mode, opts Options) (*Handle, er
 			}
 		}
 		remaining := time.Until(deadline)
+		if deferred && remaining <= 0 {
+			// The budget ran out while this iteration was deferring to
+			// queued intent, so the gate itself was never tried. Loop once
+			// more: the next iteration is the final attempt.
+			continue
+		}
 		if !waiting || remaining <= 0 {
 			_ = f.Close()
 			return nil, fmt.Errorf("workspacegate: %s (%s mode) held by %s: %w",
@@ -563,6 +574,11 @@ func (g Gate) Acquire(ctx context.Context, mode Mode, opts Options) (*Handle, er
 // above how long ordinary in-flight commands take to drain. A var so tests
 // can shorten it.
 var maxIntentHold = 10 * time.Second
+
+// testHookDeferredToIntent, when set, runs each time a Shared acquisition
+// defers to queued intent instead of trying the gate. Tests use it to let the
+// wait budget expire inside that step.
+var testHookDeferredToIntent func()
 
 // ExclusiveQueued reports whether a waiting Exclusive acquirer currently
 // holds this gate's intent lock. The probe opens read-only and treats a
