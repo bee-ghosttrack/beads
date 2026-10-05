@@ -240,6 +240,12 @@ func roundTripCases() []roundTripCase {
 		IssueType: "bug",
 		Assignee:  "agent-7",
 
+		// NoParent is the fourth scope member and has a case of its own
+		// below: the role refuses it beside ParentID.
+		ParentID:      "bd-a3f8e9",
+		ExcludeTypes:  []string{"gate", "molecule"},
+		ExcludeStatus: []string{"deferred", "blocked"},
+
 		// Zero is a real priority on this request too, and all three bounds are
 		// pointers for that reason.
 		Priority:    &zero,
@@ -313,6 +319,7 @@ func roundTripCases() []roundTripCase {
 		// `all` is a status the count takes literally and the server forwards
 		// verbatim; it is not the listing's boolean of the same spelling.
 		{"countIssues/the literal all status", OpCountIssues, "", issueops.CountRequest{Status: "all"}},
+		{"countIssues/top-level rows only", OpCountIssues, "", issueops.CountRequest{NoParent: true}},
 		{"countIssues/byGroup/a dimension over an empty predicate", OpCountIssues, "byGroup", issueops.CountByGroupRequest{GroupBy: issueops.CountGroupStatus}},
 		{"countIssues/byGroup/a dimension over the whole predicate", OpCountIssues, "byGroup", issueops.CountByGroupRequest{Filter: countEverything, GroupBy: issueops.CountGroupLabel}},
 

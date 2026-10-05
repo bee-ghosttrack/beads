@@ -382,6 +382,11 @@ func (b *builder) countFilters(req issueops.CountRequest) {
 	b.str("type", req.IssueType)
 	b.str("assignee", req.Assignee)
 
+	b.str("parent", req.ParentID)
+	b.boolean("no_parent", req.NoParent)
+	b.list("exclude_type", req.ExcludeTypes)
+	b.list("exclude_status", req.ExcludeStatus)
+
 	b.intPtr("priority", req.Priority)
 	b.intPtr("priority_min", req.PriorityMin)
 	b.intPtr("priority_max", req.PriorityMax)

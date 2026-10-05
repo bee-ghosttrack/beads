@@ -108,7 +108,7 @@ const (
 	//
 	// countIssues is why it exists: CountByGroupRequest carries the scalar
 	// predicate BY NAME (`Filter`) plus the dimension, so its table would
-	// otherwise have to restate twenty-three classifications the count table
+	// otherwise have to restate thirty classifications the count table
 	// already makes — two copies of one partition, which is the drift every
 	// other gate here is written to prevent.
 	//
@@ -418,7 +418,7 @@ func queryTable() Table {
 // does the most damage: a listing that widened returns rows a caller can look
 // at, and a count that widened returns a NUMBER, which carries no evidence of
 // the set it came from. So the partition here was measured against the
-// document rather than assumed — every one of CountRequest's twenty-three
+// document rather than assumed — every one of CountRequest's thirty
 // members is published by GET /v0/beads/issues:count, and the count's
 // vocabulary is total.
 //
@@ -452,6 +452,18 @@ func countTable() Table {
 			param("Status", "status"),
 			paramTo("IssueType", "type", "IssueType"),
 			param("Assignee", "assignee"),
+
+			// The four scope members GET /v0/beads/issues:count publishes under
+			// the issues.count.scope behavior token (wire.CapCountScope). They
+			// are sent as the caller wrote them: ParentID and ExcludeTypes
+			// spell ListRequest's own fields, and the ROLE refuses ParentID
+			// with NoParent, so this layer does not decide that pair either.
+			// A server predating the token answers each with 400
+			// unknown_parameter, never a wider count.
+			paramTo("ParentID", "parent", "ParentID"),
+			paramTo("NoParent", "no_parent", "NoParent"),
+			paramTo("ExcludeTypes", "exclude_type", "ExcludeTypes"),
+			paramTo("ExcludeStatus", "exclude_status", "ExcludeStatus"),
 
 			param("Priority", "priority"),
 			paramTo("PriorityMin", "priority_min", "PriorityMin"),
@@ -506,7 +518,7 @@ func countTable() Table {
 // It is NOT primary — the count table above owns the operation's parameter set
 // — and it classifies two members, because that is all CountByGroupRequest has.
 // The predicate travels through the count table by delegation (DispNested)
-// rather than by a second enumeration of the same twenty-three fields.
+// rather than by a second enumeration of the same thirty fields.
 func countByGroupTable() Table {
 	return Table{
 		Op: OpCountIssues, Shape: "byGroup",

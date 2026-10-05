@@ -138,6 +138,20 @@ const CapListSort = "issues.list.sort"
 // token gates.
 const CapBatchApplyLarge = "issues.batchApplyLarge"
 
+// CapCountScope is the behavior capability announcing that issues:count honors
+// the four scope parameters `parent`, `no_parent`, `exclude_type` and
+// `exclude_status`, spelled exactly as httpapi's CapIssuesCountScope (held to
+// it by TestTheProjectIdentityVocabularyMatchesTheServer). Like CapListSort it
+// names a property of an existing operation, so it rides here rather than on
+// opCapability.
+//
+// Nothing in this package reads it yet: no count dial exists here. The caller
+// that adds one owes the local refusal httpapi's constant documents — a
+// request setting any of the four against a snapshot without this token is
+// refused before the dial with a typed capability error, never sent and never
+// narrowed.
+const CapCountScope = "issues.count.scope"
+
 // CapExternalDependencies is the CONDITIONAL behavior capability announcing
 // that the ready, claim and close operations of this server apply bd's
 // external-dependency policy themselves, spelled exactly as httpapi's constant
@@ -255,7 +269,7 @@ func (e *WireRevisionSkewError) Unwrap() error { return ErrWireRevisionSkew }
 // union(opCapability tokens, this) set-equal with httpapi.Capabilities(), which is
 // what makes the server change and this client change land together: the parity
 // test goes red the moment one ships without the other.
-var behaviorCapabilities = []string{CapProjectEnforce, CapBatchApplyLarge, CapListSort}
+var behaviorCapabilities = []string{CapProjectEnforce, CapBatchApplyLarge, CapListSort, CapCountScope}
 
 // CapabilityFor reports the capability token gating op, and whether op is on
 // this client's map at all. An operation with no token — liveness, the
