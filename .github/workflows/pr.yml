@@ -5,8 +5,16 @@ on:
     # release/** is here because release-prep and release-fix PRs are based on
     # the release branch, not on main. Without it they run almost no CI and the
     # first full signal is the tag build, where a failure burns the tag.
-    branches: [ main, 'release/**' ]
+    branches: [ main, 'release/**', 'hotfix/**' ]
+  # Merge queue (engdocs/CI_REQUIRED_CHECK_TOPOLOGY.md, "Merge Queue"):
+  # the ruleset's required gate must also report on each queue entry's
+  # merge-group commit, or a queued PR waits until the queue times it out.
+  # checks_requested is the queue asking for those checks; pinned
+  # explicitly (scripts/ci_merge_queue_test.go). The concurrency group
+  # below keys a merge group on its own gh-readonly-queue/* ref, so queue
+  # runs never cancel each other or a PR's own runs.
   merge_group:
+    types: [ checks_requested ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -16,7 +24,7 @@ env:
   BD_DISABLE_METRICS: "1"
   BD_DISABLE_EVENT_FLUSH: "1"
   # D2: "true" retires a PR Risk legacy tier on same-repo, non-Dependabot
-  # pull_requests; pr.yml's gated Bazel lane(s) for it are then the tier's
+  # pull_requests and on merge groups (merge queue); pr.yml's gated Bazel lane(s) for it are then the tier's
   # only pre-merge run, and pr.yml's gate goes red unless they ran remotely
   # and passed. Committed, not repo variables, so a re-run can never change
   # them; each must equal pr.yml's / pr-risk.yml's copy
@@ -42,7 +50,7 @@ env:
   # touching ci-gate.needs or the env map below -- see the "Evaluate CI gate"
   # step's run script. Committed, not a repo variable, for the same reason as
   # the BAZEL_RETIRES_LEGACY_* flags above: a re-run can never change it.
-  WINDOWS_PREBUILT_REQUIRED: "false"
+  WINDOWS_PREBUILT_REQUIRED: "true"
   # Fork and Dependabot PRs: "true" covers them like same-repo PRs (the
   # flags above then retire their legacy tiers too): rbe-west's mint
   # (rbe-fork) gives their Bazel lanes remote execution, instance oss-fork
@@ -51,11 +59,26 @@ env:
   # lanes run remotely beside them whenever rbe-fork is open (bazel.yml
   # modes fork-ro/fork-rw), else locally with the read-only cache as before.
   BAZEL_COVERS_FORKS: "false"
+  # bazel.yml's bazel-cmd-dolt lane (the cmd/bd Dolt-server tier: the
+  # Dolt-gated cmd/bd tests no other lane runs) is advisory while this is
+  # "false": it runs and reports in the bazel call (continue-on-error, so a
+  # failure never turns the call's aggregate red), and ci-gate ignores its
+  # BAZEL_CMD_DOLT result. "true" adds BAZEL_CMD_DOLT to CI_GATE_REQUIRED in
+  # the "Evaluate CI gate" step's run script; bazel-gate.sh still accepts
+  # its skip in modes skip and local. Committed, not a repo variable, for
+  # the same reason as the flags above. The `bazel` job's cmd-dolt-required
+  # input must equal it (a `with:` cannot read env; policy-tested): "true"
+  # also drops //cmd/bd:bd_test from bazel-integration, because the required
+  # lane runs the same integration-build bd_test without the dolt skip, so
+  # each cmd/bd test runs once. Rollback: commit "false" here and false in
+  # that input together; bazel-integration runs bd_test again on the next run.
+  BAZEL_CMD_DOLT_REQUIRED: "true"
 
 jobs:
 
   # D2 step 3: stands down where bazel-coverage says pr_lanes (same-repo,
-  # non-Dependabot PRs while BAZEL_RETIRES_LEGACY_PR_LANES is "true"): its
+  # non-Dependabot PRs and merge groups while BAZEL_RETIRES_LEGACY_PR_LANES
+  # is "true"): its
   # consumers then stand down too. F3: the package gates (package-mcp,
   # package-npm) are no longer among those consumers - they moved into
   # bazel.yml and build their own bd (Bazel-built on same-repo PRs, `go
@@ -190,15 +213,23 @@ jobs:
         run: ./scripts/check-migration-hygiene.sh
 
       # Fast check to catch accidental .beads/issues.jsonl changes from
-      # contributors. pull_request-only, same as before the fold: merge_group
-      # has no base_ref to diff against, so the step (and therefore this
-      # token) is skipped there, and merge_group's CI_GATE_SKIPPED_OK
-      # allow-lists exactly that skip below.
+      # contributors. Runs on both PR triggers: a pull_request diffs against
+      # origin/<base branch> (GITHUB_BASE_REF), a merge group (which has no
+      # base_ref) against the queue's merge_group.base_sha, the commit the
+      # group's head is built on (fetch-depth 0 above fetches it).
       - name: Check for .beads/issues.jsonl changes
         id: no-beads-changes
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() }}
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
-          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -q "^\.beads/issues\.jsonl$"; then
+          base="${MERGE_GROUP_BASE_SHA:-origin/${GITHUB_BASE_REF:-main}}"
+          # Fail closed: a pipe into grep -q would pass on a failed diff.
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "::error::diff base $base is unavailable"
+            exit 1
+          fi
+          if git diff --name-only "$base"...HEAD | grep -q "^\.beads/issues\.jsonl$"; then
             echo "This PR includes changes to .beads/issues.jsonl"
             echo ""
             echo "This file is the project's issue database and should not be modified in PRs."
@@ -840,6 +871,12 @@ jobs:
       - name: Validate docs against CLI
         env:
           DOC_DRIFT_PATCH_OUT: ${{ runner.temp }}/cli-docs-freshness.patch
+          # Merge queue: a merge group has no GITHUB_BASE_REF, and without a
+          # diff base check-cli-docs-drift.sh fails on any drift, including
+          # drift already on main that the PR run attributed away, which
+          # would eject every queued PR. Diff against the queue's base
+          # commit instead (empty on pull_request: origin/$GITHUB_BASE_REF).
+          BD_DOCS_DIFF_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           ./scripts/check-doc-flags.sh ./bd
           ./scripts/check-doc-freshness.sh
@@ -868,17 +905,21 @@ jobs:
   # non-race Go build cache seeded by main.yml's push-to-main savers on the
   # exact same runner selection (S2 below).
   #
-  # F7b review fix (S3): the macOS leg stays on GitHub-hosted macos-latest
-  # unconditionally -- never Blacksmith -- because Blacksmith bills macOS
-  # runners at roughly 20x its Linux/Windows rate and no push-to-main
-  # Blacksmith-macOS cache saver exists (main.yml's `test` job's macOS leg,
-  # which this job's restore step reads from, already runs on GitHub-hosted
-  # macos-latest). The `runner: same-repo-macos` marker is kept only so this
-  # job's matrix shape stays uniform across all three OSes; its branch in the
-  # chained ternary is a plain `'macos-latest'`, not a same-repo conditional.
+  # The macOS leg moves to same-repo Blacksmith macOS
+  # (blacksmith-6vcpu-macos-26, Apple Silicon) like the other two legs; forks,
+  # Dependabot and any non-PR event keep GitHub-hosted macos-latest. The label
+  # is pinned to macos-26 because that is the image GitHub's macos-latest
+  # resolves to today (macos-26-arm64), so both paths run the same OS and
+  # architecture; bump it together with GitHub's macos-latest migration.
+  # 6 vCPU (vs. macos-latest's 3) is already 2x the GitHub-hosted leg; the
+  # 12 vCPU size is not justified for a leg dominated by one incremental
+  # ./cmd/bd test compile. This reverses F7b review fix S3 (cost accepted):
+  # main.yml's blacksmith-macos-go-build-cache job is the push-to-main
+  # Blacksmith-macOS saver S3 said was missing, on this exact label, and the
+  # GitHub-hosted fork path still restores main.yml's `test` job macOS leg.
   check-doc-freshness-platforms:
     name: Check doc freshness (${{ matrix.os }})
-    runs-on: ${{ matrix.runner == 'same-repo-linux' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest') || matrix.runner == 'same-repo-windows' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-windows-2025' || 'windows-latest') || matrix.runner == 'same-repo-macos' && 'macos-latest' || matrix.os }}
+    runs-on: ${{ matrix.runner == 'same-repo-linux' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest') || matrix.runner == 'same-repo-windows' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-windows-2025' || 'windows-latest') || matrix.runner == 'same-repo-macos' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-6vcpu-macos-26' || 'macos-latest') || matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -950,7 +991,7 @@ jobs:
   # step) for the fix that actually targets it. Reverted to one leg per OS.
   pr-preflight-platforms:
     name: PR preflight process (${{ matrix.os }})
-    runs-on: ${{ matrix.runner == 'same-repo-linux' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest') || matrix.runner == 'same-repo-windows' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-windows-2025' || 'windows-latest') || matrix.runner == 'same-repo-macos' && 'macos-latest' || matrix.os }}
+    runs-on: ${{ matrix.runner == 'same-repo-linux' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest') || matrix.runner == 'same-repo-windows' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-windows-2025' || 'windows-latest') || matrix.runner == 'same-repo-macos' && ((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-6vcpu-macos-26' || 'macos-latest') || matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -985,8 +1026,9 @@ jobs:
       # F7b review (S2): restore-only non-race Go build cache, seeded by the
       # push-to-main saver on the exact same runner selection (Linux:
       # main.yml's blacksmith-go-build-cache non-race leg; Windows:
-      # main.yml's test-windows Blacksmith leg; macOS: main.yml's test job's
-      # macOS leg) so the cold cmd/bd compile below (the real long pole,
+      # main.yml's test-windows Blacksmith leg; macOS: main.yml's
+      # blacksmith-macos-go-build-cache on Blacksmith, the test job's macOS
+      # leg on the GitHub-hosted fork path) so the cold cmd/bd compile below (the real long pole,
       # 250-300s uncached) gets a true cache hit instead of starting cold.
       # GOCACHE must match the seeder's exactly, and CGO_ENABLED is left at
       # its platform default (same as the seeder) so the key families line
@@ -1024,8 +1066,17 @@ jobs:
           GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: go test '-tags=gms_pure_go' -count=1 -run '^TestGeneratedHookTimeoutProcessBoundary$' ./cmd/bd
 
+      # This step recompiles ./cmd/bd's test binary. It must share the restored
+      # GOCACHE with the hook-timeout step above (same tags, same platform
+      # default CGO_ENABLED, see the script's header) so it is a relink rather
+      # than a second cold compile: without GOCACHE here it fell back to the
+      # runner's empty default cache and cold-compiled all of ./cmd/bd on every
+      # PR (210-240s on macos-latest, ~120s on Windows; the leg's long pole).
+      # TestPRPreflightPlatformsRunStepsUseRestoredGoBuildCache pins this.
       - name: Exercise native init gateway credential shell
         shell: bash
+        env:
+          GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: bash scripts/ci/test-init-gateway-credential.sh "$RUNNER_OS"
 
       - name: Exercise credential command fixtures on Windows
@@ -1033,6 +1084,7 @@ jobs:
         shell: pwsh
         env:
           CGO_ENABLED: "0"
+          GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: |
           $go = (Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
           $hostInfo = @(& $go env GOHOSTOS GOOS)
@@ -1069,11 +1121,15 @@ jobs:
       - name: Check benchmark environment scrubbing
         if: matrix.os == 'windows-latest'
         shell: bash
+        env:
+          GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: go test -tags gms_pure_go -count=1 -run '^(TestCleanEnvUsesHostKeySemantics|TestBenchmarkCommandBuildersStripDoltEnvOverrides)$' ./scripts/repro-dolt-prod-timeouts
 
       - name: Check shared environment key semantics
         if: matrix.os == 'windows-latest'
         shell: bash
+        env:
+          GOCACHE: ${{ runner.temp }}/go-cache/non-race
         run: bash scripts/ci/test-windows-env-helpers.sh
 
   # F3: package-mcp and package-npm (and the detect job that fed them) moved
@@ -2237,8 +2293,8 @@ jobs:
   # (PR Core, build-artifacts, the pure-Go/js-wasm check, domain+uow and
   # contract corpus, and pr-risk.yml's embedded-Dolt, proxied-server and
   # server-Dolt storage tiers), all of which stay required ids, but stand
-  # down on same-repo PRs with a non-Dependabot actor while their D2 flag
-  # is "true" (bazel-coverage): pr-risk.yml's embedded-Dolt test jobs
+  # down on same-repo PRs with a non-Dependabot actor, and on merge groups,
+  # while their D2 flag is "true" (bazel-coverage): pr-risk.yml's embedded-Dolt test jobs
   # (BAZEL_RETIRES_LEGACY_EMBEDDED, step 1), its proxied-server and
   # server-Dolt storage test jobs (BAZEL_RETIRES_LEGACY_DOLT_SERVER_TIERS,
   # step 2), and this workflow's PR Core, build-artifacts, pure-Go/js-wasm,
@@ -2252,8 +2308,10 @@ jobs:
   # proxied or server-storage lane) or skip, and exports that for ci-gate.
   # Its bazel-integration lane (main.yml's integration jobs, which run only
   # on push to main) is on and required here in modes remote and cache:
-  # same-repo PRs run it remotely, fork and Dependabot PRs locally with the
-  # read-only cache. Its bd artifact is renamed
+  # same-repo PRs and merge groups run it remotely, fork and Dependabot PRs
+  # locally with the read-only cache. Test results are cached: a PR or
+  # merge group re-runs only tests whose inputs changed (nightly re-runs
+  # everything; .bazelrc test:fresh). Its bd artifact is renamed
   # (bazel-ci-build-artifacts) so it cannot collide with build-artifacts'
   # upload. F3: the package gates build their own bd (via this call's rbe
   # job) and do not consume this artifact; it is kept for the F3.5.3
@@ -2268,9 +2326,13 @@ jobs:
       RBE_TLS_CERT: ${{ secrets.RBE_TLS_CERT }}
       RBE_TLS_KEY: ${{ secrets.RBE_TLS_KEY }}
       RBE_TLS_CA: ${{ secrets.RBE_TLS_CA }}
+      RBE_POOL_APP_PRIVATE_KEY: ${{ secrets.RBE_POOL_APP_PRIVATE_KEY }}
     with:
       build-artifact-name: bazel-ci-build-artifacts
       integration: "on"
+      # Must equal BAZEL_CMD_DOLT_REQUIRED (top of this file; policy-tested):
+      # true leaves //cmd/bd:bd_test to the then-required bazel-cmd-dolt.
+      cmd-dolt-required: true
       # F3: only pr.yml opts in; the package-mcp/package-npm jobs run inside
       # this call, needing only its rbe job.
       package-gates: "on"
@@ -2315,10 +2377,11 @@ jobs:
           RETIRED_PR_LANES: ${{ env.BAZEL_RETIRES_LEGACY_PR_LANES == 'true' }}
           COVERS_FORKS: ${{ env.BAZEL_COVERS_FORKS == 'true' }}
           PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
+          MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           FORK: ${{ github.event.pull_request.head.repo.fork == true }}
           DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
         run: |
-          for v in RETIRED_EMBEDDED RETIRED_DOLT_SERVER RETIRED_PR_LANES COVERS_FORKS PULL_REQUEST FORK DEPENDABOT; do
+          for v in RETIRED_EMBEDDED RETIRED_DOLT_SERVER RETIRED_PR_LANES COVERS_FORKS PULL_REQUEST MERGE_GROUP FORK DEPENDABOT; do
             case "${!v}" in
               true|false) ;;
               *) echo "::error::$v is '${!v}', want true or false"; exit 1 ;;
@@ -2326,9 +2389,16 @@ jobs:
           done
           # Covered: the Bazel lanes are this run's only run of the retired
           # tiers. Same-repo PRs (the CI secrets); fork and Dependabot PRs
-          # too while BAZEL_COVERS_FORKS is "true".
+          # too while BAZEL_COVERS_FORKS is "true"; and every merge group: it
+          # runs on the queue's gh-readonly-queue/* branch of this repository
+          # with the CI secrets, its actor is github-merge-queue[bot] (never
+          # Dependabot), and bazel.yml's rbe job takes mode remote for it
+          # like for a same-repo PR, so a missing secret or the farm switch
+          # off turns pr.yml's gate red rather than dropping a tier.
           covered=false
-          if [ "$PULL_REQUEST" = true ]; then
+          if [ "$MERGE_GROUP" = true ]; then
+            covered=true
+          elif [ "$PULL_REQUEST" = true ]; then
             if [ "$FORK" = false ] && [ "$DEPENDABOT" = false ]; then
               covered=true
             elif [ "$COVERS_FORKS" = true ]; then
@@ -2352,7 +2422,7 @@ jobs:
             echo "dolt_server=$dolt_server"
             echo "pr_lanes=$pr_lanes"
           } >> "$GITHUB_OUTPUT"
-          echo "Legacy tiers retired in favour of the Bazel lanes: embedded Dolt **$embedded**, proxied and server Dolt **$dolt_server**, pr.yml's PR Core/build/pure-Go/domain+uow/contract jobs **$pr_lanes** (pull_request: $PULL_REQUEST, fork: $FORK, dependabot: $DEPENDABOT, forks covered: $COVERS_FORKS, retired embedded: $RETIRED_EMBEDDED, retired proxied/server: $RETIRED_DOLT_SERVER, retired pr.yml jobs: $RETIRED_PR_LANES)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Legacy tiers retired in favour of the Bazel lanes: embedded Dolt **$embedded**, proxied and server Dolt **$dolt_server**, pr.yml's PR Core/build/pure-Go/domain+uow/contract jobs **$pr_lanes** (pull_request: $PULL_REQUEST, merge_group: $MERGE_GROUP, fork: $FORK, dependabot: $DEPENDABOT, forks covered: $COVERS_FORKS, retired embedded: $RETIRED_EMBEDDED, retired proxied/server: $RETIRED_DOLT_SERVER, retired pr.yml jobs: $RETIRED_PR_LANES)" | tee -a "$GITHUB_STEP_SUMMARY"
 
   ci-gate:
     name: CI Gate / Required
@@ -2484,6 +2554,9 @@ jobs:
           BAZEL_DOLTSERVER: ${{ needs.bazel.outputs.bazel-doltserver || 'skipped' }}
           BAZEL_PROXIED: ${{ needs.bazel.outputs.bazel-proxied || 'skipped' }}
           BAZEL_SERVER_STORAGE: ${{ needs.bazel.outputs.bazel-server-storage || 'skipped' }}
+          # Advisory unless BAZEL_CMD_DOLT_REQUIRED (top of this file) is
+          # "true": see the run script.
+          BAZEL_CMD_DOLT: ${{ needs.bazel.outputs.bazel-cmd-dolt || 'skipped' }}
           # Inputs of bazel-gate.sh, which sets BAZEL (the call's aggregate,
           # red on a missing or inconsistent mode) and the expected skips
           # from bazel.yml's own rbe job decision.
@@ -2498,9 +2571,6 @@ jobs:
           BAZEL_COVERS_PR_LANES: ${{ needs.bazel-coverage.outputs.pr_lanes }}
         run: |
           skipped_ok=""
-          if [[ "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
-            skipped_ok="CHECK_NO_BEADS_CHANGES"
-          fi
           # F4 side-by-side rollout: WINDOWS_PREBUILT_REQUIRED (top of this
           # file) flips which pair of Windows jobs ci-gate enforces with a
           # single committed flag, instead of three edits per job
@@ -2516,6 +2586,12 @@ jobs:
           else
             CI_GATE_REQUIRED="$CI_GATE_REQUIRED TEST_WINDOWS_LIVENESS WORKTREE_REMOVE_WINDOWS"
             skipped_ok="$skipped_ok TEST_WINDOWS_LIVENESS_PREBUILT WORKTREE_REMOVE_WINDOWS_PREBUILT"
+          fi
+          # The cmd/bd Dolt-server tier (bazel.yml's bazel-cmd-dolt) is
+          # advisory until BAZEL_CMD_DOLT_REQUIRED (top of this file) is
+          # "true"; it is never in the static list above.
+          if [[ "$BAZEL_CMD_DOLT_REQUIRED" == "true" ]]; then
+            CI_GATE_REQUIRED="$CI_GATE_REQUIRED BAZEL_CMD_DOLT"
           fi
           export CI_GATE_REQUIRED
           # Bazel lanes skipped by design in the call's execution mode (all
