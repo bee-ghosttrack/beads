@@ -33,6 +33,10 @@ const (
 	prRiskWorkflowName     = "pr-risk.yml"
 	prRiskCoverageJobName  = "bazel-coverage"
 	prRiskPullRequestValue = "${{ github.event_name == 'pull_request' }}"
+	// A merge group (merge queue) is covered like a same-repo PR: it runs
+	// on this repository's gh-readonly-queue/* branch with the CI secrets
+	// and its actor is github-merge-queue[bot].
+	prRiskMergeGroupValue = "${{ github.event_name == 'merge_group' }}"
 	// pr-risk.yml's and pr.yml's gate id for the decision job's result.
 	prRiskCoverageGateID = "BAZEL_COVERAGE"
 	// build-embedded's artifact (embedded-test-binaries) feeds exactly the
@@ -160,12 +164,20 @@ func (f rbeFacts) String() string {
 		f.event, f.rbeVar, f.secret != "", f.fork, f.retired, f.dependabot, f.coversForks, f.mint)
 }
 
-// covers: whether a pull_request with tier i's flag set is covered, the
-// decision both workflows must take for tier i: same-repo, non-Dependabot
-// PRs always; fork and Dependabot PRs while BAZEL_COVERS_FORKS is "true".
-// Never what the mint says: a covered fork run it does not serve is red.
+// covers: whether a run with tier i's flag set is covered, the decision
+// both workflows must take for tier i: every merge group (the queue's
+// branch is this repository's, with the CI secrets; bazel.yml's rbe job
+// never treats it as a fork); same-repo, non-Dependabot PRs always; fork
+// and Dependabot PRs while BAZEL_COVERS_FORKS is "true". Never what the
+// mint says: a covered fork run it does not serve is red.
 func (f rbeFacts) covers(i int) bool {
-	return strings.EqualFold(f.retired[i], "true") && f.event == "pull_request" &&
+	if !strings.EqualFold(f.retired[i], "true") {
+		return false
+	}
+	if f.event == "merge_group" {
+		return true
+	}
+	return f.event == "pull_request" &&
 		(!f.fork && !f.dependabot || strings.EqualFold(f.coversForks, "true"))
 }
 
@@ -259,6 +271,8 @@ func evalRBEExpr(t *testing.T, expr string, f rbeFacts, with map[string]string) 
 		return ""
 	case prRiskPullRequestValue:
 		return strconv.FormatBool(f.event == "pull_request")
+	case prRiskMergeGroupValue:
+		return strconv.FormatBool(f.event == "merge_group")
 	case prRiskDependabotValue:
 		return strconv.FormatBool(f.dependabot)
 	case "${{ vars.RBE_WEST_WORKERS == 'true' }}":
@@ -330,7 +344,7 @@ func TestPRRiskBazelCoverageJob(t *testing.T) {
 			prRiskCoverageJobName, job.Needs, job.If, job.RunsOn, job.Env, job.ContinueOnError, job.TimeoutMinutes, sameRepoBlacksmith2vcpu)
 	}
 	wantOutputs := map[string]string{}
-	wantEnv := map[string]string{"PULL_REQUEST": prRiskPullRequestValue, "DEPENDABOT": prRiskDependabotValue, "COVERS_FORKS": prCoversForksValue}
+	wantEnv := map[string]string{"PULL_REQUEST": prRiskPullRequestValue, "MERGE_GROUP": prRiskMergeGroupValue, "DEPENDABOT": prRiskDependabotValue, "COVERS_FORKS": prCoversForksValue}
 	for _, r := range retiredTiers {
 		wantOutputs[r.output] = "${{ steps.decide.outputs." + r.output + " }}"
 		wantEnv[r.envKey] = r.retiredValue()
@@ -708,8 +722,13 @@ func TestPRRiskDecisionMatchesBazelMode(t *testing.T) {
 		{"covered Dependabot PR, rbe-fork ro", rbeFacts{"pull_request", "true", "", false, both, true, "true", "ro"}, "fork-ro", coveredAll("true"), true, nil},
 		{"covered Dependabot PR, rbe-fork closed", rbeFacts{"pull_request", "", "", false, both, true, "true", "closed"}, "cache", coveredAll("true"), false, allRetired},
 		{"covered fork PR, only pr.yml's jobs retired, rbe-fork closed", rbeFacts{"pull_request", "true", "", true, prOnly, false, "true", "closed"}, "cache", map[string]string{"embedded": "false", "dolt_server": "false", "pr_lanes": "true"}, false, []string{"BAZEL_PR_LANES_RETIRED"}},
-		{"merge_group", rbeFacts{"merge_group", "true", "x", false, both, false, "false", ""}, "remote", coveredAll("false"), true, nil},
-		{"merge_group, var unset", rbeFacts{"merge_group", "", "x", false, both, false, "false", ""}, "skip", coveredAll("false"), true, nil},
+		// Merge queue: covered like a same-repo PR (the legacy tiers stay
+		// retired), so the Bazel lanes must run remotely and pass.
+		{"merge_group", rbeFacts{"merge_group", "true", "x", false, both, false, "false", ""}, "remote", coveredAll("true"), true, nil},
+		{"merge_group, kill switch (var unset)", rbeFacts{"merge_group", "", "x", false, both, false, "false", ""}, "skip", coveredAll("true"), false, allRetired},
+		{"merge_group, executor secret missing", rbeFacts{"merge_group", "true", "", false, both, false, "false", ""}, "cache", coveredAll("true"), false, allRetired},
+		{"merge_group, flags reverted, var unset", rbeFacts{"merge_group", "", "x", false, none, false, "false", ""}, "skip", coveredAll("false"), true, nil},
+		{"merge_group, only embedded retired", rbeFacts{"merge_group", "true", "x", false, embOnly, false, "false", ""}, "remote", map[string]string{"embedded": "true", "dolt_server": "false", "pr_lanes": "false"}, true, nil},
 	} {
 		d := decide(t, c.f)
 		if !reflect.DeepEqual(d.covered, c.covered) || d.mode != c.mode {
@@ -1185,9 +1204,6 @@ func TestBazelRetiredLanesCheckListedTestsRan(t *testing.T) {
 // check_shard_coverage.py itself, on a synthetic BEP, test.xml files and
 // shard script.
 func TestCheckShardCoverageScript(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold no tools/bazel Python")
-	}
 	requireHostTool(t, "bash")
 	python := requireHostTool(t, "python3")
 	script := filepath.Join(sourceRepoRoot(t), "tools", "bazel", "check_shard_coverage.py")
@@ -1352,9 +1368,6 @@ esac
 // must really not be a test (TestMain takes *testing.M). Otherwise the
 // checker reports a listed test that "did not run" on every real run.
 func TestShardScriptsListOnlyRealTests(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold neither the shard scripts' sources nor tools/bazel")
-	}
 	// The CI shard scripts use bash 4 associative arrays (Linux runners only).
 	requireAutofixBash(t)
 	root := sourceRepoRoot(t)
@@ -1531,13 +1544,7 @@ func TestShardScriptsListOnlyRealTests(t *testing.T) {
 // .github/scripts/proxied-cmd-test-shards.txt and engdocs/TESTING.md), so a
 // --check against it would always fail by design.
 func TestProxiedShardManifestGeneratorNotStale(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold neither the generator's sources nor cmd/bd")
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
-	}
+	python := requireHostTool(t, "python3")
 	root := sourceRepoRoot(t)
 	cmd := exec.Command(python, "scripts/ci/gen_proxied_shard_manifest.py", "30", "--weights=duration", "--check")
 	cmd.Dir = root
@@ -1647,49 +1654,39 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 
 	// Committed rc files: only .bazelrc. .bazelrc.local and user.bazelrc are
 	// developer-local (gitignored) and would be try-imported into CI runs.
-	if os.Getenv("TEST_SRCDIR") == "" {
-		if git, err := exec.LookPath("git"); err == nil {
-			out, err := exec.Command(git, "-C", root, "ls-files").Output()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				base := filepath.Base(f)
-				if strings.Contains(base, "bazelrc") && f != ".bazelrc" && f != setupBazelActionDir+"/write-bazelrc.sh" {
-					t.Errorf("committed rc file %s: .bazelrc's try-import would load it into every CI run", f)
-				}
-			}
+	for _, f := range repoFiles(t, root) {
+		base := filepath.Base(f)
+		if strings.Contains(base, "bazelrc") && f != ".bazelrc" && f != setupBazelActionDir+"/write-bazelrc.sh" {
+			t.Errorf("committed rc file %s: .bazelrc's try-import would load it into every CI run", f)
 		}
 	}
 
 	// The scripts every lane's test runs under or through, and the whole
 	// setup-bazel action (its generated rc applies to every command).
-	if os.Getenv("TEST_SRCDIR") == "" {
-		scriptNarrow := regexp.MustCompile(`-test\.(short|run|skip|list|bench)|BEADS_TEST_SKIP|BEADS_TEST_EMBEDDED_DOLT|BEADS_TEST_PROXIED_SERVER|BEADS_TEST_ENV_RUN_DOLT|BEADS_TEST_REQUIRE_DOLT_CONTAINER|BEADS_TEST_DOLT_SERVER\b|TESTBRIDGE_TEST_ONLY|test_filter|test_arg|_filters\b|cache_test_results|eviction_retries|flaky|runs_per_test|test_sharding_strategy`)
-		files, _ := filepath.Glob(filepath.Join(root, "tools", "bazel", "*.sh"))
-		action, _ := filepath.Glob(filepath.Join(root, setupBazelActionDir, "*"))
-		files = append(files, action...)
-		if len(files) < 5 {
-			t.Fatalf("found only %v", files)
+	scriptNarrow := regexp.MustCompile(`-test\.(short|run|skip|list|bench)|BEADS_TEST_SKIP|BEADS_TEST_EMBEDDED_DOLT|BEADS_TEST_PROXIED_SERVER|BEADS_TEST_ENV_RUN_DOLT|BEADS_TEST_REQUIRE_DOLT_CONTAINER|BEADS_TEST_DOLT_SERVER\b|TESTBRIDGE_TEST_ONLY|test_filter|test_arg|_filters\b|cache_test_results|eviction_retries|flaky|runs_per_test|test_sharding_strategy`)
+	files, _ := filepath.Glob(filepath.Join(root, "tools", "bazel", "*.sh"))
+	action, _ := filepath.Glob(filepath.Join(root, setupBazelActionDir, "*"))
+	files = append(files, action...)
+	if len(files) < 5 {
+		t.Fatalf("found only %v", files)
+	}
+	for _, f := range files {
+		rel, _ := filepath.Rel(root, f)
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, f := range files {
-			rel, _ := filepath.Rel(root, f)
-			data, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatal(err)
+		for i, line := range strings.Split(string(data), "\n") {
+			code := strings.TrimSpace(line)
+			if strings.HasPrefix(code, "#") {
+				continue
 			}
-			for i, line := range strings.Split(string(data), "\n") {
-				code := strings.TrimSpace(line)
-				if strings.HasPrefix(code, "#") {
-					continue
-				}
-				if scriptNarrow.MatchString(code) {
-					t.Errorf("%s:%d %q can select, skip or re-run the retired tiers' lanes' tests", rel, i+1, code)
-				}
-				for _, m := range regexp.MustCompile(`--config=([A-Za-z0-9_-]+)`).FindAllStringSubmatch(code, -1) {
-					if !rcEnabled[m[1]] {
-						t.Errorf("%s:%d enables --config=%s for every command", rel, i+1, m[1])
-					}
+			if scriptNarrow.MatchString(code) {
+				t.Errorf("%s:%d %q can select, skip or re-run the retired tiers' lanes' tests", rel, i+1, code)
+			}
+			for _, m := range regexp.MustCompile(`--config=([A-Za-z0-9_-]+)`).FindAllStringSubmatch(code, -1) {
+				if !rcEnabled[m[1]] {
+					t.Errorf("%s:%d enables --config=%s for every command", rel, i+1, m[1])
 				}
 			}
 		}
@@ -1699,20 +1696,15 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 	// legacy jobs run the same scripts, so they are not changed here): the
 	// command that runs the selected tests is pinned exactly, and nothing
 	// else in them may select, skip, export a tier switch or run tests.
-	if os.Getenv("TEST_SRCDIR") == "" {
-		for _, c := range bazelShardScripts {
-			for _, e := range shardScriptNarrowing(c, readPolicyFile(t, root, c.script)) {
-				t.Error(e)
-			}
+	for _, c := range bazelShardScripts {
+		for _, e := range shardScriptNarrowing(c, readPolicyFile(t, root, c.script)) {
+			t.Error(e)
 		}
 	}
 
 	// The lanes' targets (tagged embedded, dolt-server-proxied or
 	// dolt-server-integration): exactly these, with exactly these args and
 	// env (the legacy jobs' flags; the shard scripts add the rest).
-	if os.Getenv("TEST_SRCDIR") != "" {
-		return // scripts_test's runfiles hold no other package's BUILD
-	}
 	type target struct {
 		args []string
 		env  map[string]string
@@ -1739,7 +1731,7 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 			map[string]string{
 				"BEADS_TEST_BD_BINARY": "$(rlocationpath :bd_for_tests)", "BEADS_TEST_DOLT_SERVER": "local", "BEADS_TEST_GIT_IDENTITY": "1",
 				"BEADS_TEST_GOFMT": "$(rlocationpath @go_sdk//:bin/gofmt)", "BEADS_TEST_PROXIED_SERVER": "1",
-				"BEADS_TEST_REQUIRE_DOLT_CONTAINER": "1", "GOMAXPROCS": "4",
+				"BEADS_TEST_REQUIRE_DOLT_CONTAINER": "1", "BEADS_TEST_REQUIRE_SOCAT": "1", "GOMAXPROCS": "4",
 			},
 		},
 		"//internal/storage/dolt:dolt_server_conformance_test": {
@@ -1903,8 +1895,8 @@ func bazelTierTestRun(config string) string {
 
 // .bazelrc's --config=doltserver-proxied and --config=doltserver-integration,
 // exactly and in order (D2 step 2, as review F4 for embedded): no
-// --test_filter, no -test.short/-test.run/-test.skip, no retries, no result
-// caching. Their targets' own args (the conformance target's -test.run, the
+// --test_filter, no -test.short/-test.run/-test.skip, no retries (results
+// are cached like every lane's; nightly's --config=fresh re-executes). Their targets' own args (the conformance target's -test.run, the
 // legacy job's) are pinned by TestBazelRetiredLanesCannotBeNarrowed.
 var bazelDoltServerRCLines = map[string][]string{
 	"doltserver-proxied": {
@@ -1918,7 +1910,6 @@ var bazelDoltServerRCLines = map[string][]string{
 		"test:doltserver-proxied --test_arg=-test.parallel=4",
 		"test:doltserver-proxied --local_test_jobs=4",
 		"test:doltserver-proxied --remote_download_regex=.*/test\\.(log|xml)$",
-		"test:doltserver-proxied --nocache_test_results",
 		"test:doltserver-proxied --experimental_remote_cache_eviction_retries=0",
 	},
 	"doltserver-integration": {
@@ -1933,15 +1924,14 @@ var bazelDoltServerRCLines = map[string][]string{
 		"test:doltserver-integration --test_arg=-test.parallel=4",
 		"test:doltserver-integration --local_test_jobs=4",
 		"test:doltserver-integration --remote_download_regex=.*/test\\.(log|xml)$",
-		"test:doltserver-integration --nocache_test_results",
 		"test:doltserver-integration --experimental_remote_cache_eviction_retries=0",
 	},
 }
 
 // D2 step 2, as review F2/F4 for embedded: the proxied and server lanes run
-// exactly `bazel test //... --config=<config>` with a BEP and nothing else,
-// their configs are exactly the pinned lines (results never cached), and no
-// .bazelrc line of any config turns caching back on for them.
+// exactly `bazel test //... --config=<config>` (plus nightly's BAZEL_FRESH)
+// with a BEP and nothing else, their configs are exactly the pinned lines,
+// and only test:docker and test:fresh set result caching.
 func TestBazelRetiredLanesArePinned(t *testing.T) {
 	workflow := readCIWorkflow(t, bazelWorkflowName)
 	for lane, config := range bazelRetiredLaneConfigs {
@@ -1963,9 +1953,8 @@ func TestBazelRetiredLanesArePinned(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf(".bazelrc --config=%s lines changed; want exactly:\n%s\ngot:\n%s", config, strings.Join(want, "\n"), strings.Join(got, "\n"))
 		}
-		if !contains(want, "test:"+config+" --nocache_test_results") {
-			t.Errorf("pinned --config=%s lacks --nocache_test_results: the tier's only pre-merge run must execute", config)
-		}
+		// Results are cached like every lane's; only nightly's
+		// --config=fresh re-executes them (ci_merge_queue_test.go).
 	}
 	// Review F1 (step 2): no whole-invocation retry after a remote cache
 	// eviction in any retired lane (it would re-run, and could turn green,
@@ -1990,14 +1979,13 @@ func TestBazelRetiredLanesArePinned(t *testing.T) {
 		}
 	}
 	// A later --cache_test_results (any config the lanes use) would win.
-	allowed := map[string]bool{"test:docker --nocache_test_results": true, "test:embedded --nocache_test_results": true, bazelSoleRunNoCacheLine: true}
-	for config := range bazelDoltServerRCLines {
-		allowed["test:"+config+" --nocache_test_results"] = true
-	}
+	// Only the docker lane and nightly's --config=fresh (appended only when
+	// the caller asks, ci_merge_queue_test.go) turn result caching off.
+	allowed := map[string]bool{"test:docker --nocache_test_results": true, bazelFreshRCLine: true}
 	for _, line := range strings.Split(rc, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "#") && strings.Contains(line, "cache_test_results") && !allowed[line] {
-			t.Errorf(".bazelrc %q: only the docker and retired tiers' configs set test result caching (to off)", line)
+			t.Errorf(".bazelrc %q: only test:docker and test:fresh set test result caching", line)
 		}
 	}
 }
@@ -2084,9 +2072,6 @@ func shardScriptNarrowing(c bazelShardScript, src string) []string {
 // The shard script check itself, on the real scripts and on narrowing edits
 // of one (review F2 mutations m2 and m3).
 func TestShardScriptNarrowingCheck(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold no .github/scripts")
-	}
 	root := sourceRepoRoot(t)
 	scripts := map[string]bool{}
 	for _, c := range bazelShardScripts {
