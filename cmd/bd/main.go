@@ -1538,8 +1538,11 @@ var rootCmd = &cobra.Command{
 				// touches the local `store` global on that path (a gap left by
 				// #4615, which only handled local paths), so skip local
 				// discovery entirely instead of falling through to the "no
-				// beads database found" exit below.
-				if cmd.Name() == "create" && cmd.Flags().Changed("repo") {
+				// beads database found" exit below. Match the command path,
+				// not the leaf name: `bd gate create --repo` names a GitHub
+				// OWNER/REPO for gh:run/gh:pr checks, not a workspace, and must
+				// still need the local database like any other gate command.
+				if commandRegistryPath(cmd) == "create" && cmd.Flags().Changed("repo") {
 					if repoVal, _ := cmd.Flags().GetString("repo"); repoVal != "" {
 						if remotecache.IsRemoteURL(repoVal) {
 							return nil

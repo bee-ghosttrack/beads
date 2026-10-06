@@ -1122,7 +1122,16 @@ func checkGHRunStatusInRepoWithRunner(runID, repo string, runGH ghCommandRunner)
 		}
 		// Check if run not found
 		if strings.Contains(string(stderr), "not found") {
-			return false, true, "workflow run not found", nil
+			// Name the repository, as checkGHPRWithRunner does. Real gh
+			// reports a missing run as "HTTP 404: Not Found (<api url>)",
+			// which this case-sensitive match skips: that returns the error
+			// below, whose URL names the repository. Keep the match narrow; a
+			// token without access to the repository gets the same 404.
+			where := "the current repository"
+			if repo != "" {
+				where = repo
+			}
+			return false, true, fmt.Sprintf("workflow run not found: %s in %s", runID, where), nil
 		}
 		return false, false, "", fmt.Errorf("gh run view failed: %s", string(stderr))
 	}

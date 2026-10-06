@@ -1289,3 +1289,61 @@ func TestCheckGHPRNotFoundNamesTheRepository(t *testing.T) {
 		}
 	})
 }
+
+func TestCheckGHRunNotFoundNamesTheRepository(t *testing.T) {
+	notFound := func(t *testing.T, wantArgs ...string) ghCommandRunner {
+		t.Helper()
+		return func(args ...string) ([]byte, []byte, error) {
+			if !slices.Equal(args, wantArgs) {
+				t.Fatalf("gh args = %q, want %q", args, wantArgs)
+			}
+			// Stub stderr that reaches the escalation arm; real gh 404
+			// output does not (see real_gh_404_names_the_repository).
+			return nil, []byte("run 12345 not found"), fmt.Errorf("exit status 1")
+		}
+	}
+
+	t.Run("cross_repo", func(t *testing.T) {
+		resolved, escalated, reason, err := checkGHRunWithRunner(&types.Issue{
+			ID: "gt-run", IssueType: "gate", AwaitType: "gh:run", AwaitID: "12345",
+			Metadata: json.RawMessage(`{"repo":"gastownhall/beads"}`),
+		}, nil, notFound(t, "run", "view", "12345", "--json", "status,conclusion,name", "--repo", "gastownhall/beads"))
+		if err != nil {
+			t.Fatalf("checkGHRun returned error: %v", err)
+		}
+		if resolved || !escalated {
+			t.Fatalf("resolved, escalated = %v, %v; want false, true", resolved, escalated)
+		}
+		if reason != "workflow run not found: 12345 in gastownhall/beads" {
+			t.Fatalf("reason = %q; it must name the repository the run ID was looked up in", reason)
+		}
+	})
+
+	t.Run("current_repo", func(t *testing.T) {
+		_, escalated, reason, err := checkGHRunStatusInRepoWithRunner("12345", "",
+			notFound(t, "run", "view", "12345", "--json", "status,conclusion,name"))
+		if err != nil || !escalated {
+			t.Fatalf("escalated, err = %v, %v; want true, nil", escalated, err)
+		}
+		if reason != "workflow run not found: 12345 in the current repository" {
+			t.Fatalf("reason = %q", reason)
+		}
+	})
+
+	t.Run("real_gh_404_names_the_repository", func(t *testing.T) {
+		// gh run view's real stderr for a run the repository does not have.
+		// A token without access to the repository gets the same 404, so it
+		// stays an error rather than an escalation; its URL names the repo.
+		stderr := "failed to get run: HTTP 404: Not Found (https://api.github.com/repos/gastownhall/beads/actions/runs/12345?exclude_pull_requests=true)\n"
+		resolved, escalated, _, err := checkGHRunStatusInRepoWithRunner("12345", "gastownhall/beads",
+			func(args ...string) ([]byte, []byte, error) {
+				return nil, []byte(stderr), fmt.Errorf("exit status 1")
+			})
+		if err == nil || resolved || escalated {
+			t.Fatalf("resolved, escalated, err = %v, %v, %v; want false, false, an error", resolved, escalated, err)
+		}
+		if !strings.Contains(err.Error(), "/repos/gastownhall/beads/") {
+			t.Fatalf("err = %q; it must name the repository the run ID was looked up in", err)
+		}
+	})
+}
