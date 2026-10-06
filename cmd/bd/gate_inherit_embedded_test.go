@@ -5,8 +5,11 @@ package main
 import (
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // TestEmbeddedGateInheritsDownParentChain pins the property that a gate on a
@@ -43,21 +46,26 @@ func TestEmbeddedGateInheritsDownParentChain(t *testing.T) {
 		}
 		return stdout.String()
 	}
-	wantReady := func(out string, title string, want bool, when string) {
+	// An issue counts as listed only when its ID is a whole token of the
+	// output. Neither its title nor a substring of its ID will do: every
+	// ready child of an epic carries a "← <epic title>" annotation, and a
+	// child's hierarchical ID (<epic>.N) contains the epic's ID, so either
+	// looser match would let a child row stand in for the epic.
+	wantReady := func(out string, issue *types.Issue, want bool, when string) {
 		t.Helper()
-		if got := strings.Contains(out, title); got != want {
-			t.Errorf("%s: %q in ready = %v, want %v\n%s", when, title, got, want, out)
+		if got := slices.Contains(strings.Fields(out), issue.ID); got != want {
+			t.Errorf("%s: %s (%q) in ready = %v, want %v\n%s", when, issue.ID, issue.Title, got, want, out)
 		}
 	}
 
 	epic := bdCreate(t, bd, dir, "Inherit epic", "--type", "epic")
-	bdCreate(t, bd, dir, "Inherit child one", "--type", "task", "--parent", epic.ID)
-	bdCreate(t, bd, dir, "Inherit child two", "--type", "task", "--parent", epic.ID)
+	one := bdCreate(t, bd, dir, "Inherit child one", "--type", "task", "--parent", epic.ID)
+	two := bdCreate(t, bd, dir, "Inherit child two", "--type", "task", "--parent", epic.ID)
 
 	out := ready()
-	wantReady(out, "Inherit epic", true, "before gate")
-	wantReady(out, "Inherit child one", true, "before gate")
-	wantReady(out, "Inherit child two", true, "before gate")
+	wantReady(out, epic, true, "before gate")
+	wantReady(out, one, true, "before gate")
+	wantReady(out, two, true, "before gate")
 
 	gateOut := bdGate(t, bd, dir, "create", "--blocks", epic.ID, "--reason", "hold the whole tree")
 	var gateID string
@@ -72,20 +80,20 @@ func TestEmbeddedGateInheritsDownParentChain(t *testing.T) {
 	}
 
 	out = ready()
-	wantReady(out, "Inherit epic", false, "gate open, existing children")
-	wantReady(out, "Inherit child one", false, "gate open, existing children")
-	wantReady(out, "Inherit child two", false, "gate open, existing children")
+	wantReady(out, epic, false, "gate open, existing children")
+	wantReady(out, one, false, "gate open, existing children")
+	wantReady(out, two, false, "gate open, existing children")
 
 	// A child filed AFTER the gate must be born hidden too: the fence is a
 	// property of the tree at read time, not a snapshot at gate time.
-	bdCreate(t, bd, dir, "Inherit child late", "--type", "task", "--parent", epic.ID)
+	late := bdCreate(t, bd, dir, "Inherit child late", "--type", "task", "--parent", epic.ID)
 	out = ready()
-	wantReady(out, "Inherit child late", false, "gate open, later-born child")
+	wantReady(out, late, false, "gate open, later-born child")
 
 	bdGate(t, bd, dir, "resolve", gateID, "--reason", "released")
 	out = ready()
-	wantReady(out, "Inherit epic", true, "after resolve")
-	wantReady(out, "Inherit child one", true, "after resolve")
-	wantReady(out, "Inherit child two", true, "after resolve")
-	wantReady(out, "Inherit child late", true, "after resolve")
+	wantReady(out, epic, true, "after resolve")
+	wantReady(out, one, true, "after resolve")
+	wantReady(out, two, true, "after resolve")
+	wantReady(out, late, true, "after resolve")
 }
