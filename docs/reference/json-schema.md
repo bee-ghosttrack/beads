@@ -214,8 +214,11 @@ items, plus:
   issue is neither closed nor pinned; a `waits-for` edge onto a gate does not
   count, because that leg of the readiness rule is a fanout over the gate's
   children rather than a status test. Absent when nothing gates the issue.
-  DERIVED, not stored: `status` is unaffected, and the list is nonempty exactly
-  when `bd ready` withholds the issue on a gate's account
+  DERIVED, not stored: `status` is unaffected, and a nonempty list means
+  `bd ready` withholds the issue on a gate's account. The converse does not
+  hold: only the issue's own edges count, so a child of a gated parent, which
+  `bd ready` also withholds because a blocked parent blocks its children,
+  carries no `gated_by`
 
 ### `import --json`
 

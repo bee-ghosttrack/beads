@@ -54,7 +54,7 @@ func formatIssueHeader(issue *types.Issue) string {
 // status is untouched — GATED is a third segment, not a replacement — because
 // the row really is open and `bd ready` really does skip it, and a reader who
 // sees only OPEN has no way to tell those two facts apart. Callers pass the
-// gates types.ActiveGates selected; an empty set renders exactly what
+// gates types.GatesHolding selected; an empty set renders exactly what
 // formatIssueHeader always did.
 func formatIssueHeaderWithGates(issue *types.Issue, gates []*types.Issue) string {
 	// Get status icon and style

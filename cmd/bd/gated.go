@@ -32,7 +32,9 @@ type gateHydrator func(ctx context.Context, ids []string) ([]*types.Issue, error
 // different things about the same bead.
 //
 // Best effort: a read that fails yields no decoration rather than failing the
-// listing, matching how `bd list` already treats its blocking annotation.
+// listing, on both routes. That matches how the direct `bd list` route treats
+// its blocking annotation; the proxied route instead FAILS on that
+// annotation's read (A-blk-1), a split this helper leaves alone.
 func gatesByIssueID(
 	ctx context.Context,
 	issues []*types.Issue,
@@ -163,6 +165,11 @@ func proxiedGatedIssueIDs(
 // work and so hold none to lend. It opens one, reads, and closes it; a failure
 // to open yields no decoration, because a listing that renders is worth more
 // than one that refuses over a glyph.
+//
+// Its unit of work is a second snapshot, read after the blocking annotation's:
+// a gate resolved between the two can leave one render naming the gate under
+// "blocked by:" but not "gated by:", or the reverse. Cosmetic, and gone on the
+// next call.
 func proxiedGatedIssueIDsOwnUOW(ctx context.Context, issues []*types.Issue) map[string][]string {
 	if len(issues) == 0 {
 		return nil

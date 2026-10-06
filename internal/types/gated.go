@@ -87,8 +87,10 @@ func GateIsHolding(depType DependencyType, target *Issue) bool {
 //
 // THE one predicate: every gated decoration — `bd show`'s header and meta
 // lines, `bd list`'s glyph, the agent line, the detail view's gated_by — comes
-// from this function or from the pair it is built out of, so the result is
-// nonempty exactly when `bd ready` withholds subject on a gate's account.
+// from this function or from the pair it is built out of, so a nonempty result
+// means `bd ready` withholds subject on a gate's account. Not the converse:
+// only subject's own edges are read, so a child of a gated parent, withheld
+// through the recompute's parent-child leg, selects no gate here.
 func GatesHolding(subject *Issue, deps []*IssueWithDependencyMetadata) []*Issue {
 	if !SubjectCanBeGated(subject) {
 		return nil

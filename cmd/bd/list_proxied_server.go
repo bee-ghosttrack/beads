@@ -164,6 +164,11 @@ func runListProxiedWatch(_ *cobra.Command, ctx context.Context, in listInput) er
 	if err != nil {
 		return fmt.Errorf("initial query: %w", err)
 	}
+	// --watch renders no gate (the nil gated map), here and on the direct route
+	// in displayWatchedIssueList: a bead the one-shot listing marks ⊘ keeps its
+	// plain status glyph while watched, and no refresh tick pays for the gate
+	// reads. Deliberate, not a forgotten argument — decorating watch means
+	// computing the map on every refresh.
 	displayPrettyListWithDepsMode(issues, true, deps, "", hasMore, in.ReadyFlag, in.Status, in.SortBy, in.Reverse, nil)
 	printTruncationHint(hasMore, in.effectiveLimit)
 	lastSnapshot := issueSnapshot(issues)
@@ -191,6 +196,7 @@ func runListProxiedWatch(_ *cobra.Command, ctx context.Context, in listInput) er
 			snap := issueSnapshot(issues)
 			if snap != lastSnapshot {
 				lastSnapshot = snap
+				// Undecorated, as the initial render above.
 				displayPrettyListWithDepsMode(issues, true, deps, "", hasMore, in.ReadyFlag, in.Status, in.SortBy, in.Reverse, nil)
 				printTruncationHint(hasMore, in.effectiveLimit)
 				fmt.Fprintf(os.Stderr, "\nWatching for changes... (Press Ctrl+C to exit)\n")

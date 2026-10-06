@@ -1269,9 +1269,11 @@ type IssueDetails struct {
 	// stored status stays whatever it is (an open issue an open gate blocks
 	// still reads "open" here). The rule is types.GatesHolding — the gate
 	// clause of the readiness query's is_blocked column, subject half
-	// included — so this list is nonempty exactly when `bd ready` withholds
-	// the issue on a gate's account, and a closed or pinned issue carries no
-	// gated_by at all.
+	// included — so a nonempty list means `bd ready` withholds the issue on a
+	// gate's account, and a closed or pinned issue carries no gated_by at all.
+	// The converse does not hold: only the issue's own edges count, so a child
+	// of a gated parent, which `bd ready` withholds through the parent-child
+	// leg, carries no gated_by.
 	GatedBy []GateRef `json:"gated_by,omitempty"`
 
 	// UnresolvableDependencies / UnresolvableDependents count the edges

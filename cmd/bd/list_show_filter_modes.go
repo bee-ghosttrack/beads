@@ -176,6 +176,8 @@ func displayWatchedIssueList(ctx context.Context, store watchListDependencyStore
 			allDeps = deps
 		}
 	}
+	// No gate decoration (the nil gated map): --watch deliberately renders a
+	// gated bead undecorated, on both routes; see runListProxiedWatch.
 	displayPrettyListWithDepsMode(issues, true, allDeps, "", truncated, readyFiltered, statusSelector, sortBy, reverse, nil)
 }
 
