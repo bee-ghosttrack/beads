@@ -634,6 +634,21 @@ func shouldBeBlockedIDsUnionPrecomputedSQL(depTable string, explained subtreeExp
 // single-table derived table is the mergeable shape MySQL-dialect planners
 // fold back into the outer query; a DISTINCT one is materialized.
 //
+// A scoped union pins each joined leg to drive from the batch's own
+// dependency rows and look the target or parent up by primary key
+// (JOIN_ORDER/LOOKUP_JOIN hints; on MySQL, JOIN_ORDER is honored — the order
+// it forces is the one wanted — and the unknown LOOKUP_JOIN hint is ignored
+// with a warning). Left to its cost model, the Dolt sql-server planner
+// intermittently — depending on when its background statistics refresh
+// lands — turned the issues legs around: scanning every open issue through
+// the (is_blocked, status) index and probing dependencies per row. Over an
+// import's ~2000-5000 uncommitted issues that is ~3 s per leg and 6-10 s per
+// mark/unmark statement, where the lookup plan takes ~0.1 s; one plan flip
+// early in an import of 5000 cost most of its 28 minutes and brushed the
+// 10 s read timeout. The unscoped form (full repair, doctor count) walks the
+// whole table and keeps the planner's choice. TestGraphWalkPlansHonorJoinHints
+// (embedded) pins the hinted plans.
+//
 //nolint:gosec // G201: depTable and scope are constants; waitsForGateBlockedSQL is a constant template.
 func shouldBeBlockedIDsUnionScopedPrecomputedSQL(
 	depTable, scope string, explained subtreeExplainedParents,
@@ -653,27 +668,32 @@ func shouldBeBlockedIDsUnionScopedPrecomputedSQL(
 //
 //nolint:gosec // G201: depTable and scope are constants; the conditions come from the two callers above.
 func shouldBeBlockedIDsUnionCoreSQL(depTable, scope, issueParentCond, wispParentCond string) string {
+	targetHint, parentHint := "", ""
+	if scope != "" {
+		targetHint = "/*+ JOIN_ORDER(d, t) LOOKUP_JOIN(d, t) */ "
+		parentHint = "/*+ JOIN_ORDER(d, p) LOOKUP_JOIN(d, p) */ "
+	}
 	return fmt.Sprintf(`
-		SELECT d.issue_id FROM %[1]s d
+		SELECT %[6]sd.issue_id FROM %[1]s d
 		JOIN issues t ON t.id = d.depends_on_issue_id
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND (d.type = 'blocks' OR d.type = 'conditional-blocks')
 		  AND t.status <> 'closed' AND t.status <> 'pinned'
 		UNION
-		SELECT d.issue_id FROM %[1]s d
+		SELECT %[6]sd.issue_id FROM %[1]s d
 		JOIN wisps t ON t.id = d.depends_on_wisp_id
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND (d.type = 'blocks' OR d.type = 'conditional-blocks')
 		  AND t.status <> 'closed' AND t.status <> 'pinned'
 		UNION
-		SELECT d.issue_id FROM %[1]s d
+		SELECT %[7]sd.issue_id FROM %[1]s d
 		JOIN issues p ON p.id = d.depends_on_issue_id
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND d.type = 'parent-child'
 		  AND p.is_blocked = 1
 		  %[4]s
 		UNION
-		SELECT d.issue_id FROM %[1]s d
+		SELECT %[7]sd.issue_id FROM %[1]s d
 		JOIN wisps p ON p.id = d.depends_on_wisp_id
 		WHERE d.issue_id IS NOT NULL %[3]s
 		  AND d.type = 'parent-child'
@@ -687,7 +707,7 @@ func shouldBeBlockedIDsUnionCoreSQL(depTable, scope, issueParentCond, wispParent
 		    AND d.type = 'waits-for'
 		) d
 		WHERE (%[2]s)
-	`, depTable, waitsForGateBlockedSQL, scope, issueParentCond, wispParentCond)
+	`, depTable, waitsForGateBlockedSQL, scope, issueParentCond, wispParentCond, targetHint, parentHint)
 }
 
 // subtreeWalkDepth is how far parentsExplainedBySubtreeSQL walks up from a

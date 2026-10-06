@@ -329,6 +329,7 @@ type DoltStore struct {
 	serverEndpoint          string       // Exact endpoint bound to bootstrap reset authority
 	mu                      sync.RWMutex // Protects concurrent access
 	readOnly                bool         // True if opened in read-only mode
+	classifiedRead          bool         // True if readOnly came from command classification (GH#804), not strict --readonly/preview/foreign-project; still eligible for the defer-wake sweep (be-vbhpf)
 	credentialKey           []byte       // Random encryption key for federation credentials
 
 	// localActiveDatabaseDir is the exact active database directory when this
@@ -377,6 +378,19 @@ type Config struct {
 	Database       string // Database name within Dolt (default: "beads")
 	ReadOnly       bool   // Open in read-only mode (skip schema init)
 	Preview        bool   // Non-mutating preview: embedded opens skip schema init and refuse writes
+
+	// ClassifiedRead marks a ReadOnly open whose read-only-ness comes purely
+	// from command classification (GH#804: bd ready/bd list are read-only for
+	// the CURRENT project) rather than strict --readonly, an explicit preview,
+	// or a foreign-project lookup. Only a classified-read open is eligible for
+	// the lazy defer-wake sweep (be-vbhpf) — the others must never mutate.
+	//
+	// Strict --readonly and preview are excluded by the policy expression that
+	// computes this field; foreign-project and auxiliary opens are excluded
+	// because they construct their own Config and leave this at its false zero
+	// value. That default is the guarantee — setting it true on such an open
+	// would make it eligible to sweep.
+	ClassifiedRead bool
 
 	// LenientOpen opens the store leniently: a migration gate refusal (#4259)
 	// or a dirty-working-set refusal (#4566) skips the migration instead of
@@ -1175,6 +1189,16 @@ func (s *DoltStore) withReadTxLongTimeout(ctx context.Context, fn func(tx *sql.T
 // logic (verify passes, hooks, return values). See ready_claimer.ClaimNext's
 // `claimed = nil` reset for the canonical example.
 func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return s.withRetryTxOn(ctx, s.db, fn)
+}
+
+// withRetryTxOn is withRetryTx against a caller-chosen txBeginner instead of
+// the shared pool, so a caller that must hold a session-scoped resource (e.g.
+// a GET_LOCK) across the whole retried write can pin one *sql.Conn for it —
+// see withDeleteFence. Every retried attempt replays on that SAME connection,
+// which is required: txBeginner's one other implementer, *sql.Conn, is itself
+// the pinned session, there is no pool to hand back a different one.
+func (s *DoltStore) withRetryTxOn(ctx context.Context, beginner txBeginner, fn func(tx *sql.Tx) error) error {
 	// Keep circuit admission at the transaction retry boundary. Calling
 	// withRetry from here would multiply retries and could replay a write after
 	// an indeterminate commit.
@@ -1192,7 +1216,7 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	var pending issueops.BlockedRecheck
 	if err := backoff.Retry(func() error {
 		var err error
-		pending, err = s.commitWriteTx(ctx, fn)
+		pending, err = s.commitWriteTxOn(ctx, beginner, fn)
 		if err == nil {
 			if !circuitWriteManaged(ctx) && s.breaker != nil {
 				s.breaker.RecordSuccess()
@@ -1256,10 +1280,16 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 // recheck. The caller runs that recheck outside any retry loop around fn: a
 // recheck failure must never replay a write that has already landed.
 func (s *DoltStore) commitWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) (issueops.BlockedRecheck, error) {
+	return s.commitWriteTxOn(ctx, s.db, fn)
+}
+
+// commitWriteTxOn is commitWriteTx against a caller-chosen txBeginner — see
+// withRetryTxOn.
+func (s *DoltStore) commitWriteTxOn(ctx context.Context, beginner txBeginner, fn func(tx *sql.Tx) error) (issueops.BlockedRecheck, error) {
 	if s.closed.Load() {
 		return issueops.BlockedRecheck{}, ErrStoreClosed
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := beginner.BeginTx(ctx, nil)
 	if err != nil {
 		return issueops.BlockedRecheck{}, fmt.Errorf("begin write tx: %w", err)
 	}
@@ -1699,6 +1729,10 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.RemotePassword == "" {
 		cfg.RemotePassword = os.Getenv("DOLT_REMOTE_PASSWORD")
 	}
+	// Pool knobs last: every DoltStore open (the CLI's store and library
+	// callers of New/NewFromConfig*) reaches New, so the knob ladders hold
+	// here regardless of how cfg was built.
+	applyPoolKnobs(cfg)
 }
 
 // New creates a new Dolt storage backend.
@@ -2135,6 +2169,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		remotePassword:         cfg.RemotePassword,
 		serverMode:             true,
 		readOnly:               cfg.ReadOnly,
+		classifiedRead:         cfg.ClassifiedRead,
 		autoStartedServerDir:   autoStartedDir,
 	}
 
@@ -3138,12 +3173,22 @@ func sharedServerDatabase(cfg *Config) bool {
 	if !doltserver.ManagesLiveServerOnPort(cfg.BeadsDir, cfg.ServerPort) {
 		return true
 	}
-	// Proof of a bd-managed server does not override an explicit declaration
-	// that the lifecycle is external (metadata dolt_server_port, host
-	// inference, BEADS_DOLT_SERVER_MODE). Keeping this last means the change
-	// above can only ever ADD shared classifications to what #5920/#6048
-	// already gated, never remove one.
-	return doltserver.ResolveServerMode(cfg.BeadsDir) != doltserver.ServerModeOwned
+	// Proof of a bd-managed server does not override a genuine external
+	// declaration (metadata dolt_server_port, host inference,
+	// BEADS_DOLT_SERVER_MODE, IsSharedServerMode). Keeping this last means
+	// the change above can only ever ADD shared classifications to what
+	// #5920/#6048 already gated, never remove one.
+	//
+	// Uses ResolveServerModeIgnoringPortEnv, not the public ResolveServerMode
+	// (GH#6169): BEADS_DOLT_SERVER_PORT/BEADS_DOLT_PORT are also set
+	// ambiently on multi-agent rigs purely to route bd's own client
+	// connections to a shared coordination server, and say nothing about who
+	// owns cfg.BeadsDir's own server -- that question was just answered,
+	// above, by proof rather than inference. Honoring the ambient port env
+	// var here would let it override that proof and reclassify bd's own
+	// just-started server as shared, so a normal `bd init`/first-write on a
+	// multi-agent rig would refuse to migrate its own workspace database.
+	return doltserver.ResolveServerModeIgnoringPortEnv(cfg.BeadsDir) != doltserver.ServerModeOwned
 }
 
 func (s *DoltStore) initSchema(ctx context.Context, bootstrapHeal *schema.FreshBootstrapHealCapability) (int, error) {
@@ -5209,7 +5254,11 @@ func (s *DoltStore) recomputeAllBlocked(ctx context.Context) (int, error) {
 
 // txBeginner is satisfied by both *sql.DB and *sql.Conn, letting
 // recomputeAllBlockedWithDB run either against a caller-owned pinned
-// *sql.Conn (recomputeAllBlocked) or directly against a *sql.DB (tests).
+// *sql.Conn (recomputeAllBlocked) or directly against a *sql.DB (tests). Also
+// used by withRetryTxOn/commitWriteTxOn to run the shared retry-and-commit
+// body against either the pool (the common case) or one pinned connection
+// (withDeleteFence, which must hold a GET_LOCK session across the whole
+// retried write).
 type txBeginner interface {
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
