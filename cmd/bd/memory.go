@@ -131,9 +131,12 @@ func memoryCorpusBudget() int {
 // memoryCorpusChars sums len(key)+len(content) over a corpus.
 //
 // The unit is BYTES (Go len), deliberately the same unit prime's
-// --max-memory-chars cap counts in: the budget exists to bound what prime
-// injects, so measuring it in a second unit would let a corpus sit inside the
-// budget and still blow the injection cap.
+// --max-memory-chars cap counts in, so the two numbers are comparable. They are
+// not the same MEASURE: prime counts each entry as it renders it — the key and
+// value plus a few bytes of heading or bullet markup per memory, and the
+// compact form truncates long values — so a corpus sitting exactly at a budget
+// equal to prime.max-memory-chars can still have memories elided at injection.
+// A budget meant to keep prime from eliding anything has to sit below that cap.
 func memoryCorpusChars(memories map[string]string) int {
 	total := 0
 	for k, v := range memories {
@@ -352,10 +355,12 @@ existing memory, it is RECALLED instead of stored (same as 'bd recall');
 a bare key naming nothing is refused. Use --key to store slug-like content.
 
 Corpus budget (opt-in, off by default): set the memories.budget-chars config
-key to a byte ceiling for the whole memory corpus (sum of len(key)+len(content),
-the unit bd prime's --max-memory-chars counts in). A write that would cross it
-is refused, and --force overrides; a write that lands at or above 80% of the
-budget warns. With the key unset nothing changes.
+key to a byte ceiling for the whole memory corpus (sum of len(key)+len(content)).
+A write that would cross it is refused, and --force overrides; a write that
+lands at or above 80% of the budget warns. With the key unset nothing changes.
+bd prime's --max-memory-chars also counts bytes, but of each memory as
+injected, formatting included, so a budget equal to that cap does not
+guarantee prime injects every memory; set the budget below it for that.
 
 Examples:
   bd remember "always run tests with -race flag"
@@ -448,12 +453,16 @@ Examples:
 		// output, nothing. Behavior is then byte-identical to the pre-budget
 		// command, which is what TestRememberBudgetVerdictOffIsSilent and the embedded
 		// budget_off_is_silent case pin.
-		budgetKey := memoryKeyFlag
-		if budgetKey == "" {
-			budgetKey = derived
-		}
+		//
+		// The key an overwrite is credited against is ResolveKey's, the one
+		// rule every Remember implementation lands a write under, so it cannot
+		// drift from the store's key. A write ResolveKey refuses (empty
+		// content, a whitespace-only --key, content that derives no key) skips
+		// the budget: Remember refuses it below with its own validation
+		// sentence, and a refused write crosses nothing.
+		budgetKey, budgetKeyErr := memoryapi.ResolveKey(memoryKeyFlag, insight)
 		var budgetLine string
-		if budget := memoryCorpusBudget(); budget > 0 && budgetKey != "" && strings.TrimSpace(insight) != "" {
+		if budget := memoryCorpusBudget(); budget > 0 && budgetKeyErr == nil {
 			// ADVISORY, not atomic: this List and the Remember below are
 			// separate transactions, so two concurrent writers can both measure
 			// a corpus inside the budget and both land, leaving it over. The
@@ -474,11 +483,15 @@ Examples:
 				// machine-readable envelope on stdout (printing the prose to
 				// stderr as well would make the same refusal arrive twice),
 				// and every other route gets the bare sentence on stderr,
-				// where it can never corrupt structured output.
+				// where it can never corrupt structured output. Both routes
+				// carry the same hint, so a terminal user is offered the same
+				// ways out as a JSON consumer.
+				const hint = "raise memories.budget-chars, forget a memory, or pass --force"
 				if jsonOutput {
-					jsonStdoutError(line, "raise memories.budget-chars, forget a memory, or pass --force")
+					jsonStdoutError(line, hint)
 				} else {
 					fmt.Fprintln(os.Stderr, line)
+					fmt.Fprintf(os.Stderr, "Hint: %s\n", hint)
 				}
 				return SilentExit()
 			}

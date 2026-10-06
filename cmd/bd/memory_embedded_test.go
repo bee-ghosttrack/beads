@@ -605,11 +605,51 @@ func TestEmbeddedMemoryCorpusBudget(t *testing.T) {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr = %q, want %q", stderr, want)
 		}
+		// A terminal user is offered the same ways out as the --json envelope.
+		if hint := "Hint: raise memories.budget-chars, forget a memory, or pass --force"; !strings.Contains(stderr, hint) {
+			t.Errorf("stderr = %q, want the hint %q", stderr, hint)
+		}
 		if strings.Contains(stdout, "Remembered") || strings.Contains(stdout, "Updated") {
 			t.Errorf("a refused write must print no success line, got stdout %q", stdout)
 		}
 		if out := bdRecall(t, bd, dir, "pad"); !strings.Contains(out, strings.Repeat("b", 90)) {
 			t.Errorf("a refused write must leave the old content intact, got %q", out)
+		}
+	})
+
+	// The commonest call passes no --key, so the write lands under the key
+	// derived from the content, and that is the key the budget must measure:
+	// 100 + 22 ("derived-keys-count-too") + 24 (the content) projects 146.
+	t.Run("derived_key_write_is_budgeted", func(t *testing.T) {
+		stdout, stderr, err := bdRememberBuffers(t, bd, dir, "Derived keys count, too!")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("a write with no --key over the budget must exit 1, got %v; stdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		want := "bd remember: memory corpus would be 146 chars, budget is 100 (146%) — refused; use --force to override"
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+		if strings.Contains(stdout, "Remembered") || strings.Contains(stdout, "Updated") {
+			t.Errorf("a refused write must print no success line, got stdout %q", stdout)
+		}
+		bdRecallFail(t, bd, dir, "derived-keys-count-too")
+	})
+
+	// A whitespace-only --key names nothing, so the role refuses the write with
+	// its own validation sentence. The budget must not answer first: on this
+	// full corpus it would call the write over budget and point at --force,
+	// and the --force retry would only then meet the validation error.
+	t.Run("blank_key_gets_the_validation_error_not_the_budget", func(t *testing.T) {
+		stdout, stderr, err := bdRememberBuffers(t, bd, dir, "some content", "--key", "   ")
+		if err == nil {
+			t.Fatalf("a whitespace-only --key must be refused; stdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+		if !strings.Contains(stderr, "memory key must not be empty") {
+			t.Errorf("stderr = %q, want the role's validation error", stderr)
+		}
+		if strings.Contains(stderr, "memory corpus") {
+			t.Errorf("a write the role refuses must not be measured against the budget, got stderr %q", stderr)
 		}
 	})
 
@@ -646,7 +686,7 @@ func TestEmbeddedMemoryCorpusBudget(t *testing.T) {
 		}
 
 		// ...and stderr says nothing, so the refusal arrived exactly once.
-		if strings.Contains(stderr, "memory corpus") {
+		if strings.Contains(stderr, "memory corpus") || strings.Contains(stderr, "Hint:") {
 			t.Errorf("--json refusal must not also print the prose line to stderr, got stderr %q", stderr)
 		}
 
