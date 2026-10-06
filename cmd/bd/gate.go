@@ -792,9 +792,11 @@ func printGateCheckSummary(checked, resolvedCount, escalatedCount, errorCount in
 		}
 	}
 	if errorCount > 0 {
-		// A gate whose condition could not be read is neither resolved nor
-		// pending; the caller must not mistake this run for a clean sweep.
-		return fmt.Errorf("%d gate(s) could not be checked", errorCount)
+		// errorCount holds both row kinds applyGateCheckResults prints: a gate
+		// whose check failed ("error checking") and a resolved gate whose close
+		// failed ("error closing"). Neither is resolved or pending, so the
+		// caller must not mistake this run for a clean sweep.
+		return fmt.Errorf("%d gate(s) could not be checked or closed", errorCount)
 	}
 	return nil
 }

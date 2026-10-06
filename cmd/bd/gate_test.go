@@ -382,8 +382,8 @@ func TestPrintGateCheckSummary_ErrorsFailTheCommand(t *testing.T) {
 			if !strings.Contains(out, "Checked 3 gates") {
 				t.Errorf("summary line missing from output %q", out)
 			}
-			if tt.wantErr && !strings.Contains(err.Error(), "could not be checked") {
-				t.Errorf("err %q does not say the gates could not be checked", err)
+			if tt.wantErr && !strings.Contains(err.Error(), "could not be checked or closed") {
+				t.Errorf("err %q does not say the gates could not be checked or closed", err)
 			}
 		})
 	}
