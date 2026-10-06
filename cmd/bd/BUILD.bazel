@@ -770,6 +770,7 @@ go_test(
         "gate_discover_test.go",
         "gate_embedded_test.go",
         "gate_frontdoor_parity_integration_test.go",
+        "gate_inherit_embedded_test.go",
         "gate_lifecycle_proxied_integration_test.go",
         "gate_routing_test.go",
         "gate_test.go",
