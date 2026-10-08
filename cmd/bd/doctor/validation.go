@@ -369,7 +369,9 @@ func truncateDetail(detail string) string {
 // nothing in the subtree could ever become ready. The cascade now propagates
 // only exogenous blockedness, so the edges are harmless and frequently
 // intentional; what an operator wants from doctor is the inventory — which
-// beads in this store use the idiom — not a repair.
+// beads in this store use the idiom — not a repair. An inventory query that
+// fails or times out is a warning, as in the file's other checks, so it cannot
+// pass for an empty inventory.
 func CheckParentBlocksOwnChild(path string) DoctorCheck {
 	beadsDir := ResolveBeadsDirForRepo(path)
 
@@ -438,8 +440,9 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Parent Close Gates",
-			Status:   StatusOK,
+			Status:   StatusWarning,
 			Message:  "N/A (query failed)",
+			Detail:   err.Error(),
 			Category: CategoryMetadata,
 		}
 	}
@@ -455,7 +458,7 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	if err := rows.Err(); err != nil {
 		return DoctorCheck{
 			Name:     "Parent Close Gates",
-			Status:   StatusOK,
+			Status:   StatusWarning,
 			Message:  "N/A (row iteration error)",
 			Detail:   err.Error(),
 			Category: CategoryMetadata,
@@ -476,7 +479,7 @@ func checkParentBlocksOwnChildDB(db *sql.DB) DoctorCheck {
 	return DoctorCheck{
 		Name:     "Parent Close Gates",
 		Status:   StatusOK,
-		Message:  fmt.Sprintf("%d parent→own-descendant blocking edge(s) (informational: the children stay in bd ready)", len(gates)),
+		Message:  fmt.Sprintf("%d parent→own-descendant blocking edge(s) (informational: these gates do not keep the children out of bd ready)", len(gates)),
 		Detail:   detail,
 		Category: CategoryMetadata,
 	}

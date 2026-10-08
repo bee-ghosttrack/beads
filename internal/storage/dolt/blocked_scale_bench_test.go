@@ -14,7 +14,7 @@ import (
 // Blocked-state cost at store scale (gastownhall/beads#6506, #6288).
 //
 // The timings below are the ones the parent-child cascade can regress, and the
-// ones a change to shouldBeBlockedIDsUnionScopedSQL must be measured against
+// ones a change to shouldBeBlockedIDsUnionCoreSQL must be measured against
 // BEFORE it ships:
 //
 //   - RecomputeAllIsBlockedInTx — the full repair. It runs on every dolt

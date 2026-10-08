@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
-	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -785,36 +784,36 @@ func appendSiblingsUnderAncestorsInTx(
 // the filter a 70-deep chain reseeds every ancestor's subtree on every edge
 // written into it, which is O(depth x size) per write and times out.
 //
-// It is the seeding twin of isAncestorInTx in dependencies.go and borrows its
-// recursion: UNION distinct, so a malformed diamond or cycle in the hierarchy
-// terminates by unique reachable node rather than running away.
+// It walks with isAncestorInTx's own recursive members (reachabilityMembers in
+// dependencies.go): one per dependency table, each an index probe on issue_id
+// pinned by join hints, merged by UNION distinct, so a malformed diamond or
+// cycle in the hierarchy terminates by unique reachable node rather than
+// running away. The members project NULL for a row that is not parent-child,
+// which the outer filter drops. Joining the frontier to a derived UNION of the
+// two tables instead, this walk's first shape, is the scan #7224 removed from
+// isAncestorInTx (minutes per walk at 100k edges), and it runs here on every
+// parent-child write and merge replay. TestGraphWalkPlansHonorJoinHints
+// (embedded) pins the lookup plan.
 //
-//nolint:gosec // G201: the union is built from constant table names and DepTargetExpr.
+//nolint:gosec // G201: the members are built from constant table names and type filters.
 func ancestorChainInTx(ctx context.Context, tx DBTX, id string) ([]string, error) {
 	if id == "" {
 		return nil, nil
-	}
-	var unions []string
-	for _, t := range cycleDetectionTables() {
-		unions = append(unions, fmt.Sprintf(
-			"SELECT issue_id, %s AS parent_id FROM %s WHERE type = 'parent-child'", DepTargetExpr, t))
 	}
 	query := fmt.Sprintf(`
 		WITH RECURSIVE ancestors(node) AS (
 			SELECT ?
 			UNION
-			SELECT d.parent_id
-			FROM ancestors a
-			JOIN (%s) d ON d.issue_id = a.node
+			%s
 		)
 		SELECT node FROM ancestors
 		WHERE node IS NOT NULL
 		  AND ( node = ?
-		     OR EXISTS (SELECT 1 FROM dependencies r
-		                WHERE r.issue_id = ancestors.node AND r.type <> 'parent-child')
-		     OR EXISTS (SELECT 1 FROM wisp_dependencies r
-		                WHERE r.issue_id = ancestors.node AND r.type <> 'parent-child') )
-	`, strings.Join(unions, " UNION "))
+		     OR EXISTS (SELECT 1 FROM dependencies x
+		                WHERE x.issue_id = ancestors.node AND x.type <> 'parent-child')
+		     OR EXISTS (SELECT 1 FROM wisp_dependencies x
+		                WHERE x.issue_id = ancestors.node AND x.type <> 'parent-child') )
+	`, reachabilityMembers("ancestors", cycleDetectionTables(), "d.type = 'parent-child'"))
 
 	rows, err := tx.QueryContext(ctx, query, id, id)
 	if err != nil {

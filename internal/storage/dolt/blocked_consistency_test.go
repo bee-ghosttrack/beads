@@ -732,3 +732,317 @@ func TestParentChildCascade_IncrementalMatchesFullRepairAcrossEdits(t *testing.T
 	}
 	step("blocks edge removed", clear)
 }
+
+// TestParentChildCascade_OwnGateUnderExogenousParent is the contract's
+// recursive clause for a parent that carries a reason of its own (the #6602
+// review's mixed-arm repro). Q is blocked by an outside issue X, P hangs under
+// Q, and P carries a close gate over its own child C. P's own reason is
+// subtree-derived, but the epic above it is gated from outside, so P cascades
+// and C stays dark: a close gate does not unlock the work under an epic that
+// is itself blocked.
+//
+// Closing and reopening X then flips C without touching a row of the gate.
+// Nothing about P changes, so only the seeding from X down the hierarchy can
+// re-evaluate C.
+func TestParentChildCascade_OwnGateUnderExogenousParent(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{"pcm-x", "pcm-q", "pcm-p", "pcm-c"} {
+		createPerm(t, ctx, store, id)
+	}
+	addDependencyWithMeta(t, ctx, store, "pcm-q", "pcm-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcm-p", "pcm-q", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcm-p", "pcm-c", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcm-c", "pcm-p", types.DepParentChild)
+
+	step := func(name string, want map[string]bool) {
+		t.Helper()
+		assertBlockedFlags(ctx, t, store, name+" (write path)", want)
+		assertConvergedAndStable(ctx, t, store)
+		assertBlockedFlags(ctx, t, store, name+" (after full repair)", want)
+	}
+	gated := map[string]bool{
+		"pcm-x": false,
+		"pcm-q": true, // blocked from outside,
+		"pcm-p": true, // which P inherits on top of its own gate,
+		"pcm-c": true, // so the gate's own child stays dark.
+	}
+	step("own gate under an exogenously blocked parent", gated)
+
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{Status: types.StatusOpen})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	for _, issue := range ready {
+		if issue.ID == "pcm-c" {
+			t.Error("pcm-c is ready work, but the epic above its parent is blocked from outside")
+		}
+	}
+
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", gated)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+
+	if err := store.CloseIssue(ctx, "pcm-x", "lockstep", "tester", ""); err != nil {
+		t.Fatalf("close pcm-x: %v", err)
+	}
+	step("outside blocker closed", map[string]bool{
+		"pcm-x": false,
+		"pcm-q": false,
+		"pcm-p": true,  // P still waits on C,
+		"pcm-c": false, // but nothing above P is blocked any more.
+	})
+	if err := store.ReopenIssue(ctx, "pcm-x", "lockstep", "tester"); err != nil {
+		t.Fatalf("reopen pcm-x: %v", err)
+	}
+	step("outside blocker reopened", gated)
+}
+
+// TestParentChildCascade_NestedGatesBothWays pins that the recursive clause
+// reads the WHOLE chain above a parent, not one level of it.
+//
+// Exogenous root: R is blocked by an outside issue X. Q hangs under R and
+// carries a close gate over its own child P, and P carries one over its own
+// child C. Q's reason and P's are both subtree-derived, so asking only "is P's
+// blocked parent explained?" finds Q explained and lets C through. But Q is
+// explained by its own reasons alone while R above it is gated from outside:
+// R cascades into Q, Q into P, and P into C.
+//
+// No exogenous root: the same two nested gates, Q2 over P2 and P2 over C2,
+// with nothing blocked above Q2. Every blocked row is explained by its own
+// subtree, so C2 stays bright. This is the control against pruning too much:
+// a blocked parent above P2 is not enough to cascade, it has to be one that
+// is not explained.
+//
+// Closing X then frees C three levels below the row whose flag changed, and
+// reopening X darkens it again.
+//
+// Last, a write that re-evaluates the children alone: an outside blocker Y of
+// their own closes. The close seeds only Y and the rows waiting on it, so the
+// batch's read is asked about P2 and P and nothing above them, and the chain
+// has to be read by id as the walk climbs: Q2 is explained, so C2 comes
+// bright, and R is not, so C stays dark.
+func TestParentChildCascade_NestedGatesBothWays(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, id := range []string{
+		"pcn-x", "pcn-r", "pcn-q", "pcn-p", "pcn-c",
+		"pcn-q2", "pcn-p2", "pcn-c2",
+	} {
+		createPerm(t, ctx, store, id)
+	}
+	// The blocks edges go in while no hierarchy exists; each parent-child edge
+	// that puts a gate's target under its blocker closes a loop and needs
+	// SkipCycleCheck.
+	addDependencyWithMeta(t, ctx, store, "pcn-r", "pcn-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcn-q", "pcn-p", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcn-p", "pcn-c", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcn-q", "pcn-r", types.DepParentChild, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcn-p", "pcn-q", types.DepParentChild)
+	addDepSkippingCycleCheck(ctx, t, store, "pcn-c", "pcn-p", types.DepParentChild)
+
+	addDependencyWithMeta(t, ctx, store, "pcn-q2", "pcn-p2", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcn-p2", "pcn-c2", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcn-p2", "pcn-q2", types.DepParentChild)
+	addDepSkippingCycleCheck(ctx, t, store, "pcn-c2", "pcn-p2", types.DepParentChild)
+
+	step := func(name string, want map[string]bool) {
+		t.Helper()
+		assertBlockedFlags(ctx, t, store, name+" (write path)", want)
+		assertConvergedAndStable(ctx, t, store)
+		assertBlockedFlags(ctx, t, store, name+" (after full repair)", want)
+	}
+	want := map[string]bool{
+		"pcn-x":  false,
+		"pcn-r":  true,
+		"pcn-q":  true,
+		"pcn-p":  true,
+		"pcn-c":  true, // two explained gates under an exogenous one
+		"pcn-q2": true,
+		"pcn-p2": true,
+		"pcn-c2": false, // two explained gates with nothing above them
+	}
+	step("nested gates", want)
+
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{Status: types.StatusOpen})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	inReady := map[string]bool{}
+	for _, issue := range ready {
+		inReady[issue.ID] = true
+	}
+	if inReady["pcn-c"] {
+		t.Error("pcn-c is ready work, but R two gates above it is blocked from outside")
+	}
+	if !inReady["pcn-c2"] {
+		t.Error("pcn-c2 missing from ready work: every gate above it is explained by its own subtree")
+	}
+
+	if _, err := store.db.ExecContext(ctx, "UPDATE issues SET is_blocked = 1 - is_blocked"); err != nil {
+		t.Fatalf("invert flags: %v", err)
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	assertBlockedFlags(ctx, t, store, "after repairing an inverted plane", want)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+
+	if err := store.CloseIssue(ctx, "pcn-x", "lockstep", "tester", ""); err != nil {
+		t.Fatalf("close pcn-x: %v", err)
+	}
+	freed := map[string]bool{}
+	for id, blocked := range want {
+		freed[id] = blocked
+	}
+	freed["pcn-r"] = false
+	freed["pcn-c"] = false
+	step("outside blocker closed", freed)
+	if err := store.ReopenIssue(ctx, "pcn-x", "lockstep", "tester"); err != nil {
+		t.Fatalf("reopen pcn-x: %v", err)
+	}
+	step("outside blocker reopened", want)
+
+	createPerm(t, ctx, store, "pcn-y")
+	addDependencyWithMeta(t, ctx, store, "pcn-c2", "pcn-y", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcn-c", "pcn-y", types.DepBlocks, "")
+	want["pcn-y"] = false
+	want["pcn-c2"] = true // by Y, for now
+	step("a blocker of their own on both children", want)
+	if err := store.CloseIssue(ctx, "pcn-y", "done", "tester", ""); err != nil {
+		t.Fatalf("close pcn-y: %v", err)
+	}
+	want["pcn-c2"] = false
+	step("their own blocker closed", want)
+}
+
+// TestParentChildCascade_WispGateUnderExogenousParent is the mixed arm on the
+// wisp mirror, and across the two kinds: wisp P carries a close gate over its
+// own wisp child C and hangs under a permanent epic Q that an outside issue X
+// blocks. The edge up from P lives in wisp_dependencies and names Q in
+// depends_on_issue_id, so the walk above P has to cross from the wisp tables
+// to the issue tables to find what gates it.
+//
+// The second component crosses the other way, under the same X: permanent P2
+// carries a close gate over its own child C2 and hangs under a wisp epic Q2
+// that X blocks. The edge up from P2 lives in dependencies and names Q2 in
+// depends_on_wisp_id.
+//
+// Last, a wisp gate that is explained: wisp Q3 gates its own child P3, which
+// gates its own child C3, and nothing blocks Q3 from outside, so C3 is bright.
+// Then C3's own outside blocker Y closes. The close seeds only Y and the rows
+// waiting on it, so the batch's read is asked about P3 and nothing above it,
+// and the walk has to read wisp Q3 by id to find it explained.
+func TestParentChildCascade_WispGateUnderExogenousParent(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	createPerm(t, ctx, store, "pcwm-x")
+	createPerm(t, ctx, store, "pcwm-q")
+	createWisp(t, ctx, store, "pcwm-p")
+	createWisp(t, ctx, store, "pcwm-c")
+	addDependencyWithMeta(t, ctx, store, "pcwm-q", "pcwm-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcwm-p", "pcwm-q", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcwm-p", "pcwm-c", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcwm-c", "pcwm-p", types.DepParentChild)
+
+	createWisp(t, ctx, store, "pcwm-q2")
+	createPerm(t, ctx, store, "pcwm-p2")
+	createPerm(t, ctx, store, "pcwm-c2")
+	addDependencyWithMeta(t, ctx, store, "pcwm-q2", "pcwm-x", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcwm-p2", "pcwm-q2", types.DepParentChild, "")
+	addDependencyWithMeta(t, ctx, store, "pcwm-p2", "pcwm-c2", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcwm-c2", "pcwm-p2", types.DepParentChild)
+
+	// The rows live in two tables, so read both; the ids do not collide.
+	check := func(when string, want map[string]bool) {
+		t.Helper()
+		got := readIsBlockedFlags(t, ctx, store, "issues")
+		for id, blocked := range readIsBlockedFlags(t, ctx, store, "wisps") {
+			got[id] = blocked
+		}
+		for id, expected := range want {
+			if blocked, ok := got[id]; !ok {
+				t.Errorf("%s: %s not found in issues or wisps", when, id)
+			} else if blocked != expected {
+				t.Errorf("%s: %s is_blocked = %v, want %v", when, id, blocked, expected)
+			}
+		}
+	}
+	step := func(name string, want map[string]bool) {
+		t.Helper()
+		check(name+" (write path)", want)
+		assertConvergedAndStable(ctx, t, store)
+		check(name+" (after full repair)", want)
+	}
+	gated := map[string]bool{
+		"pcwm-x": false,
+		"pcwm-q": true, "pcwm-p": true, "pcwm-c": true,
+		"pcwm-q2": true, "pcwm-p2": true, "pcwm-c2": true,
+	}
+	step("wisp gate under an exogenously blocked epic", gated)
+
+	for _, table := range []string{"issues", "wisps"} {
+		if _, err := store.db.ExecContext(ctx, "UPDATE "+table+" SET is_blocked = 1 - is_blocked"); err != nil {
+			t.Fatalf("invert %s flags: %v", table, err)
+		}
+	}
+	if changed := recomputeAll(ctx, t, store.db); changed == 0 {
+		t.Fatal("repair reported 0 corrections over an inverted plane")
+	}
+	check("after repairing an inverted plane", gated)
+	if n := countInconsistencies(ctx, t, store.db); n != 0 {
+		t.Errorf("after repair: want 0 inconsistencies, got %d", n)
+	}
+
+	if err := store.CloseIssue(ctx, "pcwm-x", "lockstep", "tester", ""); err != nil {
+		t.Fatalf("close pcwm-x: %v", err)
+	}
+	step("outside blocker closed", map[string]bool{
+		"pcwm-x": false,
+		"pcwm-q": false, "pcwm-p": true, "pcwm-c": false,
+		"pcwm-q2": false, "pcwm-p2": true, "pcwm-c2": false,
+	})
+	if err := store.ReopenIssue(ctx, "pcwm-x", "lockstep", "tester"); err != nil {
+		t.Fatalf("reopen pcwm-x: %v", err)
+	}
+	step("outside blocker reopened", gated)
+
+	createWisp(t, ctx, store, "pcwm-q3")
+	createPerm(t, ctx, store, "pcwm-p3")
+	createPerm(t, ctx, store, "pcwm-c3")
+	addDependencyWithMeta(t, ctx, store, "pcwm-q3", "pcwm-p3", types.DepBlocks, "")
+	addDependencyWithMeta(t, ctx, store, "pcwm-p3", "pcwm-c3", types.DepBlocks, "")
+	addDepSkippingCycleCheck(ctx, t, store, "pcwm-p3", "pcwm-q3", types.DepParentChild)
+	addDepSkippingCycleCheck(ctx, t, store, "pcwm-c3", "pcwm-p3", types.DepParentChild)
+	nested := map[string]bool{"pcwm-q3": true, "pcwm-p3": true, "pcwm-c3": false}
+	step("two explained gates under a wisp", nested)
+
+	createPerm(t, ctx, store, "pcwm-y")
+	addDependencyWithMeta(t, ctx, store, "pcwm-c3", "pcwm-y", types.DepBlocks, "")
+	nested["pcwm-y"] = false
+	nested["pcwm-c3"] = true // by Y, for now
+	step("a blocker of its own on the grandchild", nested)
+	if err := store.CloseIssue(ctx, "pcwm-y", "done", "tester", ""); err != nil {
+		t.Fatalf("close pcwm-y: %v", err)
+	}
+	nested["pcwm-c3"] = false
+	step("its own blocker closed", nested)
+}

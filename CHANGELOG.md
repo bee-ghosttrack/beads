@@ -1364,12 +1364,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blockedness whose cause lies outside the parent's own subtree — so the
   close-gate idiom, a parent carrying `blocks` edges onto its own children (or
   grandchildren) so it cannot close before them, stops darkening the very work
-  it is waiting for. The parent itself stays blocked. One case is knowingly
-  left alone, always in the direction of showing work rather than hiding it: a
-  sub-epic blocked BOTH by its own children AND by an exogenously blocked
-  ancestor keeps its children visible, where the contract would darken them
-  (tracked as [#6601](https://github.com/gastownhall/beads/issues/6601)).
-  "Inside my own subtree" is also decided to a fixed depth of **four**
+  it is waiting for. The parent itself stays blocked, and a close gate does not
+  unlock the work under an epic that is itself blocked from outside: a sub-epic
+  blocked BOTH by its own children AND by an exogenously blocked ancestor still
+  darkens its children
+  ([#6601](https://github.com/gastownhall/beads/issues/6601)).
+  "Inside my own subtree" is decided to a fixed depth of **four**
   parent-child levels — epic → sub-epic → leg → task — so a parent that
   blocks on something deeper than that still darkens its whole subtree, exactly
   as it did before this fix; that depth is a measured trade (the

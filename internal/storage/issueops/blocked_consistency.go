@@ -375,10 +375,11 @@ func unmarkAllBlockedSQL(table, alias, depTable string, explained subtreeExplain
 	`, table, alias, shouldBeBlockedIDsUnionPrecomputedSQL(depTable, explained))
 }
 
-// subtreeExplainedParents is one read of parentsExplainedBySubtreeSQL, for the
-// UNBATCHED statements: the ids of blocked parents whose blockedness is solely
-// explained by their own subtree and which therefore may not darken their
-// children (gastownhall/beads#6506), split by the parent's kind.
+// subtreeExplainedParents is one read of parentsExplainedBySubtreeSQL, pruned
+// by pruneExplainedByAncestryInTx: the ids of blocked parents whose
+// blockedness is solely explained by their own subtree, with nothing blocked
+// above them that is not, and which therefore may not darken their children
+// (gastownhall/beads#6506). The ids are split by the parent's kind.
 //
 // WHY THE IDS AND NOT THE SQL. A spliced `p.id NOT IN (deriving query)` is
 // evaluated once per leg per statement, and a full repair pass is four
@@ -434,23 +435,22 @@ func notInPlaceholders(n int) string {
 // computed once and excluded everywhere. Halving the reads is the difference
 // between the doctor count landing at 1.7x origin/main and at 1.4x.
 func subtreeExplainedParentsInTx(ctx context.Context, tx DBTX) (subtreeExplainedParents, error) {
-	var out subtreeExplainedParents
+	var read subtreeExplainedParents
 	var err error
 
-	out.issueParents, err = queryIDs(ctx, tx,
+	read.issueParents, err = queryIDs(ctx, tx,
 		parentsExplainedBySubtreeSQL("issues", "dependencies", "depends_on_issue_id", unbatchedCandSources()))
 	if err != nil {
-		return out, fmt.Errorf("read issue parents explained by their own subtree: %w", err)
+		return read, fmt.Errorf("read issue parents explained by their own subtree: %w", err)
 	}
-	out.wispParents, err = queryIDs(ctx, tx,
+	read.wispParents, err = queryIDs(ctx, tx,
 		parentsExplainedBySubtreeSQL("wisps", "wisp_dependencies", "depends_on_wisp_id", unbatchedCandSources()))
-	if err != nil {
-		if isTableNotExistError(err) {
-			return out, nil
-		}
-		return out, fmt.Errorf("read wisp parents explained by their own subtree: %w", err)
+	if err != nil && !isTableNotExistError(err) {
+		return read, fmt.Errorf("read wisp parents explained by their own subtree: %w", err)
 	}
-	return out, nil
+	// Every parent in the store was a candidate, so a blocked parent this read
+	// did not return is one its own reasons do not explain.
+	return pruneExplainedByAncestryInTx(ctx, tx, read, true)
 }
 
 // scopedExplainedParentsInTx is subtreeExplainedParentsInTx confined to ONE
@@ -478,31 +478,309 @@ func subtreeExplainedParentsInTx(ctx context.Context, tx DBTX) (subtreeExplained
 func scopedExplainedParentsInTx(
 	ctx context.Context, tx DBTX, depTable, scope string, args []any,
 ) (subtreeExplainedParents, error) {
-	var out subtreeExplainedParents
+	var read subtreeExplainedParents
 	hasIssueParent, hasWispParent, err := batchParentKindsInTx(ctx, tx, depTable, scope, args)
 	if err != nil {
 		if isTableNotExistError(err) {
-			return out, nil
+			return read, nil
 		}
-		return out, err
+		return read, err
 	}
 	cands := []candSource{{depTable: depTable, scope: scope}}
 
 	if hasIssueParent {
-		out.issueParents, err = queryIDs(ctx, tx,
+		read.issueParents, err = queryIDs(ctx, tx,
 			parentsExplainedBySubtreeSQL("issues", "dependencies", "depends_on_issue_id", cands), args...)
 		if err != nil {
-			return out, fmt.Errorf("read batch issue parents explained by their own subtree: %w", err)
+			return read, fmt.Errorf("read batch issue parents explained by their own subtree: %w", err)
 		}
 	}
 	if hasWispParent {
-		out.wispParents, err = queryIDs(ctx, tx,
+		read.wispParents, err = queryIDs(ctx, tx,
 			parentsExplainedBySubtreeSQL("wisps", "wisp_dependencies", "depends_on_wisp_id", cands), args...)
+		if err != nil && !isTableNotExistError(err) {
+			return read, fmt.Errorf("read batch wisp parents explained by their own subtree: %w", err)
+		}
+	}
+	// Only the batch's own parents were candidates, so the parents above them
+	// are read by id as the walk climbs.
+	return pruneExplainedByAncestryInTx(ctx, tx, read, false)
+}
+
+// parentRef is one parent in pruneExplainedByAncestryInTx's walk: its id and
+// its kind, which picks the tables its rows live in. The two id spaces are kept
+// apart rather than trusted not to collide.
+type parentRef struct {
+	id   string
+	wisp bool
+}
+
+// parentEdge is one parent-child edge from child up to a parent that is
+// blocked.
+type parentEdge struct {
+	child, parent parentRef
+}
+
+// pruneExplainedByAncestryInTx drops from a read of parentsExplainedBySubtreeSQL
+// every parent that is blocked FROM ABOVE: one with a blocked parent that is
+// not itself explained, at any depth. It is the contract's recursive clause
+// ("…or P's own parent-child parent is exogenously blocked") for parents that
+// carry reasons of their own.
+//
+// WHY THE FIXPOINT DOES NOT CARRY IT. The read decides from a parent's OWN
+// reason rows. The legs' p.is_blocked = 1 conjunct carries inheritance only
+// for a parent with no reason row: such a parent is dark exactly while
+// something above it cascades into it. A parent with a subtree reason is dark
+// either way, so its bit says nothing about what is above it. Q blocks on
+// outside X, pc P -> Q, P blocks on its own child C: the read explains P, so C
+// comes bright while the epic above it is still gated by X. A one-level check
+// ("no blocked parent outside the set") is not enough either. Put a second
+// close gate between them (R blocks on X, pc Q -> R, Q blocks on P, pc P -> Q,
+// P blocks on C): P's blocked parent Q is in the set, so P stays explained and
+// R's gate never reaches C. Whether a parent is explained depends on the whole
+// chain above it, and no is_blocked bit records that chain.
+//
+// So this resolves it here, over the few parents the read returned:
+//
+//   - the edges: each explained parent's blocked parents
+//     (blockedParentEdgesInTx);
+//   - membership of every blocked parent the walk meets. A complete read
+//     already decides it: every parent in the store was a candidate, so a
+//     blocked parent it did not return is not explained. A batch-scoped read
+//     decided only the batch's parents, so the walk reads the rest by id
+//     (explainedAmongInTx) and keeps climbing while it finds explained ones;
+//   - the set itself (dropBlockedFromAbove): the GREATEST set of read parents
+//     all of whose blocked parents are in it. Start from everything read, and
+//     drop any parent with a blocked parent outside the set, until nothing
+//     drops. Greatest, because "exogenously blocked" needs a finite chain up
+//     to a real outside reason, so a malformed hierarchy cycle of close gates
+//     with nothing exogenous above it stays explained. The greatest set is
+//     unique, so the order of the drops cannot change it.
+//
+// COST. Nothing when the read is empty, which covers every store with no close
+// gate and every batch with none at or above it. Otherwise it is one indexed
+// edge read per level of nested close gates, plus a by-id read per level on
+// the scoped path, over parents that are few by construction.
+func pruneExplainedByAncestryInTx(
+	ctx context.Context, tx DBTX, read subtreeExplainedParents, complete bool,
+) (subtreeExplainedParents, error) {
+	if len(read.issueParents) == 0 && len(read.wispParents) == 0 {
+		return read, nil
+	}
+	refs := read.refs()
+	// explained holds every blocked parent the walk has met: true while it is
+	// explained by its own subtree, false once it is known not to be.
+	explained := make(map[parentRef]bool, len(refs))
+	for _, p := range refs {
+		explained[p] = true
+	}
+	above, err := climbBlockedParentsInTx(ctx, tx, refs, explained, complete)
+	if err != nil {
+		return read, err
+	}
+	dropBlockedFromAbove(explained, above)
+
+	var out subtreeExplainedParents
+	for _, p := range refs {
+		switch {
+		case !explained[p]:
+		case p.wisp:
+			out.wispParents = append(out.wispParents, p.id)
+		default:
+			out.issueParents = append(out.issueParents, p.id)
+		}
+	}
+	return out, nil
+}
+
+// refs lists the read's parents with their kinds, issue parents first.
+func (e subtreeExplainedParents) refs() []parentRef {
+	out := make([]parentRef, 0, len(e.issueParents)+len(e.wispParents))
+	for _, id := range e.issueParents {
+		out = append(out, parentRef{id: id})
+	}
+	for _, id := range e.wispParents {
+		out = append(out, parentRef{id: id, wisp: true})
+	}
+	return out
+}
+
+// climbBlockedParentsInTx is pruneExplainedByAncestryInTx's walk: up from the
+// read's parents through their blocked parents, returning the edges (child to
+// its blocked parents) and entering every blocked parent it meets in
+// explained. On a complete read it stops after one level; on a scoped read it
+// climbs on from each new parent explainedAmongInTx finds explained.
+func climbBlockedParentsInTx(
+	ctx context.Context, tx DBTX, frontier []parentRef, explained map[parentRef]bool, complete bool,
+) (map[parentRef][]parentRef, error) {
+	above := make(map[parentRef][]parentRef)
+	for len(frontier) > 0 {
+		edges, err := blockedParentEdgesInTx(ctx, tx, frontier)
 		if err != nil {
-			if isTableNotExistError(err) {
-				return out, nil
+			return nil, err
+		}
+		var unknown []parentRef
+		for _, e := range edges {
+			above[e.child] = append(above[e.child], e.parent)
+			if _, met := explained[e.parent]; !met {
+				explained[e.parent] = false
+				unknown = append(unknown, e.parent)
 			}
-			return out, fmt.Errorf("read batch wisp parents explained by their own subtree: %w", err)
+		}
+		if complete || len(unknown) == 0 {
+			break
+		}
+		frontier, err = explainedAmongInTx(ctx, tx, unknown)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range frontier {
+			explained[p] = true
+		}
+	}
+	return above, nil
+}
+
+// dropBlockedFromAbove shrinks explained to the greatest set the contract
+// allows: it drops any parent with a blocked parent outside the set, until
+// nothing drops.
+func dropBlockedFromAbove(explained map[parentRef]bool, above map[parentRef][]parentRef) {
+	for dropped := true; dropped; {
+		dropped = false
+		for p, ok := range explained {
+			if ok && !allExplained(above[p], explained) {
+				explained[p] = false
+				dropped = true
+			}
+		}
+	}
+}
+
+func allExplained(parents []parentRef, explained map[parentRef]bool) bool {
+	for _, q := range parents {
+		if !explained[q] {
+			return false
+		}
+	}
+	return true
+}
+
+// blockedParentEdgesInTx reads the parent-child edges from children up to a
+// parent that is blocked. An edge lives in the child's dependency table and
+// names the parent in the column for the parent's kind, so this is one lookup
+// per child kind and parent kind, each keyed on the child's issue_id. The hints
+// pin that drive, as on the batched legs.
+//
+//nolint:gosec // G201: table and column names are constants; the ids are ? placeholders.
+func blockedParentEdgesInTx(ctx context.Context, tx DBTX, children []parentRef) ([]parentEdge, error) {
+	var issueIDs, wispIDs []string
+	for _, c := range children {
+		if c.wisp {
+			wispIDs = append(wispIDs, c.id)
+		} else {
+			issueIDs = append(issueIDs, c.id)
+		}
+	}
+	var out []parentEdge
+	for _, side := range []struct {
+		depTable string
+		ids      []string
+		wisp     bool
+	}{
+		{"dependencies", issueIDs, false},
+		{"wisp_dependencies", wispIDs, true},
+	} {
+		for start := 0; start < len(side.ids); start += queryBatchSize {
+			end := min(start+queryBatchSize, len(side.ids))
+			placeholders, args := buildSQLInClause(side.ids[start:end])
+			for _, parent := range []struct {
+				table, col string
+				wisp       bool
+			}{
+				{"issues", "depends_on_issue_id", false},
+				{"wisps", "depends_on_wisp_id", true},
+			} {
+				edges, err := queryParentEdges(ctx, tx, fmt.Sprintf(`
+					SELECT /*+ JOIN_ORDER(d, p) LOOKUP_JOIN(d, p) */ d.issue_id, p.id
+					FROM %[1]s d
+					JOIN %[2]s p ON p.id = d.%[3]s
+					WHERE d.issue_id IN (%[4]s)
+					  AND d.type = 'parent-child'
+					  AND p.is_blocked = 1
+				`, side.depTable, parent.table, parent.col, placeholders), args, side.wisp, parent.wisp)
+				if err != nil {
+					return nil, fmt.Errorf("read blocked parents of explained parents: %w", err)
+				}
+				out = append(out, edges...)
+			}
+		}
+	}
+	return out, nil
+}
+
+// queryParentEdges runs one of blockedParentEdgesInTx's lookups and tags each
+// (child, parent) row with the kinds the lookup was for. A table that does not
+// exist has no edges.
+func queryParentEdges(
+	ctx context.Context, tx DBTX, query string, args []any, childWisp, parentWisp bool,
+) ([]parentEdge, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		if isTableNotExistError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []parentEdge
+	for rows.Next() {
+		var childID, parentID string
+		if err := rows.Scan(&childID, &parentID); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		out = append(out, parentEdge{
+			child:  parentRef{id: childID, wisp: childWisp},
+			parent: parentRef{id: parentID, wisp: parentWisp},
+		})
+	}
+	return out, rows.Err()
+}
+
+// explainedAmongInTx is parentsExplainedBySubtreeSQL for the named parents, by
+// id. pruneExplainedByAncestryInTx uses it for the blocked parents above a
+// batch that the batch-scoped read was not asked about.
+//
+// Unlike the wisp reads above, it does not tolerate a missing table, because it
+// cannot meet one: the prune runs only on a non-empty read, and that read came
+// from the same core query, which reads both item tables and both dependency
+// tables whichever kind it asks about.
+func explainedAmongInTx(ctx context.Context, tx DBTX, parents []parentRef) ([]parentRef, error) {
+	var out []parentRef
+	for _, kind := range []struct {
+		table, depTable string
+		wisp            bool
+	}{
+		{"issues", "dependencies", false},
+		{"wisps", "wisp_dependencies", true},
+	} {
+		var ids []string
+		for _, p := range parents {
+			if p.wisp == kind.wisp {
+				ids = append(ids, p.id)
+			}
+		}
+		for start := 0; start < len(ids); start += queryBatchSize {
+			end := min(start+queryBatchSize, len(ids))
+			placeholders, args := buildSQLInClause(ids[start:end])
+			found, err := queryIDs(ctx, tx,
+				parentsExplainedBySubtreeCoreSQL(kind.table, kind.depTable, candByIDSQL(kind.table, placeholders)),
+				args...)
+			if err != nil {
+				return nil, fmt.Errorf("read explained parents above the batch: %w", err)
+			}
+			for _, id := range found {
+				out = append(out, parentRef{id: id, wisp: kind.wisp})
+			}
 		}
 	}
 	return out, nil
@@ -659,12 +937,10 @@ func shouldBeBlockedIDsUnionScopedPrecomputedSQL(
 }
 
 // shouldBeBlockedIDsUnionCoreSQL is the five legs themselves. The two
-// parent-child legs take their exogeneity condition as text, because the two
-// callers spell it differently: the batched path splices the deriving query
-// (confined to the batch's parents), the unbatched path an already-read
-// IN-list. Both say the same thing — "unless this parent is explained by its
-// own subtree" — and the empty string says "no parent is", which is what an
-// empty set means.
+// parent-child legs take their exogeneity condition as text: both callers
+// pass an already-read IN-list rendered to placeholders (notInPlaceholders),
+// saying "unless this parent is explained by its own subtree", and the empty
+// string says "no parent is", which is what an empty set means.
 //
 //nolint:gosec // G201: depTable and scope are constants; the conditions come from the two callers above.
 func shouldBeBlockedIDsUnionCoreSQL(depTable, scope, issueParentCond, wispParentCond string) string {
@@ -770,16 +1046,19 @@ const subtreeWalkDepth = 4
 //
 // SHAPE. The caller's condition is a subtraction:
 //
-//	AND p.id NOT IN (this select)
+//	AND p.id NOT IN (this select, pruned by pruneExplainedByAncestryInTx)
 //
-// A parent cascades unless it appears here, so a parent with NO blocking
-// reason row of its own — absent from this set, because the set is built from
-// reason rows — cascades. That is the contract's recursive clause carried
-// through the EXISTING fixpoint rather than through a second pass of SQL
-// recursion: such a parent is dark because ITS parent is, so its children
-// inherit. Because the legs keep the p.is_blocked = 1 conjunct, a chain
-// converges the way it always did — one level per fixpoint pass — and the
-// single-pass doctor COUNT stays the documented lower bound.
+// A parent cascades unless it appears here. A parent with NO blocking reason
+// row of its own is absent from this set, because the set is built from reason
+// rows, so it cascades. For such a parent that is the contract's recursive
+// clause, carried by the EXISTING fixpoint and not by a second pass of SQL
+// recursion: it is dark because ITS parent is, so its children inherit.
+// Because the legs keep the p.is_blocked = 1 conjunct, a chain converges the
+// way it always did, one level per fixpoint pass, and the single-pass doctor
+// COUNT stays the documented lower bound. A parent that DOES carry a reason is
+// dark whatever is above it, so the fixpoint cannot carry the clause for it:
+// pruneExplainedByAncestryInTx drops it from the set when a blocked parent
+// above it is not itself explained.
 //
 // Every reason row is either inside the parent's subtree or outside it, so
 // "no reason row is exogenous" (MAX(...) = 0 below) is the whole membership
@@ -844,7 +1123,25 @@ func parentsExplainedBySubtreeSQL(parentTable, parentDepTable, parentCol string,
 		      AND d.type = 'parent-child'
 		      AND d.%[1]s IS NOT NULL`, parentCol, c.depTable, c.scope)
 	}
+	return parentsExplainedBySubtreeCoreSQL(parentTable, parentDepTable, cand.String())
+}
 
+// candByIDSQL is a cand body naming parents by id: placeholders is a rendered
+// IN-list, for explainedAmongInTx.
+//
+//nolint:gosec // G201: parentTable is a constant; placeholders carries only ? placeholders.
+func candByIDSQL(parentTable, placeholders string) string {
+	return fmt.Sprintf(`
+		    SELECT c.id FROM %s c WHERE c.id IN (%s)`, parentTable, placeholders)
+}
+
+// parentsExplainedBySubtreeCoreSQL is parentsExplainedBySubtreeSQL over a cand
+// body the caller has already built: the parent-child rows of a batch or of the
+// whole store (parentsExplainedBySubtreeSQL), or parents named by id
+// (candByIDSQL).
+//
+//nolint:gosec // G201: parentTable and parentDepTable are constants; cand is built from constants and ? placeholders.
+func parentsExplainedBySubtreeCoreSQL(parentTable, parentDepTable, cand string) string {
 	// The ancestor walk: one pair of indexed LEFT JOINs per level, on the
 	// dependency tables directly. Materializing the parent-child edges into a
 	// CTE first was measured at 6.6x on the batched write path — the whole
@@ -890,7 +1187,7 @@ func parentsExplainedBySubtreeSQL(parentTable, parentDepTable, parentCol string,
 		    GROUP BY r.pid
 		  )
 		  SELECT b.pid FROM bits b WHERE b.exogenous = 0
-	`, parentTable, parentDepTable, cand.String(),
+	`, parentTable, parentDepTable, cand,
 		blockingReasonSQL("pr"), joins.String(), match.String())
 }
 

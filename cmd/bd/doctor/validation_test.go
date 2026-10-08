@@ -5,6 +5,7 @@ package doctor
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -817,6 +818,29 @@ func TestCheckParentBlocksOwnChildDB_GateReported(t *testing.T) {
 	}
 	if strings.Contains(check.Detail, other.ID) {
 		t.Errorf("Detail = %q, must not list the exogenous blocker %s", check.Detail, other.ID)
+	}
+}
+
+// TestCheckParentBlocksOwnChildDB_QueryFailureWarns verifies that an inventory
+// query that fails is a warning, not an OK that reads as "no gates". A closed
+// handle fails every query without reaching a server.
+func TestCheckParentBlocksOwnChildDB_QueryFailureWarns(t *testing.T) {
+	db, err := sql.Open("mysql", "root@tcp(127.0.0.1:1)/none")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_ = db.Close()
+
+	check := checkParentBlocksOwnChildDB(db)
+
+	if check.Status != StatusWarning {
+		t.Errorf("Status = %q, want %q", check.Status, StatusWarning)
+	}
+	if check.Message != "N/A (query failed)" {
+		t.Errorf("Message = %q, want %q", check.Message, "N/A (query failed)")
+	}
+	if check.Detail == "" {
+		t.Error("Detail is empty, want the query error")
 	}
 }
 
