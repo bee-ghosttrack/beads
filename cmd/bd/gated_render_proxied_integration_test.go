@@ -119,4 +119,48 @@ func TestProxiedServerGatedRendering(t *testing.T) {
 			t.Errorf("proxied closed row carries the gated glyph:\n%s", row)
 		}
 	})
+
+	// A gate can be a wisp — `bd mol wisp` clones a formula's gates as wisps,
+	// held to a wisp step by a blocks edge. The proxied list once hydrated gate
+	// candidates from the issues table only, so this row rendered plain OPEN
+	// while `bd show` and `bd ready` called the same wisp gated.
+	t.Run("wisp_gate_decorates_the_wisp_row", func(t *testing.T) {
+		subject := bdProxiedCreate(t, bd, p.dir, "Proxied wisp step", "-p", "2", "--ephemeral")
+		wgate := bdProxiedCreate(t, bd, p.dir, "Proxied wisp gate", "-p", "2", "-t", "gate", "--ephemeral")
+		if _, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "dep", "add", subject.ID, wgate.ID, "-t", "blocks"); err != nil {
+			t.Fatalf("bd dep add failed: %v\nstderr:\n%s", err, stderr)
+		}
+
+		// The premise: the read that was already wisp-aware calls it gated.
+		showOut := bdProxiedShowRaw(t, bd, p.dir, subject.ID)
+		t.Logf("bd show %s:\n%s", subject.ID, showOut)
+		if !strings.Contains(showOut, "· GATED]") {
+			t.Fatalf("proxied show does not call the wisp gated, the premise of this case:\n%s", showOut)
+		}
+
+		listOut := bdProxiedList(t, bd, p, "--include-ephemeral")
+		t.Logf("bd list --include-ephemeral:\n%s", listOut)
+		if row := listRowFor(t, listOut, subject.ID); !strings.HasPrefix(strings.TrimSpace(row), ui.StatusIconGated) {
+			t.Errorf("proxied pretty wisp row does not lead with %q:\n%s", ui.StatusIconGated, row)
+		}
+
+		flatOut := bdProxiedList(t, bd, p, "--flat", "--include-ephemeral")
+		t.Logf("bd list --flat --include-ephemeral:\n%s", flatOut)
+		row := listRowFor(t, flatOut, subject.ID)
+		if !strings.Contains(row, ui.StatusIconGated) {
+			t.Errorf("proxied compact wisp row missing %q:\n%s", ui.StatusIconGated, row)
+		}
+		if !strings.Contains(row, "gated by: "+wgate.ID) {
+			t.Errorf("proxied compact wisp row does not name the wisp gate %s:\n%s", wgate.ID, row)
+		}
+
+		stdout, stderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir, []string{"CLAUDE_CODE=1"}, "list", "--flat", "--include-ephemeral")
+		if err != nil {
+			t.Fatalf("bd list --flat --include-ephemeral failed: %v\nstderr:\n%s", err, stderr)
+		}
+		t.Logf("CLAUDE_CODE=1 bd list --flat --include-ephemeral:\n%s", stdout)
+		if row := listRowFor(t, stdout, subject.ID); !strings.Contains(row, "gated by: "+wgate.ID) {
+			t.Errorf("proxied agent wisp row does not name the wisp gate %s:\n%s", wgate.ID, row)
+		}
+	})
 }

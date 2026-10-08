@@ -11,7 +11,11 @@ import (
 // gateDepLoader reads the dependency records of a page of ids.
 type gateDepLoader func(ctx context.Context, ids []string) (map[string][]*types.Dependency, error)
 
-// gateHydrator resolves the gate CANDIDATES a page's edges name into issues.
+// gateHydrator resolves the gate CANDIDATES a page's edges name into issues,
+// from BOTH planes: a gate can be a wisp (`bd mol wisp` clones a formula's
+// gates as wisps), and a candidate the hydrator misses is no error but a nil
+// target, which GateIsHolding reads as no gate — the row goes undecorated
+// while `bd show` and `bd ready` call the bead gated.
 type gateHydrator func(ctx context.Context, ids []string) ([]*types.Issue, error)
 
 // gatesByIssueID returns, per listed id, the OPEN gates holding it back — the
@@ -22,8 +26,8 @@ type gateHydrator func(ctx context.Context, ids []string) ([]*types.Issue, error
 // back in one call (or from the map a tree view has already loaded), and the
 // gate candidates they name are hydrated in one more. The COST BOUND is per
 // page, not per row — two calls whatever the page length — though each of those
-// calls is itself a few round trips (the id-set readers partition wisps from
-// issues and then batch their INs), so "two queries" understates the wire
+// calls is itself a few round trips (each reads the issues and the wisps plane
+// separately and batches its INs), so "two queries" understates the wire
 // traffic and "per page" is the promise that matters.
 //
 // The verdict is types.GateIsHolding plus types.SubjectCanBeGated — the one
@@ -156,8 +160,29 @@ func proxiedGatedIssueIDs(
 			return uw.DependencyUseCase().GetForIssueIDs(ctx, ids)
 		},
 		func(ctx context.Context, ids []string) ([]*types.Issue, error) {
-			return uw.IssueUseCase().GetIssuesByIDs(ctx, ids)
+			return proxiedGateCandidates(ctx, uw, ids)
 		})
+}
+
+// proxiedGateCandidates is the proxied gateHydrator. Unlike the direct route's
+// st.GetIssuesByIDs, the use case's GetIssuesByIDs reads the issues table
+// only, while the edges came from GetForIssueIDs, which reads both dependency
+// tables — so the wisps are read beside it, the two-plane idiom
+// ready_proxied_server.go and uowMolReader already use for ids that may be
+// wisps.
+//
+// A failed wisps read keeps the durable candidates: it costs the wisp gates
+// their decoration, not the whole page.
+func proxiedGateCandidates(ctx context.Context, uw uow.UnitOfWork, ids []string) ([]*types.Issue, error) {
+	issues, err := uw.IssueUseCase().GetIssuesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	wisps, err := uw.IssueUseCase().GetWispsByIDs(ctx, ids)
+	if err != nil {
+		return issues, nil
+	}
+	return append(issues, wisps...), nil
 }
 
 // proxiedGatedIssueIDsOwnUOW serves the proxied compact and agent listings,

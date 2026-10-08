@@ -300,6 +300,46 @@ func TestEmbeddedGatedRendering(t *testing.T) {
 			t.Errorf("ungated row should lead with %q:\n%s", ui.StatusIconOpen, row)
 		}
 	})
+
+	// A gate can be a wisp — `bd mol wisp` clones a formula's gates as wisps,
+	// held to a wisp step by a blocks edge. The direct route's readers
+	// partition the planes; this pins that, beside the proxied twin of this
+	// case in TestProxiedServerGatedRendering, whose hydrator once did not.
+	t.Run("wisp_gate_decorates_the_wisp_row", func(t *testing.T) {
+		subject := bdCreate(t, bd, dir, "Wisp step", "-p", "2", "--ephemeral")
+		wgate := bdCreate(t, bd, dir, "Wisp gate", "-p", "2", "-t", "gate", "--ephemeral")
+		if out, err := bdRunWithFlockRetry(t, bd, dir, "dep", "add", subject.ID, wgate.ID, "-t", "blocks"); err != nil {
+			t.Fatalf("bd dep add failed: %v\n%s", err, out)
+		}
+
+		showOut := bdShowRaw(t, bd, dir, subject.ID)
+		t.Logf("bd show %s:\n%s", subject.ID, showOut)
+		if !strings.Contains(showOut, "· GATED]") {
+			t.Fatalf("show does not call the wisp gated, the premise of this case:\n%s", showOut)
+		}
+
+		listOut := bdList(t, bd, dir, "--include-ephemeral")
+		t.Logf("bd list --include-ephemeral:\n%s", listOut)
+		if row := listRowFor(t, listOut, subject.ID); !strings.HasPrefix(strings.TrimSpace(row), ui.StatusIconGated) {
+			t.Errorf("pretty wisp row does not lead with %q:\n%s", ui.StatusIconGated, row)
+		}
+
+		flatOut := bdList(t, bd, dir, "--flat", "--include-ephemeral")
+		t.Logf("bd list --flat --include-ephemeral:\n%s", flatOut)
+		row := listRowFor(t, flatOut, subject.ID)
+		if !strings.Contains(row, ui.StatusIconGated) {
+			t.Errorf("compact wisp row missing %q:\n%s", ui.StatusIconGated, row)
+		}
+		if !strings.Contains(row, "gated by: "+wgate.ID) {
+			t.Errorf("compact wisp row does not name the wisp gate %s:\n%s", wgate.ID, row)
+		}
+
+		agentOut := bdListEnv(t, bd, dir, []string{"CLAUDE_CODE=1"}, "--flat", "--include-ephemeral")
+		t.Logf("CLAUDE_CODE=1 bd list --flat --include-ephemeral:\n%s", agentOut)
+		if row := listRowFor(t, agentOut, subject.ID); !strings.Contains(row, "gated by: "+wgate.ID) {
+			t.Errorf("agent-mode wisp row does not name the wisp gate %s:\n%s", wgate.ID, row)
+		}
+	})
 }
 
 func keysOf(m map[string]any) []string {
