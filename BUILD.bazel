@@ -11,13 +11,19 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 # so //:repo_files covers it for //test/docsync's link checks and the
 # repository-policy tests in //scripts.
 # gazelle:exclude integrations
+# The two example Go modules (own go.mod, built against a released beads) are
+# not part of this build either, but they are tracked files the repository
+# guards (gofmt, build-tag and install-guidance checks in
+# //scripts/repochecks) must see, so they are not in .bazelignore.
+# gazelle:exclude examples/library-usage
+# gazelle:exclude examples/bd-example-extension-go
 gazelle(name = "gazelle")
 
 exports_files(
     [".buildflags"],
     visibility = [
-        "//scripts/pr-lint:__pkg__",
         "//scripts/prlintmake:__pkg__",
+        "//tests/upgrade_smoke:__pkg__",
     ],
 )
 
@@ -26,11 +32,33 @@ exports_files([
     "go.sum",
 ])
 
+# The golangci-lint configuration nogo applies (//tools/nogo), and its test.
+exports_files(
+    [".golangci.yml"],
+    visibility = [
+        "//tools/nogo:__pkg__",
+        "//tools/nogo/internal/golangci:__pkg__",
+    ],
+)
+
 # Repository files read by source-scanning tests, declared as their `data` so
 # the tests run under `bazel test` and remote execution.
 exports_files(
     [".gitattributes"],
     visibility = ["//scripts/gitattributespolicy:__pkg__"],
+)
+
+# //tests/hook_timeout_backends: the tracked git hooks whose managed section
+# it runs against real timeout implementations.
+exports_files(
+    [
+        ".githooks/post-checkout",
+        ".githooks/post-merge",
+        ".githooks/pre-commit",
+        ".githooks/pre-push",
+        ".githooks/prepare-commit-msg",
+    ],
+    visibility = ["//tests/hook_timeout_backends:__pkg__"],
 )
 
 # //cmd/bd:bd_test: tracked git hooks (generator parity) and the formula
@@ -349,6 +377,7 @@ filegroup(
         "//issueops:repo_files",
         "//journalops:repo_files",
         "//memoryops:repo_files",
+        "//platforms:repo_files",
         "//plugins/beads:repo_files",
         "//schema:repo_files",
         "//scripts:repo_files",
@@ -360,18 +389,37 @@ filegroup(
         "//scripts/migration-test/catalog:repo_files",
         "//scripts/pr-lint:repo_files",
         "//scripts/prlintmake:repo_files",
+        "//scripts/repochecks:repo_files",
         "//scripts/repro-dolt-hang:repo_files",
         "//scripts/repro-dolt-prod-timeouts:repo_files",
         "//scripts/workflowtags:repo_files",
         "//test/conformance:repo_files",
         "//test/docsync:repo_files",
         "//test/testmainconvention:repo_files",
+        "//tests/hook_timeout_backends:repo_files",
+        "//tests/migration:repo_files",
+        "//tests/regression:repo_files",
+        "//tests/upgrade_smoke:repo_files",
+        "//third_party/cc_toolchain:repo_files",
         "//third_party/patches:repo_files",
         "//tools/bazel:repo_files",
         "//tools/docsmint:repo_files",
+        "//tools/nogo:repo_files",
+        "//tools/nogo/analyzers/depguard:repo_files",
+        "//tools/nogo/analyzers/errcheck:repo_files",
+        "//tools/nogo/analyzers/forbidigo:repo_files",
+        "//tools/nogo/analyzers/gosec:repo_files",
+        "//tools/nogo/analyzers/misspell:repo_files",
+        "//tools/nogo/analyzers/sloglint:repo_files",
+        "//tools/nogo/analyzers/unconvert:repo_files",
+        "//tools/nogo/analyzers/unparam:repo_files",
+        "//tools/nogo/internal/analyzertest:repo_files",
+        "//tools/nogo/internal/golangci:repo_files",
+        "//tools/nogo/internal/position:repo_files",
     ],
     visibility = [
         "//scripts:__pkg__",
+        "//scripts/repochecks:__pkg__",
         "//test/docsync:__pkg__",
     ],
 )

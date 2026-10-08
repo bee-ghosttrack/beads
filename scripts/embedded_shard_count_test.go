@@ -65,7 +65,7 @@ func bazelEmbeddedStorageShardCount(t *testing.T) int {
 // --check verifies only that the committed block names every discovered
 // test exactly once, failing with the exact command to fix it when a name
 // is missing, stale, or duplicated — run here so a drifted block fails `go
-// test ./scripts/...` (and scripts-go-checks on fork PRs) instead of only
+// test ./scripts/...` (//scripts:scripts_test under Bazel) instead of only
 // surfacing as a test silently never running in any shard. The legacy
 // blocks are deliberately excluded: both files document that their 20- and
 // 5-shard blocks are frozen (see .github/scripts/embedded-{cmd,storage}-
@@ -95,4 +95,25 @@ func TestStorageEmbeddedShardManifestGeneratorNotStale(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("gen_embedded_storage_shard_manifest.py %s --weights=duration --check: %v\n%s", shards, err, out)
 	}
+}
+
+// bazelServerFullShardCount returns dolt:dolt_server_full_test's own
+// shard_count from internal/storage/dolt/BUILD.bazel: the single source of
+// truth for the bazel-server-storage lane's full-suite shard split, now that
+// PR Risk's legacy "Test (Server Dolt Full Suite N/16)" job, whose matrix it
+// used to mirror, is retired (ga-96smfk.22). Mirrors
+// bazelEmbeddedCmdShardCount above.
+func bazelServerFullShardCount(t *testing.T) int {
+	t.Helper()
+	root := sourceRepoRoot(t)
+	rule := bazelRuleBlock(readPolicyFile(t, root, "internal/storage/dolt/BUILD.bazel"), "dolt_server_full_test")
+	m := shardCountPattern.FindStringSubmatch(rule)
+	if m == nil {
+		t.Fatalf("dolt:dolt_server_full_test has no `shard_count = N,` in internal/storage/dolt/BUILD.bazel:\n%s", rule)
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("dolt:dolt_server_full_test shard_count: %v", err)
+	}
+	return n
 }
