@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -174,7 +176,7 @@ func TestCheckBeadGate_CrossRigUsesBeadIDForRoutedLookup(t *testing.T) {
 		"gt-abc": {ID: "gt-abc", Status: types.StatusClosed},
 	}}
 
-	satisfied, reason := checkBeadGate(ctx, st, "gastown:gt-abc")
+	satisfied, reason, _ := checkBeadGate(ctx, st, "gastown:gt-abc")
 	if !satisfied {
 		t.Fatalf("expected closed routed bead to satisfy gate, got reason %q", reason)
 	}
@@ -208,7 +210,7 @@ func TestCheckBeadGate_InvalidCrossRigFormat(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			satisfied, reason := checkBeadGate(ctx, nil, tt.awaitID)
+			satisfied, reason, _ := checkBeadGate(ctx, nil, tt.awaitID)
 			if satisfied {
 				t.Errorf("expected not satisfied for %q", tt.awaitID)
 			}
@@ -220,7 +222,7 @@ func TestCheckBeadGate_InvalidCrossRigFormat(t *testing.T) {
 }
 
 func TestCheckBeadGate_EmptyAwaitID(t *testing.T) {
-	satisfied, reason := checkBeadGate(context.Background(), nil, "")
+	satisfied, reason, _ := checkBeadGate(context.Background(), nil, "")
 	if satisfied {
 		t.Error("expected not satisfied for empty await_id")
 	}
@@ -241,7 +243,7 @@ func TestCheckBeadGate_LocalBead(t *testing.T) {
 		},
 	}
 
-	satisfied, reason := checkBeadGate(ctx, st, "bd-closed")
+	satisfied, reason, _ := checkBeadGate(ctx, st, "bd-closed")
 	if !satisfied {
 		t.Errorf("expected satisfied for closed local bead, got reason %q", reason)
 	}
@@ -249,7 +251,7 @@ func TestCheckBeadGate_LocalBead(t *testing.T) {
 		t.Errorf("reason %q does not mention closed", reason)
 	}
 
-	satisfied, reason = checkBeadGate(ctx, st, "bd-open")
+	satisfied, reason, _ = checkBeadGate(ctx, st, "bd-open")
 	if satisfied {
 		t.Error("expected not satisfied for open local bead")
 	}
@@ -263,7 +265,10 @@ func TestCheckBeadGate_LocalBead(t *testing.T) {
 // leaving the gate pending forever.
 func TestCheckBeadGate_LocalBeadNotFound(t *testing.T) {
 	st := &fakeBeadGateGetter{issues: map[string]*types.Issue{}}
-	satisfied, reason := checkBeadGate(context.Background(), st, "bd-missing")
+	satisfied, reason, err := checkBeadGate(context.Background(), st, "bd-missing")
+	if err != nil {
+		t.Fatalf("a missing bead is not an error, got %v", err)
+	}
 	if !satisfied {
 		t.Errorf("expected satisfied for missing local bead, got reason %q", reason)
 	}
@@ -275,7 +280,10 @@ func TestCheckBeadGate_LocalBeadNotFound(t *testing.T) {
 // Real storage reports a purged bead as an error, not as (nil, nil).
 func TestCheckBeadGate_LocalBeadErrNotFoundResolves(t *testing.T) {
 	st := &fakeBeadGateGetter{err: storage.ErrNotFound}
-	satisfied, reason := checkBeadGate(context.Background(), st, "bd-missing")
+	satisfied, reason, err := checkBeadGate(context.Background(), st, "bd-missing")
+	if err != nil {
+		t.Fatalf("storage.ErrNotFound is a missing bead, not an error, got %v", err)
+	}
 	if !satisfied {
 		t.Errorf("expected satisfied for storage.ErrNotFound, got reason %q", reason)
 	}
@@ -286,7 +294,10 @@ func TestCheckBeadGate_LocalBeadErrNotFoundResolves(t *testing.T) {
 
 func TestCheckBeadGate_LocalBeadErrNoRowsResolves(t *testing.T) {
 	st := &fakeBeadGateGetter{err: fmt.Errorf("query bead: %w", sql.ErrNoRows)}
-	satisfied, reason := checkBeadGate(context.Background(), st, "bd-missing")
+	satisfied, reason, err := checkBeadGate(context.Background(), st, "bd-missing")
+	if err != nil {
+		t.Fatalf("sql.ErrNoRows is a missing bead, not an error, got %v", err)
+	}
 	if !satisfied {
 		t.Errorf("expected satisfied for sql.ErrNoRows, got reason %q", reason)
 	}
@@ -298,18 +309,126 @@ func TestCheckBeadGate_LocalBeadErrNoRowsResolves(t *testing.T) {
 // Negative control: a genuine backend failure is not a missing bead, so the
 // gate must stay pending rather than silently resolving.
 func TestCheckBeadGate_LocalBeadLookupError(t *testing.T) {
-	st := &fakeBeadGateGetter{err: errors.New("dolt exploded")}
-	satisfied, reason := checkBeadGate(context.Background(), st, "bd-abc")
+	// A store that cannot be read is an error, not a pending gate: the
+	// caller must be able to tell "dolt is down" from "still waiting".
+	boom := errors.New("dolt exploded")
+	st := &fakeBeadGateGetter{err: boom}
+	satisfied, reason, err := checkBeadGate(context.Background(), st, "bd-abc")
 	if satisfied {
 		t.Error("expected not satisfied on lookup error")
 	}
-	if !gateTestContainsIgnoreCase(reason, "dolt exploded") {
-		t.Errorf("reason %q does not carry the lookup error", reason)
+	if err == nil {
+		t.Fatal("expected a lookup error to be returned as an error")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("err = %v, want it to wrap the lookup error", err)
+	}
+	if !gateTestContainsIgnoreCase(err.Error(), "dolt exploded") {
+		t.Errorf("err %q does not carry the lookup error", err)
+	}
+	if reason != "" {
+		t.Errorf("reason = %q, want empty on an error", reason)
+	}
+}
+
+func TestCheckBeadGate_LocalBeadNotFoundErrorResolves(t *testing.T) {
+	// A getter that reports absence through an error (the routed getter
+	// surfaces storage.ErrNotFound; the proxied fresh-read getter surfaces
+	// sql.ErrNoRows) is a missing bead, not a broken store: the gate resolves
+	// rather than pending forever on a bead that can never close.
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "storage sentinel", err: storage.ErrNotFound},
+		{name: "wrapped storage sentinel", err: fmt.Errorf("lookup bd-missing: %w", storage.ErrNotFound)},
+		{name: "sql no rows", err: sql.ErrNoRows},
+		{name: "partial-id resolver text", err: errors.New("no issue found matching bd-missing")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &fakeBeadGateGetter{err: tt.err}
+			satisfied, reason, err := checkBeadGate(context.Background(), st, "bd-missing")
+			if err != nil {
+				t.Fatalf("not-found is a missing bead, not an error, got %v", err)
+			}
+			if !satisfied {
+				t.Errorf("expected satisfied for a missing bead, got reason %q", reason)
+			}
+			if !gateTestContainsIgnoreCase(reason, "no longer exists") {
+				t.Errorf("reason %q does not mention that the bead no longer exists", reason)
+			}
+		})
+	}
+}
+
+func TestEvaluateGates_BeadStoreErrorCountsAsError(t *testing.T) {
+	// The bead arm used to drop the lookup error on the floor, so a dead
+	// store reported every bead gate as pending and the check exited 0.
+	gate := &types.Issue{ID: "bd-gate", IssueType: "gate", AwaitType: "bead", AwaitID: "bd-abc"}
+	st := &fakeBeadGateGetter{err: errors.New("dolt exploded")}
+
+	results := evaluateGates(context.Background(), []*types.Issue{gate}, time.Now(), st, nil)
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].err == nil {
+		t.Fatal("expected the store error on the result")
+	}
+	if results[0].resolved {
+		t.Error("a store error must not resolve the gate")
+	}
+
+	closeCalls := 0
+	var resolved, escalated, errCount int
+	_ = captureGateStdout(t, func() {
+		resolved, escalated, errCount = applyGateCheckResults(results, false, false, func(*types.Issue, string) error {
+			closeCalls++
+			return nil
+		})
+	})
+	if errCount != 1 || resolved != 0 || escalated != 0 {
+		t.Errorf("counts = (resolved %d, escalated %d, errors %d), want (0, 0, 1)", resolved, escalated, errCount)
+	}
+	if closeCalls != 0 {
+		t.Errorf("closeResolved called %d times on an errored gate", closeCalls)
+	}
+}
+
+func TestPrintGateCheckSummary_ErrorsFailTheCommand(t *testing.T) {
+	origJSON := jsonOutput
+	t.Cleanup(func() { jsonOutput = origJSON })
+
+	for _, tt := range []struct {
+		name    string
+		json    bool
+		errors  int
+		wantErr bool
+	}{
+		{name: "clean sweep", errors: 0, wantErr: false},
+		{name: "one unreadable gate", errors: 1, wantErr: true},
+		{name: "json still fails", json: true, errors: 2, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			jsonOutput = tt.json
+			var err error
+			out := captureGateStdout(t, func() {
+				err = printGateCheckSummary(3, 1, 0, tt.errors, false)
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v (output %q)", err, tt.wantErr, out)
+			}
+			if !strings.Contains(out, "Checked 3 gates") {
+				t.Errorf("summary line missing from output %q", out)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "could not be checked or closed") {
+				t.Errorf("err %q does not say the gates could not be checked or closed", err)
+			}
+		})
 	}
 }
 
 func TestCheckBeadGate_NilStoreStaysPending(t *testing.T) {
-	satisfied, reason := checkBeadGate(context.Background(), nil, "bd-abc")
+	satisfied, reason, _ := checkBeadGate(context.Background(), nil, "bd-abc")
 	if satisfied {
 		t.Error("expected not satisfied with no store")
 	}
