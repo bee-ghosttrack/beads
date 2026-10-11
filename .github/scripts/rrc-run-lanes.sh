@@ -28,7 +28,12 @@ shift
 flags=("$@")
 
 file=${RRC_LANE_COMMANDS:-$(dirname "${BASH_SOURCE[0]}")/rrc-lane-commands.txt}
-mapfile -t cmds < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$file" | grep -v '^[[:space:]]*$' || true)
+# A read loop, not `mapfile`: that is bash >= 4, and macOS ships bash 3.2
+# (the Main workflow's macOS leg runs this script through TestRRCRunLanes).
+cmds=()
+while IFS= read -r line || [ -n "$line" ]; do
+	cmds+=("$line")
+done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$file" | grep -v '^[[:space:]]*$' || true)
 if [ "${#cmds[@]}" -eq 0 ]; then
 	echo "::error::no lane commands in $file"
 	exit 1
