@@ -931,6 +931,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`conformance.RunRoleContracts` now runs six role contracts it never
+  dispatched.** `RoleContractBundle` gains the fields `BatchGetter`,
+  `BlockedLister`, `Heartbeater`, `LeaseReclaimer`, `Molecule` and
+  `ParticipationGeneration`. Their contracts were added in October with the
+  in-tree leg wirings and no bundle field, so an out-of-tree backend that runs
+  the bundle was never asked to prove a lease sweep, a heartbeat, a batch get,
+  a blocked listing, molecule auto-close or the participation stamp. The fields are additive: a backend that leaves one nil compiles
+  unchanged and that contract skips loudly, naming the accessor to put on the
+  allowlist `RunUnsupportedContract` is driven with. A new guard,
+  `TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt`, fails when a
+  contract's Fixture type has neither a bundle field nor a named reason for
+  staying outside the role tier.
 - **`bd prune` no longer deletes a closed bead that a live bead still depends
   on.** A prune deleted the closed parent of an open child, because the
   reference protection scans text and a child names its parent by a

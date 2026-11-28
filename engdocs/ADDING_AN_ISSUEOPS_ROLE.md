@@ -249,7 +249,12 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
     adapter in between — the kit is FROZEN and a role slice does not edit it.
     Every case asserts what the leaf doc PROMISES, cited by line. A backend
     that genuinely disagrees is parked at its WIRING site with
-    `skipKnownDivergence`, never by weakening the case.
+    `skipKnownDivergence`, never by weakening the case. The contract also
+    owes a `RoleContractBundle` field and a `roleContractCases` row
+    (`backend/conformance/role_bundle.go`, `role_bundle_cases.go`), because
+    that bundle is the only way an out-of-tree backend runs the cases;
+    `TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt` fails without
+    them.
 
     A case may need to establish a state the ROLE CANNOT PRODUCE — a recorded
     version below its own high-water mark is one, and reconciling is the one

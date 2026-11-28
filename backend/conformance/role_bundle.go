@@ -48,7 +48,10 @@ import (
 // Sequencing is required of any backend without per-test copy-on-write
 // branches: history is database-global there, so a parallel sibling corrupts
 // another case's history-delta arithmetic (newUOWRoleFixtureProvider states it
-// for the in-tree provider).
+// for the in-tree provider). Two contracts do not inherit their order from a
+// leg: the leg wirings run some of Heartbeater's and BatchGetter's cases in
+// another order than their contract files declare, and the bundle keeps the
+// declared order for both.
 //
 // Inter-role: the supplier's job, because no fixture hook can undo what these
 // contracts deliberately do to a workspace. No in-tree leg shares one database
@@ -78,40 +81,46 @@ import (
 // A fixture per role per workspace contains every one of them.
 type RoleContractBundle struct {
 	// Called ONCE; the whole contract runs against the one fixture.
-	BatchApply           func(t *testing.T) *BatchApplyFixture
-	BatchCloser          func(t *testing.T) *BatchCloserFixture
-	BatchCreator         func(t *testing.T) *BatchCreatorFixture
-	BlockingAnnotator    func(t *testing.T) *BlockingAnnotatorFixture
-	Bootstrapper         func(t *testing.T) *BootstrapperFixture
-	Claimer              func(t *testing.T) *ClaimerFixture
-	Commenter            func(t *testing.T) *CommenterFixture
-	Counter              func(t *testing.T) *CounterFixture
-	CycleDetector        func(t *testing.T) *CycleDetectorFixture
-	Deleter              func(t *testing.T) *DeleterFixture
-	DependencyEditor     func(t *testing.T) *DependencyEditorFixture
-	DualWrite            func(t *testing.T) *DualWriteFixture
-	EdgeReader           func(t *testing.T) *EdgeReaderFixture
-	GraphCounter         func(t *testing.T) *GraphCounterFixture
-	IDRetention          func(t *testing.T) *IDRetentionFixture
-	Importer             func(t *testing.T) *ImporterFixture
-	Journal              func(t *testing.T) *JournalFixture
-	LifecycleCloseReopen func(t *testing.T) *LifecycleCloseReopenFixture
-	LifecycleCreate      func(t *testing.T) *LifecycleCreateFixture
-	LifecycleUpdate      func(t *testing.T) *LifecycleUpdateFixture
-	Memories             func(t *testing.T) *MemoriesFixture
-	MetadataCAS          func(t *testing.T) *MetadataCASFixture
-	Querier              func(t *testing.T) *QuerierFixture
-	Reader               func(t *testing.T) *ReaderFixture
-	ReadyClaimer         func(t *testing.T) *ReadyClaimerFixture
-	ReadyCounter         func(t *testing.T) *ReadyCounterFixture
-	Relations            func(t *testing.T) *RelationsFixture
-	Releaser             func(t *testing.T) *ReleaserFixture
-	RowVersion           func(t *testing.T) *RowVersionFixture
-	StatsReporter        func(t *testing.T) *StatsReporterFixture
-	Sweeper              func(t *testing.T) *SweeperFixture
-	TreeWalker           func(t *testing.T) *TreeWalkerFixture
-	VersionReconciler    func(t *testing.T) *VersionReconcilerFixture
-	WorkspaceConfig      func(t *testing.T) *WorkspaceConfigFixture
+	BatchApply              func(t *testing.T) *BatchApplyFixture
+	BatchCloser             func(t *testing.T) *BatchCloserFixture
+	BatchCreator            func(t *testing.T) *BatchCreatorFixture
+	BatchGetter             func(t *testing.T) *BatchGetterFixture
+	BlockedLister           func(t *testing.T) *BlockedListerFixture
+	BlockingAnnotator       func(t *testing.T) *BlockingAnnotatorFixture
+	Bootstrapper            func(t *testing.T) *BootstrapperFixture
+	Claimer                 func(t *testing.T) *ClaimerFixture
+	Commenter               func(t *testing.T) *CommenterFixture
+	Counter                 func(t *testing.T) *CounterFixture
+	CycleDetector           func(t *testing.T) *CycleDetectorFixture
+	Deleter                 func(t *testing.T) *DeleterFixture
+	DependencyEditor        func(t *testing.T) *DependencyEditorFixture
+	DualWrite               func(t *testing.T) *DualWriteFixture
+	EdgeReader              func(t *testing.T) *EdgeReaderFixture
+	GraphCounter            func(t *testing.T) *GraphCounterFixture
+	Heartbeater             func(t *testing.T) *HeartbeaterFixture
+	IDRetention             func(t *testing.T) *IDRetentionFixture
+	Importer                func(t *testing.T) *ImporterFixture
+	Journal                 func(t *testing.T) *JournalFixture
+	LeaseReclaimer          func(t *testing.T) *LeaseReclaimerFixture
+	LifecycleCloseReopen    func(t *testing.T) *LifecycleCloseReopenFixture
+	LifecycleCreate         func(t *testing.T) *LifecycleCreateFixture
+	LifecycleUpdate         func(t *testing.T) *LifecycleUpdateFixture
+	Memories                func(t *testing.T) *MemoriesFixture
+	MetadataCAS             func(t *testing.T) *MetadataCASFixture
+	Molecule                func(t *testing.T) *MoleculeFixture
+	ParticipationGeneration func(t *testing.T) *ParticipationGenerationFixture
+	Querier                 func(t *testing.T) *QuerierFixture
+	Reader                  func(t *testing.T) *ReaderFixture
+	ReadyClaimer            func(t *testing.T) *ReadyClaimerFixture
+	ReadyCounter            func(t *testing.T) *ReadyCounterFixture
+	Relations               func(t *testing.T) *RelationsFixture
+	Releaser                func(t *testing.T) *ReleaserFixture
+	RowVersion              func(t *testing.T) *RowVersionFixture
+	StatsReporter           func(t *testing.T) *StatsReporterFixture
+	Sweeper                 func(t *testing.T) *SweeperFixture
+	TreeWalker              func(t *testing.T) *TreeWalkerFixture
+	VersionReconciler       func(t *testing.T) *VersionReconcilerFixture
+	WorkspaceConfig         func(t *testing.T) *WorkspaceConfigFixture
 
 	// IssueOperations is called ONCE PER CASE. No in-tree leg has ever run two
 	// of these cases against one workspace — the store legs take a fresh store
@@ -261,7 +270,14 @@ func runFuncName(run any) string {
 // Claimer/RefusesAWispIDAsNotFound — the same name the unit-of-work leg's
 // subtests use. A case whose name does not carry its role keeps the whole of
 // it: Bootstrapper/InitVerifierWritesNothing names the half it belongs to,
-// which is the useful part.
+// which is the useful part. So does a case whose name is its role and nothing
+// more: RunBlockedLister is a whole contract in one function that runs its
+// cases as subtests of its own, and it addresses as
+// BlockedLister/BlockedLister/<case> rather than under an empty name.
 func subtestName(role, runName string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(runName, "Run"), role)
+	name := strings.TrimPrefix(runName, "Run")
+	if short := strings.TrimPrefix(name, role); short != "" {
+		return short
+	}
+	return name
 }

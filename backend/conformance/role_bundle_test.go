@@ -220,6 +220,20 @@ func TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt(t *testing.T) {
 	}
 }
 
+// TestSubtestNameKeepsANameThatIsOnlyItsRole pins the one case subtestName
+// does not strip: a Run function named for its role and nothing more.
+func TestSubtestNameKeepsANameThatIsOnlyItsRole(t *testing.T) {
+	for _, tc := range []struct{ role, run, want string }{
+		{"BlockedLister", "RunBlockedLister", "BlockedLister"},
+		{"Claimer", "RunClaimerRefusesAWispIDAsNotFound", "RefusesAWispIDAsNotFound"},
+		{"Bootstrapper", "RunInitVerifierWritesNothing", "InitVerifierWritesNothing"},
+	} {
+		if got := subtestName(tc.role, tc.run); got != tc.want {
+			t.Errorf("subtestName(%q, %q) = %q, want %q", tc.role, tc.run, got, tc.want)
+		}
+	}
+}
+
 // TestOnlyTheIssueOperationsContractsBuildAFixturePerCase pins which contracts
 // pay for a fresh workspace per case. It is a two-way pin: relaxing one of the
 // two to a shared fixture asserts a safety no leg has ever demonstrated, and
