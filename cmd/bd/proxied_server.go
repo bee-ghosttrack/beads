@@ -60,7 +60,14 @@ func validateProxiedServerRootPath(path string) error { return proxiedopen.Valid
 
 func validateProxiedServerLogPath(path string) error { return proxiedopen.ValidateLogPath(path) }
 
-func renderProxiedServerConfig(port int) ([]byte, error) { return proxiedopen.RenderConfig(port) }
+// renderProxiedServerConfig is a seam for tests, which need the bytes of a
+// generated config and no particular directory. Production code calls
+// proxiedopen.EnsureConfig, which names the directory beside the proxied
+// root; a directory under the temp directory is one any local user can
+// create, so nothing that launches a server may use this.
+func renderProxiedServerConfig(port int) ([]byte, error) {
+	return proxiedopen.RenderConfig(port, filepath.Join(os.TempDir(), doltserver.ServerFilesDirName))
+}
 
 func renderLegacyProxiedServerConfig(port int) ([]byte, error) {
 	return proxiedopen.RenderLegacyConfig(port)

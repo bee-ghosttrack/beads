@@ -1669,6 +1669,25 @@ func doltServerFilesDir(beadsDir string) string {
 	return filepath.Join(beadsDir, ServerFilesDirName)
 }
 
+// flagLaunchInfo is the line Start prints when it launches the managed server
+// with command-line flags in place of the generated config, because it could
+// not confirm that doltBin accepts that config. RequireDoltBinaryVersion has
+// already refused a dolt shown to be older than bd's minimum, which is above
+// MinDoltVersionForArchiveLevelConfig, so the launch that reaches this line is
+// in practice one whose `dolt version` failed or printed a version bd could
+// not read in full. The line says what holds in every such case, that bd
+// could not confirm the version, and does not say the dolt is old. It names
+// both things the flag launch goes without, because the config file is the
+// only place either is set.
+func flagLaunchInfo(doltBin string) string {
+	return fmt.Sprintf(
+		"Info: bd could not confirm that the dolt at %s is Dolt %s or newer, so it starts this managed server "+
+			"with command-line flags in place of its generated config. The server's background auto-GC may "+
+			"produce zstd archives, and secure_file_priv is not set: SQL on this server can read and write "+
+			"any file the server process can.\n",
+		doltBin, MinDoltVersionForArchiveLevelConfig)
+}
+
 // doltCfgDirName mirrors commands.DefaultCfgDirName in the pinned dolt
 // module (cmd/dolt/commands/sql.go) — the on-disk directory name Dolt looks
 // in for privileges.db (users/passwords) and branch_control.db.
@@ -1946,10 +1965,7 @@ func startLocked(beadsDir string) (*State, error) {
 	// risk a refuse-to-start over an unrecognized YAML key.
 	useArchiveLevelConfig := SupportsArchiveLevelConfig(doltBin)
 	if !useArchiveLevelConfig {
-		fmt.Fprintf(os.Stderr,
-			"Info: external dolt at %s predates archive_level config support (need >= Dolt %s); "+
-				"this managed server's background auto-GC may still produce zstd archives.\n",
-			doltBin, MinDoltVersionForArchiveLevelConfig)
+		fmt.Fprint(os.Stderr, flagLaunchInfo(doltBin))
 	}
 
 	// Ensure dolt identity is configured

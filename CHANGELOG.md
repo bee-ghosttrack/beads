@@ -187,6 +187,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's config, which bd writes once and you may edit, are unchanged. See
   [Server config file](docs/architecture/dolt.md).
 
+- **The proxied server's generated config confines SQL file access too, and
+  the docs say what the setting does not cover.** A config that
+  `bd init --proxied-server` generates now sets `secure_file_priv` to
+  `dolt-server-files` beside the proxied root (`.beads/dolt-server-files` by
+  default), as the server-mode config does. bd never
+  rewrites that file, so an existing proxied config is unchanged;
+  [Server config file](docs/architecture/dolt.md) has the two lines to add.
+  The same section now names three limits of the setting: Dolt's `file://`
+  procedures (`dolt_backup`, `dolt_push`, `dolt_clone`) are outside it,
+  whoever can write `.beads/` can point the directory elsewhere with a
+  symlink, and a server bd has to start with command-line flags is not
+  confined. The `Info:` line bd prints at such a start said the `dolt` was
+  too old, which it never is by then; it now says bd could not confirm the
+  version and that `secure_file_priv` is not set.
+
 ### Added
 
 - **`bd reclaim --dry-run` lists the stale leases a sweep would revert and

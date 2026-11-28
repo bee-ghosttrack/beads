@@ -154,7 +154,19 @@ func resolveOrCreateConfig(beadsDir string) (string, error) {
 		return "", fmt.Errorf("ensureProxiedServerConfig: pick free port: %w", err)
 	}
 
-	body, err := RenderConfig(port)
+	// Beside the proxied root, as the server-mode directory is beside the
+	// data directory: .beads/dolt-server-files for the default root, and
+	// ~/.beads/shared-server/dolt-server-files for the shared one. Not in
+	// beadsDir: several repositories can share one root and so this one
+	// config (bd migrate dolt-mode from-shared-server-to-proxied-server roots
+	// each at the shared dolt directory), and the first to open would write
+	// its own .beads into the config the others run with. Absolute, because
+	// the server's working directory is the root.
+	filesDir, err := filepath.Abs(filepath.Join(filepath.Dir(root), doltserver.ServerFilesDirName))
+	if err != nil {
+		return "", fmt.Errorf("ensureProxiedServerConfig: resolve %s: %w", doltserver.ServerFilesDirName, err)
+	}
+	body, err := RenderConfig(port, filesDir)
 	if err != nil {
 		return "", fmt.Errorf("ensureProxiedServerConfig: render YAML: %w", err)
 	}
@@ -328,14 +340,29 @@ func generatedProxiedServerLogLevel() servercfg.LogLevel {
 }
 
 // RenderConfig renders Beads' default managed-local config listening on port.
-func RenderConfig(port int) ([]byte, error) {
-	return renderConfigAtLevel(port, generatedProxiedServerLogLevel())
+//
+// serverFilesDir becomes system_variables.secure_file_priv: the only directory
+// the server's SQL may read files from (LOAD_FILE, LOAD DATA INFILE) or write
+// them to (SELECT ... INTO OUTFILE). The proxied server is the server-mode
+// one in this respect (see doltserver.ServerFilesDirName): it runs as the
+// user with a passwordless root on a loopback port, and Dolt's default, "",
+// lets any local process that can open that port read and write the user's
+// files through SQL. Beads does not create the directory, and while it does
+// not exist the server refuses those statements. A path that is not absolute
+// is refused, the empty one above all: it would write a config that confines
+// nothing, or one that resolves against the server's working directory.
+func RenderConfig(port int, serverFilesDir string) ([]byte, error) {
+	if !filepath.IsAbs(serverFilesDir) {
+		return nil, fmt.Errorf("secure_file_priv directory %q is not an absolute path", serverFilesDir)
+	}
+	return renderConfigAtLevel(port, generatedProxiedServerLogLevel(), serverFilesDir)
 }
 
-// renderConfigAtLevel renders the managed config at logLevel.
-// Configs generated before proxiedServerLogLevel existed used info, and
-// RenderLegacyConfig must reproduce them byte for byte.
-func renderConfigAtLevel(port int, level servercfg.LogLevel) ([]byte, error) {
+// renderConfigAtLevel renders the managed config at logLevel, with
+// secure_file_priv set to secureFilePriv unless that is empty.
+// Configs generated before proxiedServerLogLevel existed used info and set no
+// secure_file_priv, and RenderLegacyConfig must reproduce them byte for byte.
+func renderConfigAtLevel(port int, level servercfg.LogLevel, secureFilePriv string) ([]byte, error) {
 	host := ListenerHost
 	logLevel := string(level)
 	yc := &servercfg.YAMLConfig{
@@ -348,6 +375,13 @@ func renderConfigAtLevel(port int, level servercfg.LogLevel) ([]byte, error) {
 	archiveLevel := 0
 	yc.BehaviorConfig.AutoGCBehavior = &servercfg.AutoGCBehaviorYAMLConfig{
 		ArchiveLevel_: &archiveLevel,
+	}
+	if secureFilePriv != "" {
+		// Dolt expands ${VAR} and turns "$$" into "$" when it reads a config
+		// file, so a "$" in the path is written doubled; otherwise the server
+		// would be confined to a different directory than the one named here,
+		// or the config would fail to load.
+		yc.SystemVars_ = map[string]interface{}{"secure_file_priv": strings.ReplaceAll(secureFilePriv, "$", "$$")}
 	}
 	body, err := yaml.Marshal(yc)
 	if err != nil {
@@ -378,7 +412,7 @@ func managedPortRecordLine(port int) string {
 // before the port record existed: the marker followed directly by the YAML,
 // at log_level info.
 func RenderLegacyConfig(port int) ([]byte, error) {
-	body, err := renderConfigAtLevel(port, servercfg.LogLevel_Info)
+	body, err := renderConfigAtLevel(port, servercfg.LogLevel_Info, "")
 	if err != nil {
 		return nil, err
 	}

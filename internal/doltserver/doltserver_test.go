@@ -2794,6 +2794,26 @@ func TestBuildDoltServerYAMLConfig(t *testing.T) {
 	}
 }
 
+// TestFlagLaunchInfoNamesWhatTheFlagLaunchLoses pins the line Start prints
+// when it launches with command-line flags: the dolt that reaches it is one
+// whose version bd could not read (an old one is refused first), so the line
+// must not call it old, and it must say that secure_file_priv is not set,
+// which docs/architecture/dolt.md tells users to expect.
+func TestFlagLaunchInfoNamesWhatTheFlagLaunchLoses(t *testing.T) {
+	line := flagLaunchInfo("/opt/dolt/bin/dolt")
+	for _, want := range []string{"/opt/dolt/bin/dolt", MinDoltVersionForArchiveLevelConfig, "could not confirm", "zstd archives", "secure_file_priv is not set"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("flag-launch line lacks %q:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "predates") {
+		t.Errorf("flag-launch line calls the dolt old, but an old dolt never reaches it:\n%s", line)
+	}
+	if !strings.HasSuffix(line, "\n") || strings.Count(line, "\n") != 1 {
+		t.Errorf("flag-launch line is not one line:\n%q", line)
+	}
+}
+
 // TestBuildDoltServerYAMLConfig_DebugLogLevel asserts debug mode raises the
 // YAML config's log level the same way buildDoltServerArgs does for the
 // CLI-flag form.

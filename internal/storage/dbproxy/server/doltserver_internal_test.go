@@ -316,6 +316,28 @@ func TestUseRuntimePort_CopiesRawText(t *testing.T) {
 	}
 }
 
+// TestUseRuntimePort_KeepsSecureFilePriv pins that a port move does not
+// unconfine the server: the runtime config is the config with only
+// listener.port changed, so the secure_file_priv Beads generates (or an
+// operator set) is the one the moved server runs with.
+func TestUseRuntimePort_KeepsSecureFilePriv(t *testing.T) {
+	rootDir := t.TempDir()
+	filesDir := filepath.Join(t.TempDir(), "dolt-server-files")
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(cfg, []byte("log_level: info\nlistener:\n  host: 127.0.0.1\n  port: 40001\nsystem_variables:\n  secure_file_priv: "+fmt.Sprintf("%q", filesDir)+"\n"), 0o600))
+	s, err := NewDoltServer(os.Args[0], rootDir, cfg, "", 0, "")
+	require.NoError(t, err)
+
+	require.NoError(t, s.useRuntimePort(40001))
+
+	body, err := os.ReadFile(filepath.Join(rootDir, RuntimeConfigFileName))
+	require.NoError(t, err)
+	moved, err := servercfg.NewYamlConfig(body)
+	require.NoError(t, err)
+	assert.NotEqual(t, 40001, moved.Port())
+	assert.Equal(t, filesDir, moved.SystemVars()["secure_file_priv"])
+}
+
 // newScriptDoltServer builds a DoltServer whose dolt is a shell script that
 // answers `config`/`init` and runs sqlServer (shell) for `sql-server`, with
 // $port set to the --config file's listener.port. Shell scripts start in

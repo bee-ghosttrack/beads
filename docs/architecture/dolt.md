@@ -511,8 +511,10 @@ stop batching.
 **Server config file.** For a server bd launches with its default
 configuration, bd writes the shared server's config to
 `~/.beads/shared-server/dolt-server-config.yaml` and passes it with
-`--config`. bd rewrites it on every start, so edits to it do not last. With a
-Dolt too old for that config, bd passes command-line flags instead, and Dolt
+`--config`. bd rewrites it on every start, so edits to it do not last. When bd
+cannot read the version of the `dolt` it found (`dolt version` fails or prints
+no version), it cannot tell that the binary accepts that config, so it passes
+command-line flags instead and prints an `Info:` line that says so. Dolt
 then writes a template to `~/.beads/shared-server/dolt/config.yaml` that
 records those flag values and leaves its other settings commented out. The
 bd-launched server does not read that template, so its server settings have no
@@ -532,9 +534,51 @@ as you with a passwordless `root` on a loopback port, and Dolt's default, an
 empty `secure_file_priv`, would let any local process that can open that port
 read and write your files through SQL. bd never uses those statements. To use
 them yourself, create the directory and keep the files in it; bd does not add
-it to `.beads/.gitignore`, so files there show as untracked. A server started
-with command-line flags (a Dolt too old for the config) keeps Dolt's default,
-because the config file is the only place the setting can be made.
+it to `.beads/.gitignore`, so files there show as untracked.
+
+The setting has three limits, each measured on Dolt 2.6.0:
+
+- It governs those SQL file statements and nothing else. Dolt's procedures
+  that take a `file://` URL are outside it: `dolt_backup` (`sync`, `sync-url`
+  and `restore`), `dolt_push` to a `file://` remote and `dolt_clone` from one
+  all work on a confined server. They read and write Dolt's own storage
+  format, not files of the caller's choosing, but a process that can open the
+  port can still copy a database into any directory the server can write, and
+  can read any Dolt database the server can read.
+- It names a path, and the server follows a symlink there. Whoever can write
+  `.beads/` can make `dolt-server-files` a symlink to another directory, at
+  any time, and the server's file statements then reach that directory. So
+  the setting keeps the file statements from a process that can reach the
+  port and cannot write `.beads/`; it does not keep them from one that can
+  do both.
+- A server started with command-line flags (the case above, where bd could
+  not read the `dolt` version) is not confined at all: it keeps Dolt's
+  default, because the config file is the only place the setting can be made.
+  bd's `Info:` line at that start says so.
+
+The proxied server's config (`bd init --proxied-server`) carries the same
+setting when bd generates it. The directory is `dolt-server-files` beside the
+proxied root: `.beads/dolt-server-files` for the default root `.beads/dolt`,
+and `~/.beads/shared-server/dolt-server-files` for repositories that share
+the root `~/.beads/shared-server/dolt`, which share one config. bd writes that
+file once and never rewrites it, so a config generated before this setting
+existed does not have it. To add it, put these lines in the file, with the
+absolute path of the directory that holds the proxied root, and restart the
+proxied server:
+
+```yaml
+system_variables:
+  secure_file_priv: /absolute/path/to/.beads/dolt-server-files
+```
+
+If the file already has a `system_variables:` key, add the second line under
+it, and do not repeat the key. Write a `$` in the path as
+`$$`, because Dolt expands `${NAME}` in a config file. One more thing to know
+before editing an old config: a config with no `# beads-chosen-listener-port:`
+line was generated before bd recorded the port it chose, and any edit to such
+a file, this one included, pins its listener port, so bd no longer moves the
+server to a free port when that one is taken. Deleting the file instead has
+bd generate a new one, with the setting and a new port, at the next start.
 
 ## Maintenance — `bd prune` and `bd purge`
 

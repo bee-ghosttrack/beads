@@ -91,7 +91,8 @@ func TestEnsureConfigGeneratesALoopbackConfig(t *testing.T) {
 	t.Cleanup(func() { ListenerOwnershipProvable = orig })
 
 	beadsDir := t.TempDir()
-	t.Setenv("BEADS_PROXIED_SERVER_ROOT_PATH", filepath.Join(t.TempDir(), "root"))
+	rootParent := t.TempDir()
+	t.Setenv("BEADS_PROXIED_SERVER_ROOT_PATH", filepath.Join(rootParent, "root"))
 	path, err := EnsureConfig(beadsDir)
 	if err != nil {
 		t.Fatal(err)
@@ -115,6 +116,90 @@ func TestEnsureConfigGeneratesALoopbackConfig(t *testing.T) {
 	}
 	if port, _, ok := CutManagedPortRecord(body[len(ManagedConfigMarker):]); !ok || port != cfg.Port() {
 		t.Errorf("port record = %d (ok %t), want listener.port %d", port, ok, cfg.Port())
+	}
+	// The proxied server runs as the user with a passwordless root, as the
+	// server-mode one does, so its config confines SQL file access the same
+	// way: to a directory beside the root that Beads does not create. The
+	// directory follows the root and not beadsDir, because repositories that
+	// share a root share this config.
+	filesDir := filepath.Join(rootParent, doltserver.ServerFilesDirName)
+	if got := cfg.SystemVars()["secure_file_priv"]; got != filesDir {
+		t.Errorf("system_variables.secure_file_priv = %v, want %s", got, filesDir)
+	}
+	for _, dir := range []string{filesDir, filepath.Join(beadsDir, doltserver.ServerFilesDirName)} {
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			t.Errorf("EnsureConfig created %s (stat error %v); Beads leaves it to the operator", dir, err)
+		}
+	}
+}
+
+// TestEnsureConfigNamesTheDefaultRootsSibling pins the directory for the
+// default root, <beadsDir>/dolt: it is .beads/dolt-server-files, the one the
+// server-mode config names, so the docs can give one path for both modes.
+func TestEnsureConfigNamesTheDefaultRootsSibling(t *testing.T) {
+	beadsDir := t.TempDir()
+	t.Setenv("BEADS_PROXIED_SERVER_ROOT_PATH", "dolt")
+	path, err := EnsureConfig(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(beadsDir, "dolt", ConfigFileName); path != want {
+		t.Fatalf("config path = %s, want %s", path, want)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := servercfg.NewYamlConfig(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.SystemVars()["secure_file_priv"], filepath.Join(beadsDir, doltserver.ServerFilesDirName); got != want {
+		t.Errorf("system_variables.secure_file_priv = %v, want %s", got, want)
+	}
+}
+
+// TestRenderConfigDoublesADollarInTheDirectory pins that the path survives
+// Dolt's reading of the file: Dolt expands ${VAR} and unescapes "$$" in a
+// config, so a "$" written single would confine the server to another
+// directory, or stop the config loading.
+func TestRenderConfigDoublesADollarInTheDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "a${BD_NO_SUCH_VARIABLE}b$c", doltserver.ServerFilesDirName)
+	body, err := RenderConfig(40001, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := servercfg.NewYamlConfig(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.SystemVars()["secure_file_priv"], strings.ReplaceAll(dir, "$", "$$"); got != want {
+		t.Errorf("secure_file_priv as written = %v, want %s (each $ doubled)", got, want)
+	}
+}
+
+// TestRenderConfigRefusesADirectoryThatIsNotAbsolute pins that RenderConfig
+// cannot write a config that confines nothing: an empty secure_file_priv is
+// Dolt's allow-everything default, and a relative one would resolve against
+// the server's working directory.
+func TestRenderConfigRefusesADirectoryThatIsNotAbsolute(t *testing.T) {
+	for _, dir := range []string{"", "dolt-server-files"} {
+		if body, err := RenderConfig(40001, dir); err == nil {
+			t.Errorf("RenderConfig(40001, %q) rendered a config, want a refusal:\n%s", dir, body)
+		}
+	}
+}
+
+// TestRenderLegacyConfigSetsNoSecureFilePriv pins the other side: the legacy
+// rendering reproduces configs written before the setting existed, and
+// ManagedPortConflictPolicy compares it with them byte for byte.
+func TestRenderLegacyConfigSetsNoSecureFilePriv(t *testing.T) {
+	legacy, err := RenderLegacyConfig(40001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacy), "secure_file_priv") || strings.Contains(string(legacy), "system_variables") {
+		t.Errorf("the legacy rendering gained a system variable, so it no longer matches the configs it stands for:\n%s", legacy)
 	}
 }
 
