@@ -50,13 +50,14 @@ Flags:
       --persistent                   Mark issue as persistent (promote wisp to regular issue)
   -p, --priority string              Priority (0-4 or P0-P4, 0=highest)
       --remove-label strings         Remove labels (repeatable)
-      --session string               Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)
+      --session string               Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID or CLAUDE_CODE_SESSION_ID env var)
       --set-labels strings           Set labels, replacing all existing (repeatable)
       --set-metadata stringArray     Set metadata key=value (repeatable, e.g., --set-metadata team=platform)
       --spec-id string               Link to specification document
   -s, --status string                New status
       --stdin                        Read description from stdin (alias for --body-file -)
       --title string                 New title
+      --ttl duration                 With --claim: the claim's lease expires this long from now (a Go duration such as 30m or 2h) instead of after the default lease length. Each bd heartbeat resets the expiry to now plus its own --ttl, or the default length without one, so pass the same --ttl on every heartbeat. A re-claim of an issue you already hold leaves its lease unchanged, and a wisp has no lease. Refused on a remote bd serve backend
   -t, --type string                  New type (bug|feature|task|epic|chore|decision|spike|story|milestone); custom types require types.custom config; aliases: enhancement/feat→feature, dec/adr→decision
       --unset-metadata stringArray   Remove metadata key (repeatable, e.g., --unset-metadata team)
 
