@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // newReclaimTestCmd builds a command with the real reclaim scope flag set so the
@@ -217,5 +219,150 @@ func TestRenderReclaimJSONCarriesDryRun(t *testing.T) {
 				t.Errorf("count = %v, want %d", got["count"], len(tc.rows))
 			}
 		})
+	}
+}
+
+// scriptedReclaimer answers every request with one fixed result and keeps the
+// request, so a test can stand in for a role that does or does not know DryRun.
+type scriptedReclaimer struct {
+	result issueops.ReclaimResult
+	got    issueops.ReclaimRequest
+}
+
+func (r *scriptedReclaimer) Reclaim(_ context.Context, request issueops.ReclaimRequest) (issueops.ReclaimResult, error) {
+	r.got = request
+	return r.result, nil
+}
+
+// TestRunReclaimRefusesAPreviewTheRoleDidNotConfirm pins the command against a
+// LeaseReclaimer that predates ReclaimRequest.DryRun. Such a role ignores the
+// member, reverts the rows and answers DryRun false. The command must not
+// print those rows as a preview: it fails, and it counts as a write when rows
+// were named, because they may have been reverted.
+func TestRunReclaimRefusesAPreviewTheRoleDidNotConfirm(t *testing.T) {
+	reverted := []types.ReclaimedLease{
+		{ID: "bd-1", PreviousOwner: "alice", Revision: "rev-1"},
+		{ID: "bd-2", Revision: "rev-2"},
+	}
+	previewed := []types.ReclaimedLease{{ID: "bd-1", PreviousOwner: "alice"}}
+	cases := []struct {
+		name      string
+		dryRun    bool
+		json      bool
+		result    issueops.ReclaimResult
+		wantErr   bool
+		wantWrite bool
+		want      []string
+		wantNot   []string
+	}{
+		{
+			name: "a preview the role ran as a sweep", dryRun: true,
+			result:  issueops.ReclaimResult{Reclaimed: reverted},
+			wantErr: true, wantWrite: true,
+			wantNot: []string{"Would reclaim", "Reclaimed", "bd-1", "bd-2"},
+		},
+		{
+			name: "the same under --json", dryRun: true, json: true,
+			result:  issueops.ReclaimResult{Reclaimed: reverted},
+			wantErr: true, wantWrite: true,
+			want:    []string{`"error"`},
+			wantNot: []string{`"dry_run"`, `"reclaimed"`},
+		},
+		{
+			name: "an unconfirmed preview that named nothing", dryRun: true,
+			result:  issueops.ReclaimResult{Reclaimed: []types.ReclaimedLease{}},
+			wantErr: true,
+			wantNot: []string{"No stale leases"},
+		},
+		{
+			name: "a confirmed preview", dryRun: true,
+			result: issueops.ReclaimResult{DryRun: true, Reclaimed: previewed},
+			want:   []string{"Would reclaim 1 stale-lease issue(s):", "bd-1 (was held by alice)"},
+		},
+		{
+			name:      "a sweep",
+			result:    issueops.ReclaimResult{Reclaimed: reverted},
+			wantWrite: true,
+			want:      []string{"Reclaimed 2 stale-lease issue(s):", "bd-2 (was held by (unassigned))"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldJSON := jsonOutput
+			jsonOutput = tc.json
+			commandDidWrite.Store(false)
+			t.Cleanup(func() {
+				jsonOutput = oldJSON
+				commandDidWrite.Store(false)
+			})
+
+			reclaimer := &scriptedReclaimer{result: tc.result}
+			out, err := captureStdoutWithError(t, func() error {
+				return runReclaim(context.Background(), reclaimer, issueops.ReclaimRequest{Actor: "tester", DryRun: tc.dryRun}, false)
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("runReclaim error = %v, want an error: %v", err, tc.wantErr)
+			}
+			if reclaimer.got.DryRun != tc.dryRun {
+				t.Errorf("the role was asked DryRun = %v, want %v", reclaimer.got.DryRun, tc.dryRun)
+			}
+			if got := commandDidWrite.Load(); got != tc.wantWrite {
+				t.Errorf("commandDidWrite = %v, want %v", got, tc.wantWrite)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("stdout is missing %q:\n%s", want, out)
+				}
+			}
+			for _, not := range tc.wantNot {
+				if strings.Contains(out, not) {
+					t.Errorf("stdout contains %q:\n%s", not, out)
+				}
+			}
+		})
+	}
+}
+
+// TestReclaimUnconfirmedPreviewNamesTheRows pins what the refusal tells the operator:
+// which rows the role named, and how many of them carry a revision, which a
+// preview never mints and a revert always does.
+func TestReclaimUnconfirmedPreviewNamesTheRows(t *testing.T) {
+	preview := issueops.ReclaimRequest{Actor: "tester", DryRun: true}
+	rows := []types.ReclaimedLease{
+		{ID: "bd-1", PreviousOwner: "alice", Revision: "rev-1"},
+		{ID: "bd-2"},
+		{ID: "bd-3", PreviousOwner: "bob", Revision: "rev-3"},
+	}
+
+	err := unconfirmedPreview(preview, issueops.ReclaimResult{Reclaimed: rows})
+	if err == nil {
+		t.Fatal("a preview answered with DryRun false was accepted")
+	}
+	for _, want := range []string{
+		"--dry-run was not confirmed",
+		"It named 3 lease(s), of which 2 carry a new revision",
+		"bd-1 (was held by alice)",
+		"bd-2 (was held by (unassigned))",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal is missing %q:\n%s", want, err)
+		}
+	}
+
+	err = unconfirmedPreview(preview, issueops.ReclaimResult{Reclaimed: []types.ReclaimedLease{}})
+	if err == nil || !strings.Contains(err.Error(), "It named no lease, so nothing was reverted this time") {
+		t.Errorf("an unconfirmed preview with no rows answered %v", err)
+	}
+
+	for name, pair := range map[string]struct {
+		request issueops.ReclaimRequest
+		result  issueops.ReclaimResult
+	}{
+		"a confirmed preview": {preview, issueops.ReclaimResult{DryRun: true, Reclaimed: rows}},
+		"a sweep":             {issueops.ReclaimRequest{Actor: "tester"}, issueops.ReclaimResult{Reclaimed: rows}},
+	} {
+		if err := unconfirmedPreview(pair.request, pair.result); err != nil {
+			t.Errorf("%s was refused: %v", name, err)
+		}
 	}
 }

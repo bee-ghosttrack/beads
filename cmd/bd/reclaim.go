@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -126,22 +127,71 @@ Examples:
 				return HandleErrorRespectJSON("%v", err)
 			}
 		}
-		result, err := reclaimer.Reclaim(ctx, issueops.ReclaimRequest{
+		return runReclaim(ctx, reclaimer, issueops.ReclaimRequest{
 			Actor:     currentActor(),
 			OlderThan: olderThan,
 			Filter:    filter,
 			DryRun:    dryRun,
-		})
-		if err != nil {
-			return HandleErrorRespectJSON("reclaim: %v", err)
-		}
-		// A preview changed nothing, so it never marks the command as a write.
-		if !dryRun && len(result.Reclaimed) > 0 {
+		}, !filter.IsEmpty())
+	},
+}
+
+// runReclaim sends one request through the role and prints what came back. A
+// preview is printed only when the result confirms it was one.
+func runReclaim(ctx context.Context, reclaimer issueops.LeaseReclaimer, request issueops.ReclaimRequest, scoped bool) error {
+	result, err := reclaimer.Reclaim(ctx, request)
+	if err != nil {
+		return HandleErrorRespectJSON("reclaim: %v", err)
+	}
+	if err := unconfirmedPreview(request, result); err != nil {
+		// The rows it names may have been reverted, so the command counts as
+		// a write and the store's after-write steps still run.
+		if len(result.Reclaimed) > 0 {
 			commandDidWrite.Store(true)
 		}
+		return HandleErrorRespectJSON("reclaim: %v", err)
+	}
+	// A preview changed nothing, so it never marks the command as a write.
+	if !request.DryRun && len(result.Reclaimed) > 0 {
+		commandDidWrite.Store(true)
+	}
 
-		return renderReclaim(result.Reclaimed, !filter.IsEmpty(), dryRun)
-	},
+	return renderReclaim(result.Reclaimed, scoped, request.DryRun)
+}
+
+// unconfirmedPreview refuses a dry run whose result does not echo DryRun, and
+// answers nil for every other pair. ReclaimRequest.DryRun is newer than the
+// role, so a LeaseReclaimer written before it compiles unchanged, never reads
+// the member and runs the real sweep. Its result then has DryRun false, and
+// that is the only sign the command gets. By then the sweep has already run,
+// so the refusal cannot undo it: it names the rows instead of printing them
+// under "Would reclaim", and counts the ones that carry a revision, because a
+// preview mints none and a revert mints one on each row.
+func unconfirmedPreview(request issueops.ReclaimRequest, result issueops.ReclaimResult) error {
+	if !request.DryRun || result.DryRun {
+		return nil
+	}
+	const cause = "--dry-run was not confirmed: the lease sweep answered without echoing DryRun, " +
+		"as a backend that predates the preview does, and such a backend runs the sweep for real"
+	if len(result.Reclaimed) == 0 {
+		return errors.New(cause + ". It named no lease, so nothing was reverted this time; " +
+			"do not use --dry-run against this backend")
+	}
+	rows := make([]string, 0, len(result.Reclaimed))
+	reverted := 0
+	for _, r := range result.Reclaimed {
+		owner := r.PreviousOwner
+		if owner == "" {
+			owner = "(unassigned)"
+		}
+		if r.Revision != "" {
+			reverted++
+		}
+		rows = append(rows, fmt.Sprintf("%s (was held by %s)", r.ID, owner))
+	}
+	return fmt.Errorf("%s. It named %d lease(s), of which %d carry a new revision, which only a real revert mints: %s. "+
+		"Read each with 'bd show' before sweeping again",
+		cause, len(result.Reclaimed), reverted, strings.Join(rows, ", "))
 }
 
 // openLeaseReclaimer hands back the stale-lease sweep for whichever route this

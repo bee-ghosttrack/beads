@@ -201,6 +201,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReclaimRequest.DryRun` and `ReclaimResult.DryRun`, and `bd serve` as
   `dry_run` on `POST /v0/beads/issues:reclaim` (additive; a server without it
   answers `unknown_parameter` and sweeps nothing).
+- **`bd reclaim --dry-run` refuses a result that does not confirm the
+  preview.** `ReclaimRequest.DryRun` is newer than the `LeaseReclaimer` role,
+  so a backend written before it compiles unchanged, never reads the member
+  and runs the real sweep, and the command printed the rows it had just
+  reverted under `Would reclaim`. The command now checks that the result
+  echoes `DryRun`. When it does not, it exits 1, prints no preview, and names
+  the rows and how many carry a new revision, which only a real revert mints.
+  Every backend in this repository echoes the member, so nothing changes for
+  them.
 
 - **`--ttl <duration>` on `bd update --claim`, `bd ready --claim` and
   `bd heartbeat`: a worker chooses its lease length.** A claim's lease
