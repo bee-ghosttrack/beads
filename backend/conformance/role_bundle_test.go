@@ -77,7 +77,9 @@ func TestRoleContractCasesCoverEveryContractCase(t *testing.T) {
 
 	// Order matters as much as coverage: the cases run in the order their
 	// contract file declares them, which is the order the unit-of-work leg's
-	// runners use and the order its config-writing cases depend on.
+	// runners use and the order its config-writing cases depend on (the
+	// ordering note on RoleContractBundle names the two contracts whose leg
+	// wirings run in another order).
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("roleContractCases is out of declaration order at position %d: table has %s, source has %s",
@@ -131,6 +133,89 @@ func TestRoleContractCasesMatchTheBundleFields(t *testing.T) {
 				t.Errorf("roleContractCases row %q reads RoleContractBundle.%s, which belongs to row %q",
 					other.role, field.Name, contract.role)
 			}
+		}
+	}
+}
+
+// fixturesOutsideTheRoleTier names every Fixture type in this package that has
+// Run cases and no RoleContractBundle field, with why. It is the half of the
+// role tier's membership that the bundle's struct cannot state: the coverage
+// guard above derives the tier from the bundle's fields, so a contract added
+// with its three leg wirings and no field is not a missing case there. It is
+// no case at all, and RunRoleContracts never dispatches it.
+//
+// An entry records how the bundle stands today, and is no ruling that the
+// type must stay out. To move one in, delete its entry, then add the bundle
+// field and the roleContractCases row.
+var fixturesOutsideTheRoleTier = map[string]string{
+	"ExpectedRevisionFixture":     phase0HistoryTierReason,
+	"CrossRecordInvariantFixture": phase0HistoryTierReason,
+	"EpochFixture":                phase0HistoryTierReason,
+	"RetentionFixture":            phase0HistoryTierReason,
+	"AsOfReadFixture": "versioned-history read contract (R7.1): the read is issueops.AsOfReadInTx, which no " +
+		"publicops role reaches (asOfReadNoHTTPWireWaiverReason in internal/storage/leg_contract_wiring_test.go)",
+}
+
+// phase0HistoryTierReason is the exemption this file already stated in prose
+// before the list existed: see TestRoleContractCasesCoverEveryContractCase.
+const phase0HistoryTierReason = "Phase 0 history-semantics contract (R16, R16.1, R17, R20), wired directly by " +
+	"versioned_history_wiring_test.go and by each storage leg rather than through RoleContractBundle"
+
+// TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt is the drift guard on
+// the bundle's FIELDS, where TestRoleContractCasesCoverEveryContractCase is the
+// guard on its cases.
+//
+// That guard cannot see a whole contract go missing. It counts a Run function
+// as a role-tier case only when its Fixture type is already a bundle field, so
+// a new role's contract file, wired on all three in-tree legs and given no
+// field, fails nothing: an external backend running RunRoleContracts is never
+// asked to prove the role, and nothing says so. Here the set is derived from
+// the package source the other way round: every Fixture type that a Run
+// function with the case signature takes (takesFixture, the same parser the
+// coverage guard uses) must either be produced by a bundle field or be named
+// in fixturesOutsideTheRoleTier with a reason.
+func TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt(t *testing.T) {
+	inBundle := roleTierFixtureNames()
+
+	caseCount := map[string]int{}
+	for _, c := range parseFixtureCases(t) {
+		caseCount[c.fixture]++
+	}
+	if len(caseCount) == 0 {
+		t.Fatal("parsed no fixture-taking cases from the package source; the parser wiring is broken")
+	}
+	fixtures := make([]string, 0, len(caseCount))
+	for name := range caseCount {
+		fixtures = append(fixtures, name)
+	}
+	sort.Strings(fixtures)
+
+	for _, name := range fixtures {
+		reason, outside := fixturesOutsideTheRoleTier[name]
+		switch {
+		case inBundle[name] && outside:
+			t.Errorf("%s is produced by a RoleContractBundle field and is also named in "+
+				"fixturesOutsideTheRoleTier; delete the entry", name)
+		case !inBundle[name] && !outside:
+			t.Errorf("%d Run case(s) take %s, which no RoleContractBundle field produces, so "+
+				"RunRoleContracts never dispatches them and an external backend is never held to "+
+				"that contract. Add the bundle field and its roleContractCases row, or name %s in "+
+				"fixturesOutsideTheRoleTier with the reason it belongs to another tier",
+				caseCount[name], name, name)
+		case outside && strings.TrimSpace(reason) == "":
+			t.Errorf("fixturesOutsideTheRoleTier names %s with no reason", name)
+		}
+	}
+
+	outsideNames := make([]string, 0, len(fixturesOutsideTheRoleTier))
+	for name := range fixturesOutsideTheRoleTier {
+		outsideNames = append(outsideNames, name)
+	}
+	sort.Strings(outsideNames)
+	for _, name := range outsideNames {
+		if caseCount[name] == 0 {
+			t.Errorf("fixturesOutsideTheRoleTier names %s, which no Run case in this package takes; "+
+				"delete the stale entry", name)
 		}
 	}
 }
@@ -329,6 +414,27 @@ func runProbeChild(t *testing.T, mode string) (string, error) {
 func parseRoleContractCases(t *testing.T) []string {
 	t.Helper()
 	roleFixtures := roleTierFixtureNames()
+	var cases []string
+	for _, c := range parseFixtureCases(t) {
+		if roleFixtures[c.fixture] {
+			cases = append(cases, c.name)
+		}
+	}
+	return cases
+}
+
+// fixtureCase is one Run function with the case signature, and the Fixture
+// type it takes.
+type fixtureCase struct {
+	name    string
+	fixture string
+}
+
+// parseFixtureCases returns every top-level Run function in this package's
+// non-test sources that has the case signature (takesFixture), whatever tier
+// its Fixture type belongs to, in filename then declaration order.
+func parseFixtureCases(t *testing.T) []fixtureCase {
+	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -340,7 +446,7 @@ func parseRoleContractCases(t *testing.T) []string {
 	if err != nil {
 		t.Fatalf("parsing package conformance: %v", err)
 	}
-	var cases []string
+	var cases []fixtureCase
 	for _, pkg := range pkgs {
 		files := make([]string, 0, len(pkg.Files))
 		for name := range pkg.Files {
@@ -353,8 +459,8 @@ func parseRoleContractCases(t *testing.T) []string {
 				if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Run") {
 					continue
 				}
-				if fixtureName, ok := takesFixture(fn); ok && roleFixtures[fixtureName] {
-					cases = append(cases, fn.Name.Name)
+				if fixtureName, ok := takesFixture(fn); ok {
+					cases = append(cases, fixtureCase{name: fn.Name.Name, fixture: fixtureName})
 				}
 			}
 		}
@@ -369,7 +475,9 @@ func parseRoleContractCases(t *testing.T) []string {
 // reach it. Other conformance tiers in this package (e.g. Phase 0's
 // history-semantics contracts, wired directly by
 // versioned_history_wiring_test.go rather than through this bundle) mint their
-// own *Fixture types that intentionally never appear here.
+// own *Fixture types that never appear here, and fixturesOutsideTheRoleTier
+// names each of them: this function cannot tell a Fixture that belongs to
+// another tier from one whose author forgot the bundle field.
 func roleTierFixtureNames() map[string]bool {
 	names := map[string]bool{}
 	bundleType := reflect.TypeOf(RoleContractBundle{})
