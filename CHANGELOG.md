@@ -939,7 +939,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bundle was never asked to prove a lease sweep, a heartbeat, a batch get,
   a blocked listing, molecule auto-close or the participation stamp. The fields are additive: a backend that leaves one nil compiles
   unchanged and that contract skips loudly, naming the accessor to put on the
-  allowlist `RunUnsupportedContract` is driven with. A new guard,
+  allowlist `RunUnsupportedContract` is driven with. One case of
+  `ParticipationGeneration` calls `t.Setenv`, so a backend that fills that
+  field must run the bundle outside any parallel test, and that field's
+  factory must not call `t.Parallel`; otherwise Go panics and the whole test
+  binary stops. Four of that fixture's closures may be nil:
+  `ParticipatingIssueIDs`, since production makes
+  `storage.HistoryParticipation` optional, and the wisps-table mutations
+  `ClearWispFlag`, `SquashWispRoot` and `CreateUnflaggedWisp`. The case that
+  needs one now skips, naming it, where it used to panic. A new guard,
   `TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt`, fails when a
   contract's Fixture type has neither a bundle field nor a named reason for
   staying outside the role tier.

@@ -48,10 +48,27 @@ import (
 // Sequencing is required of any backend without per-test copy-on-write
 // branches: history is database-global there, so a parallel sibling corrupts
 // another case's history-delta arithmetic (newUOWRoleFixtureProvider states it
-// for the in-tree provider). Two contracts do not inherit their order from a
-// leg: the leg wirings run some of Heartbeater's and BatchGetter's cases in
-// another order than their contract files declare, and the bundle keeps the
-// declared order for both.
+// for the in-tree provider). Three contracts do not inherit their order from a
+// leg. The leg wirings run some of Heartbeater's and BatchGetter's cases in
+// another order than their contract files declare. ParticipationGeneration's
+// contract file declares its schema-skew case 17th of 18; the unit-of-work,
+// embedded and http legs run it sixth, and the dolt leg runs it apart (see the
+// next paragraph). The bundle keeps the declared order for all three. For
+// ParticipationGeneration that is safe because each of its cases sets the
+// versioned-history flag it needs before it writes.
+//
+// No parallel test, once ParticipationGeneration is filled.
+// RunParticipationGenerationFenceIgnoresSchemaSkewHatch calls t.Setenv
+// (BD_IGNORE_SCHEMA_SKEW), and Go panics when a test with a parallel ancestor
+// calls it. The panic ends the whole test binary and every result in it. So
+// the test that calls RunRoleContracts with that field filled must not be
+// parallel or have a parallel ancestor, and the field's factory, which is
+// handed the role's subtest, must not call t.Parallel on it. Per-test
+// copy-on-write branches do not lift this. The dolt leg's fixture builder
+// (setupTestStore) calls t.Parallel, so that leg runs this one case apart,
+// against a dedicated serial database
+// (TestParticipationGenerationFence_FenceIgnoresSchemaSkewHatch in
+// internal/storage/dolt).
 //
 // Inter-role: the supplier's job, because no fixture hook can undo what these
 // contracts deliberately do to a workspace. No in-tree leg shares one database
@@ -81,46 +98,54 @@ import (
 // A fixture per role per workspace contains every one of them.
 type RoleContractBundle struct {
 	// Called ONCE; the whole contract runs against the one fixture.
-	BatchApply              func(t *testing.T) *BatchApplyFixture
-	BatchCloser             func(t *testing.T) *BatchCloserFixture
-	BatchCreator            func(t *testing.T) *BatchCreatorFixture
-	BatchGetter             func(t *testing.T) *BatchGetterFixture
-	BlockedLister           func(t *testing.T) *BlockedListerFixture
-	BlockingAnnotator       func(t *testing.T) *BlockingAnnotatorFixture
-	Bootstrapper            func(t *testing.T) *BootstrapperFixture
-	Claimer                 func(t *testing.T) *ClaimerFixture
-	Commenter               func(t *testing.T) *CommenterFixture
-	Counter                 func(t *testing.T) *CounterFixture
-	CycleDetector           func(t *testing.T) *CycleDetectorFixture
-	Deleter                 func(t *testing.T) *DeleterFixture
-	DependencyEditor        func(t *testing.T) *DependencyEditorFixture
-	DualWrite               func(t *testing.T) *DualWriteFixture
-	EdgeReader              func(t *testing.T) *EdgeReaderFixture
-	GraphCounter            func(t *testing.T) *GraphCounterFixture
-	Heartbeater             func(t *testing.T) *HeartbeaterFixture
-	IDRetention             func(t *testing.T) *IDRetentionFixture
-	Importer                func(t *testing.T) *ImporterFixture
-	Journal                 func(t *testing.T) *JournalFixture
-	LeaseReclaimer          func(t *testing.T) *LeaseReclaimerFixture
-	LifecycleCloseReopen    func(t *testing.T) *LifecycleCloseReopenFixture
-	LifecycleCreate         func(t *testing.T) *LifecycleCreateFixture
-	LifecycleUpdate         func(t *testing.T) *LifecycleUpdateFixture
-	Memories                func(t *testing.T) *MemoriesFixture
-	MetadataCAS             func(t *testing.T) *MetadataCASFixture
-	Molecule                func(t *testing.T) *MoleculeFixture
+	BatchApply           func(t *testing.T) *BatchApplyFixture
+	BatchCloser          func(t *testing.T) *BatchCloserFixture
+	BatchCreator         func(t *testing.T) *BatchCreatorFixture
+	BatchGetter          func(t *testing.T) *BatchGetterFixture
+	BlockedLister        func(t *testing.T) *BlockedListerFixture
+	BlockingAnnotator    func(t *testing.T) *BlockingAnnotatorFixture
+	Bootstrapper         func(t *testing.T) *BootstrapperFixture
+	Claimer              func(t *testing.T) *ClaimerFixture
+	Commenter            func(t *testing.T) *CommenterFixture
+	Counter              func(t *testing.T) *CounterFixture
+	CycleDetector        func(t *testing.T) *CycleDetectorFixture
+	Deleter              func(t *testing.T) *DeleterFixture
+	DependencyEditor     func(t *testing.T) *DependencyEditorFixture
+	DualWrite            func(t *testing.T) *DualWriteFixture
+	EdgeReader           func(t *testing.T) *EdgeReaderFixture
+	GraphCounter         func(t *testing.T) *GraphCounterFixture
+	Heartbeater          func(t *testing.T) *HeartbeaterFixture
+	IDRetention          func(t *testing.T) *IDRetentionFixture
+	Importer             func(t *testing.T) *ImporterFixture
+	Journal              func(t *testing.T) *JournalFixture
+	LeaseReclaimer       func(t *testing.T) *LeaseReclaimerFixture
+	LifecycleCloseReopen func(t *testing.T) *LifecycleCloseReopenFixture
+	LifecycleCreate      func(t *testing.T) *LifecycleCreateFixture
+	LifecycleUpdate      func(t *testing.T) *LifecycleUpdateFixture
+	Memories             func(t *testing.T) *MemoriesFixture
+	MetadataCAS          func(t *testing.T) *MetadataCASFixture
+	Molecule             func(t *testing.T) *MoleculeFixture
+	Querier              func(t *testing.T) *QuerierFixture
+	Reader               func(t *testing.T) *ReaderFixture
+	ReadyClaimer         func(t *testing.T) *ReadyClaimerFixture
+	ReadyCounter         func(t *testing.T) *ReadyCounterFixture
+	Relations            func(t *testing.T) *RelationsFixture
+	Releaser             func(t *testing.T) *ReleaserFixture
+	RowVersion           func(t *testing.T) *RowVersionFixture
+	StatsReporter        func(t *testing.T) *StatsReporterFixture
+	Sweeper              func(t *testing.T) *SweeperFixture
+	TreeWalker           func(t *testing.T) *TreeWalkerFixture
+	VersionReconciler    func(t *testing.T) *VersionReconcilerFixture
+	WorkspaceConfig      func(t *testing.T) *WorkspaceConfigFixture
+
+	// ParticipationGeneration is called ONCE too, and stands apart for one
+	// rule: its factory must not call t.Parallel, and a bundle that fills it
+	// must not run under a parallel test, because one of its cases calls
+	// t.Setenv. See "No parallel test" in the ordering note above. Its
+	// fixture may leave four closures nil (ParticipatingIssueIDs and three
+	// wisps-table mutations), each skipping the one case that needs it; see
+	// ParticipationGenerationFixture.
 	ParticipationGeneration func(t *testing.T) *ParticipationGenerationFixture
-	Querier                 func(t *testing.T) *QuerierFixture
-	Reader                  func(t *testing.T) *ReaderFixture
-	ReadyClaimer            func(t *testing.T) *ReadyClaimerFixture
-	ReadyCounter            func(t *testing.T) *ReadyCounterFixture
-	Relations               func(t *testing.T) *RelationsFixture
-	Releaser                func(t *testing.T) *ReleaserFixture
-	RowVersion              func(t *testing.T) *RowVersionFixture
-	StatsReporter           func(t *testing.T) *StatsReporterFixture
-	Sweeper                 func(t *testing.T) *SweeperFixture
-	TreeWalker              func(t *testing.T) *TreeWalkerFixture
-	VersionReconciler       func(t *testing.T) *VersionReconcilerFixture
-	WorkspaceConfig         func(t *testing.T) *WorkspaceConfigFixture
 
 	// IssueOperations is called ONCE PER CASE. No in-tree leg has ever run two
 	// of these cases against one workspace — the store legs take a fresh store

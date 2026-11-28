@@ -340,14 +340,15 @@ var roleContractCases = []roleContract{
 		RunDependencyEditorRefusesADottedChildGatedOnItsOwnParent,
 	),
 
-	// The accessor named here is not an accessor at all, alone among these
-	// rows except Journal: storage.VersionedHistoryConfigurer is reached by
-	// TYPE ASSERTION, either on a store (the dolt and embedded-dolt legs) or
-	// on a unit-of-work provider (the uow leg), because enabling dual-write
-	// history is engine configuration rather than an issue-shaped operation
-	// storage.Storage publishes. A backend that does not implement Phase 2's
-	// dual-write mechanism leaves this field nil; see
-	// dualwrite_history_contract.go's header.
+	// The accessor named here is not an accessor at all, as on the
+	// ParticipationGeneration row below and the Journal row:
+	// storage.VersionedHistoryConfigurer is reached by TYPE ASSERTION, either
+	// on a store (the dolt and embedded-dolt legs) or on a unit-of-work
+	// provider (the uow leg), because enabling dual-write history is engine
+	// configuration rather than an issue-shaped operation storage.Storage
+	// publishes. A backend that does not implement Phase 2's dual-write
+	// mechanism leaves this field nil; see dualwrite_history_contract.go's
+	// header.
 	roleCases("DualWrite", "the storage.VersionedHistoryConfigurer type assertion", oncePerRole,
 		func(b RoleContractBundle) func(t *testing.T) *DualWriteFixture { return b.DualWrite },
 		RunDualWriteMintsOneVersionRowPerAcceptedMutation,
@@ -358,6 +359,11 @@ var roleContractCases = []roleContract{
 		RunDualWriteNoOpMutationLeavesThePriorVersionRowUnperturbed,
 	),
 
+	// The same type assertion as DualWrite's: this contract pins the write
+	// fence on that same dual-write mechanism (design §16.2b), so a backend
+	// without the mechanism leaves this field nil too. One with it may still
+	// leave four of the fixture's closures nil; each skips the one case that
+	// needs it (see ParticipationGenerationFixture).
 	roleCases("ParticipationGeneration", "the storage.VersionedHistoryConfigurer type assertion", oncePerRole,
 		func(b RoleContractBundle) func(t *testing.T) *ParticipationGenerationFixture {
 			return b.ParticipationGeneration
@@ -516,13 +522,14 @@ var roleContractCases = []roleContract{
 		RunIssueOperationsCreateParentChildRecomputesWaitsForClosure,
 	),
 
-	// The accessor named here is not an accessor at all, alone among these
-	// rows. journalops.Journal is reached by TYPE ASSERTION on a store —
-	// `bd serve` does exactly that (cmd/bd/serve.go, serveJournalCursor) — or
-	// through uow.EventsJournalCursorSource on a unit-of-work provider, because
-	// the journal is engine state on a dolt_ignored table that
-	// storage.DoltStorage does not publish. A backend that cannot read it
-	// leaves this field nil; see journal_contract.go's header.
+	// The accessor named here is not an accessor at all, as on the DualWrite
+	// and ParticipationGeneration rows. journalops.Journal is reached by TYPE
+	// ASSERTION on a store — `bd serve` does exactly that (cmd/bd/serve.go,
+	// serveJournalCursor) — or through uow.EventsJournalCursorSource on a
+	// unit-of-work provider, because the journal is engine state on a
+	// dolt_ignored table that storage.DoltStorage does not publish. A backend
+	// that cannot read it leaves this field nil; see journal_contract.go's
+	// header.
 	roleCases("Journal", "the storage.EventsJournalCursor type assertion (or uow.EventsJournalCursor())", oncePerRole,
 		func(b RoleContractBundle) func(t *testing.T) *JournalFixture { return b.Journal },
 		RunJournalPagesAreSeqAscendingAndSinceExclusive,
@@ -697,7 +704,7 @@ var roleContractCases = []roleContract{
 		RunMetadataCASDoesNotMutateTheCallerRequest,
 	),
 
-	roleCases("Molecule", "MoleculeStepper()", oncePerRole,
+	roleCases("Molecule", "MoleculeStepper(), IssueLifecycle() and BatchCloser()", oncePerRole,
 		func(b RoleContractBundle) func(t *testing.T) *MoleculeFixture { return b.Molecule },
 		RunMoleculeCloseAutoClosesTheCompletedRoot,
 		RunMoleculeAutoCloseIsOptInAndRuleBound,

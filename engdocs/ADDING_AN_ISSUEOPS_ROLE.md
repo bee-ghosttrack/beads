@@ -254,7 +254,14 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
     (`backend/conformance/role_bundle.go`, `role_bundle_cases.go`), because
     that bundle is the only way an out-of-tree backend runs the cases;
     `TestEveryFixtureWithACaseIsInTheBundleOrNamedOutsideIt` fails without
-    them.
+    them. The bundle runs each case under the supplier's own test and under
+    the role subtest its factory is handed, and either may be parallel. Go
+    panics, ending the whole test binary, when a test with a parallel
+    ancestor calls `t.Setenv` or `t.Chdir`. So a case that calls either must
+    say so on its contract's bundle field and in the ordering note on
+    `RoleContractBundle`, as `ParticipationGeneration`'s schema-skew case
+    does. The alternative is a fixture type and bundle field of its own, so a
+    supplier whose tests are parallel can leave just that field nil.
 
     A case may need to establish a state the ROLE CANNOT PRODUCE — a recorded
     version below its own high-water mark is one, and reconciling is the one

@@ -39,6 +39,16 @@ import (
 // UpdateIssue (or their unit-of-work equivalents), never issue_versions or
 // store_epoch directly.
 //
+// FOUR CLOSURES MAY BE NIL; THE REST MAY NOT. ClearWispFlag, SquashWispRoot,
+// CreateUnflaggedWisp and ParticipatingIssueIDs each serve one case, and a
+// backend can lack any of them: a write surface may have no form for the
+// three wisps-table mutations (the http wire has none), and production makes
+// storage.HistoryParticipation optional. A nil one skips its case, by name,
+// before the case touches the fixture. RoleContractBundle runs every case
+// against one fixture and, unlike a leg's own wiring, cannot leave a case
+// out, so without the skip the call would panic and end the supplier's whole
+// test binary.
+//
 // WHAT THIS CONTRACT DELIBERATELY DOES NOT PIN:
 //   - THE EXACT STAMPED VALUE. That a create-shaped mutation with the flag on
 //     stamps SOME non-NULL participation_generation is pinned here; that the
@@ -98,17 +108,19 @@ type ParticipationGenerationFixture struct {
 	// UpdateIssue of {"wisp": false} bd mol squash makes on a squashed root
 	// (UpdateWisp on the unit-of-work leg, the way its molecule writer routes
 	// it). The row stays in the wisps table, now carrying neither Ephemeral
-	// nor NoHistory.
+	// nor NoHistory. Nil skips the one case that needs it, by name.
 	ClearWispFlag func(ctx context.Context, id string) error
 	// SquashWispRoot closes the wisp id and then clears its flag as
 	// ClearWispFlag does, both in ONE transaction: the shape bd mol squash's
 	// root auto-close takes, where an error from either write aborts both.
+	// Nil skips the one case that needs it, by name.
 	SquashWispRoot func(ctx context.Context, id string) error
 	// CreateUnflaggedWisp creates id in the wisps table with neither
 	// Ephemeral nor NoHistory set: import's "wisp_plane" marker, which pins
 	// the plane whatever the flags say (WispPlaneOverride = &true, through
 	// the batch create import runs), or on the unit-of-work leg CreateWisp,
-	// which routes by the call rather than by the flags.
+	// which routes by the call rather than by the flags. Nil skips the one
+	// case that needs it, by name.
 	CreateUnflaggedWisp func(ctx context.Context, id string) error
 	// CreateNoHistoryIssue creates id in the ISSUES table carrying
 	// NoHistory=true: import's promoted-no-history shape (bd-r9uce), a
@@ -131,7 +143,9 @@ type ParticipationGenerationFixture struct {
 	// one `bd config set versioned-history.enabled true` narrows its offenders
 	// with: storage.HistoryParticipation on the store legs, the unit of work's
 	// IssueUseCase on uow. Unlike ParticipationGeneration it is not white-box
-	// test access; it is the read under test.
+	// test access; it is the read under test. Nil skips the one case that
+	// needs it, by name, for a backend with no such read: production makes
+	// storage.HistoryParticipation optional.
 	ParticipatingIssueIDs func(ctx context.Context, ids []string) (map[string]struct{}, error)
 }
 
@@ -624,6 +638,9 @@ func runDemotedParticipatingRowKeepsItsHistory(t *testing.T, ctx context.Context
 // fence, mints a stray version for a wisp.
 func RunParticipationGenerationWispFlagClearMintsNothing(t *testing.T, ctx context.Context, fixture ParticipationGenerationFixture) {
 	t.Helper()
+	if fixture.ClearWispFlag == nil {
+		t.Skip("ParticipationGenerationFixture.ClearWispFlag is nil: this backend cannot clear a wisp's flag in place")
+	}
 	runWispTableRowMintsNothing(t, ctx, fixture, "flag-clear", fixture.CreateWisp, fixture.ClearWispFlag)
 }
 
@@ -634,6 +651,10 @@ func RunParticipationGenerationWispFlagClearMintsNothing(t *testing.T, ctx conte
 // with it and the squash cannot complete.
 func RunParticipationGenerationWispRootSquashMintsNothing(t *testing.T, ctx context.Context, fixture ParticipationGenerationFixture) {
 	t.Helper()
+	if fixture.SquashWispRoot == nil {
+		t.Skip("ParticipationGenerationFixture.SquashWispRoot is nil: this backend cannot close a wisp root " +
+			"and clear its flag in one transaction")
+	}
 	runWispTableRowMintsNothing(t, ctx, fixture, "squash", fixture.CreateWisp, fixture.SquashWispRoot)
 }
 
@@ -644,6 +665,10 @@ func RunParticipationGenerationWispRootSquashMintsNothing(t *testing.T, ctx cont
 // exactly as a flagged wisp does.
 func RunParticipationGenerationUnflaggedWispCreateMintsNothing(t *testing.T, ctx context.Context, fixture ParticipationGenerationFixture) {
 	t.Helper()
+	if fixture.CreateUnflaggedWisp == nil {
+		t.Skip("ParticipationGenerationFixture.CreateUnflaggedWisp is nil: this backend cannot create a " +
+			"wisps-table row with neither flag set")
+	}
 	runWispTableRowMintsNothing(t, ctx, fixture, "unflagged-create", fixture.CreateUnflaggedWisp)
 }
 
@@ -873,6 +898,10 @@ func RunParticipationGenerationFenceIgnoresSchemaSkewHatch(t *testing.T, ctx con
 // then refuses every write to.
 func RunParticipationGenerationReadReportsExactlyTheParticipatingRows(t *testing.T, ctx context.Context, fixture ParticipationGenerationFixture) {
 	t.Helper()
+	if fixture.ParticipatingIssueIDs == nil {
+		t.Skip("ParticipationGenerationFixture.ParticipatingIssueIDs is nil: this backend serves no " +
+			"participation read (storage.HistoryParticipation)")
+	}
 	prefix := fixture.IssuePrefix + "-pread"
 	legacy, legacyRoundTrip := prefix+"-legacy", prefix+"-legacy-rt"
 	participating, participatingRoundTrip := prefix+"-part", prefix+"-part-rt"

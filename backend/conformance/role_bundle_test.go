@@ -78,7 +78,7 @@ func TestRoleContractCasesCoverEveryContractCase(t *testing.T) {
 	// Order matters as much as coverage: the cases run in the order their
 	// contract file declares them, which is the order the unit-of-work leg's
 	// runners use and the order its config-writing cases depend on (the
-	// ordering note on RoleContractBundle names the two contracts whose leg
+	// ordering note on RoleContractBundle names the three contracts whose leg
 	// wirings run in another order).
 	for i := range want {
 		if got[i] != want[i] {
@@ -407,6 +407,72 @@ func TestRoleCasesFailsWhenAFactoryReturnsNil(t *testing.T) {
 		t.Errorf("a nil fixture SKIPPED; a broken supplier must fail rather than narrow what the "+
 			"backend is held to:\n%s", out)
 	}
+}
+
+// TestParticipationGenerationSkipsACaseWhoseOptionalClosureIsNil pins the nil
+// convention one level down, inside a fixture. A supplier can fill
+// ParticipationGeneration and still lack one of the four closures
+// ParticipationGenerationFixture names optional; the case that needs it must
+// then SKIP, naming it, and must do so before it touches the fixture. The
+// bundle cannot leave one case out, so the alternative is a call through a
+// nil func, and that panic ends the supplier's whole test binary. The cases
+// run in a child process for the same reason: a regression fails this test,
+// not this binary.
+func TestParticipationGenerationSkipsACaseWhoseOptionalClosureIsNil(t *testing.T) {
+	cases := []struct {
+		closure string
+		run     func(t *testing.T, ctx context.Context, fixture ParticipationGenerationFixture)
+	}{
+		{"ClearWispFlag", RunParticipationGenerationWispFlagClearMintsNothing},
+		{"SquashWispRoot", RunParticipationGenerationWispRootSquashMintsNothing},
+		{"CreateUnflaggedWisp", RunParticipationGenerationUnflaggedWispCreateMintsNothing},
+		{"ParticipatingIssueIDs", RunParticipationGenerationReadReportsExactlyTheParticipatingRows},
+	}
+	if os.Getenv(roleBundleProbeEnv) == "optionalnil" {
+		for _, c := range cases {
+			t.Run(c.closure, func(t *testing.T) {
+				c.run(t, context.Background(), participationGenerationFixtureWithout(t, c.closure))
+			})
+		}
+		return
+	}
+
+	out, err := runProbeChild(t, "optionalnil")
+	if err != nil {
+		t.Fatalf("a case whose optional closure is nil must skip, not fail or panic: %v\n%s", err, out)
+	}
+	for _, c := range cases {
+		if !strings.Contains(out, "--- SKIP: "+t.Name()+"/"+c.closure+" ") {
+			t.Errorf("the case that needs %s did not SKIP with it nil:\n%s", c.closure, out)
+		}
+		if !strings.Contains(out, "ParticipationGenerationFixture."+c.closure+" is nil") {
+			t.Errorf("the case that needs %s skipped without naming it:\n%s", c.closure, out)
+		}
+	}
+}
+
+// participationGenerationFixtureWithout returns a fixture with every closure
+// bound except the one named: the fixture a supplier that lacks just that
+// closure hands the bundle. Each bound closure fails t when a case calls it,
+// so a case gets through this probe only by skipping first.
+func participationGenerationFixtureWithout(t *testing.T, nilClosure string) ParticipationGenerationFixture {
+	t.Helper()
+	fixture := ParticipationGenerationFixture{IssuePrefix: "probe"}
+	v := reflect.ValueOf(&fixture).Elem()
+	if field, ok := v.Type().FieldByName(nilClosure); !ok || field.Type.Kind() != reflect.Func {
+		t.Fatalf("ParticipationGenerationFixture has no closure named %s", nilClosure)
+	}
+	for i := range v.NumField() {
+		field, name := v.Field(i), v.Type().Field(i).Name
+		if field.Kind() != reflect.Func || name == nilClosure {
+			continue
+		}
+		field.Set(reflect.MakeFunc(field.Type(), func([]reflect.Value) []reflect.Value {
+			t.Fatalf("the case called %s before it skipped on its nil %s", name, nilClosure)
+			return nil // not reached: Fatalf ends the case's goroutine
+		}))
+	}
+	return fixture
 }
 
 // runProbeChild re-runs the calling test in a child process with mode set, so
